@@ -1,7 +1,8 @@
-from PyQt6 import QtWidgets, QtCore
+from PyQt6 import QtWidgets, QtCore, QtGui
 
 import globals_
 from ui import GetIcon
+from tiles import LoadTileset, UnloadTileset
 
 # Sets up the Area Options Menu
 class AreaOptionsDialog(QtWidgets.QDialog):
@@ -62,9 +63,9 @@ class LoadingTab(QtWidgets.QWidget):
         self.credits.setToolTip(globals_.trans.string('AreaDlg', 35))
         self.credits.setChecked(globals_.Area.creditsFlag)
 
-        self.ambush = QtWidgets.QCheckBox(globals_.trans.string('AreaDlg', 36))
-        self.ambush.setToolTip(globals_.trans.string('AreaDlg', 37))
-        self.ambush.setChecked(globals_.Area.ambushFlag)
+        self.faceLeft = QtWidgets.QCheckBox(globals_.trans.string('AreaDlg', 36))
+        self.faceLeft.setToolTip(globals_.trans.string('AreaDlg', 37))
+        self.faceLeft.setChecked(globals_.Area.faceLeftFlag)
 
         self.unk1 = QtWidgets.QCheckBox(globals_.trans.string('AreaDlg', 38))
         self.unk1.setToolTip(globals_.trans.string('AreaDlg', 39))
@@ -90,7 +91,7 @@ class LoadingTab(QtWidgets.QWidget):
         settingsLayout.addRow(globals_.trans.string('AreaDlg', 32), self.toadHouseType)
         settingsLayout.addRow(self.wrap)
         settingsLayout.addRow(self.credits)
-        settingsLayout.addRow(self.ambush)
+        settingsLayout.addRow(self.faceLeft)
         settingsLayout.addRow(self.unk1)
         settingsLayout.addRow(self.unk2)
         settingsLayout.addRow(globals_.trans.string('AreaDlg', 42), self.unk3)
@@ -106,6 +107,15 @@ class TilesetsTab(QtWidgets.QWidget):
     def __init__(self):
         QtWidgets.QWidget.__init__(self)
         self.setMinimumWidth(384)
+        self.preview_size = QtCore.QSize(320, 180)
+        self.preview_cache = {}
+        self.preview_labels = []
+        self.original_tileset_names = [
+            str(getattr(globals_.Area, 'tileset0', '') or ''),
+            str(getattr(globals_.Area, 'tileset1', '') or ''),
+            str(getattr(globals_.Area, 'tileset2', '') or ''),
+            str(getattr(globals_.Area, 'tileset3', '') or ''),
+        ]
 
         # Set up each tileset
         self.widgets = []
@@ -185,6 +195,15 @@ class TilesetsTab(QtWidgets.QWidget):
             line.setCompleter(QtWidgets.QCompleter(tilesetList))
             line.setPlaceholderText(globals_.trans.string('AreaDlg', 30))  # '(None)'
             self.lineEdits.append(line)
+
+            preview_label = QtWidgets.QLabel()
+            preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            preview_label.setFixedSize(self.preview_size)
+            preview_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+            preview_label.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+            preview_label.setText(globals_.trans.string('AreaDlg', 15))
+            self.preview_labels.append(preview_label)
+
             line.setText(eval('globals_.Area.tileset%d' % slot))
             self.handleTextEdit(slot)
             # Above line: For some reason, PyQt doesn't automatically call
@@ -195,8 +214,13 @@ class TilesetsTab(QtWidgets.QWidget):
             L.addWidget(tree, 0, 0, 1, 2)
             L.addWidget(QtWidgets.QLabel(globals_.trans.string('AreaDlg', 31, '[slot]', slot)), 1, 0)  # 'Tilesets (Pa[slot])'
             L.addWidget(line, 1, 1)
+            L.addWidget(preview_label, 2, 0, 1, 2)
             L.setRowStretch(0, 1)
+            L.setAlignment(preview_label, QtCore.Qt.AlignmentFlag.AlignHCenter)
             widget.setLayout(L)
+
+        for slot in range(4):
+            self._updatePreview(slot)
 
         # Set up the tab widget
         T = QtWidgets.QTabWidget()
@@ -233,6 +257,7 @@ class TilesetsTab(QtWidgets.QWidget):
 
         value = str(item.text(1))
         self.lineEdits[slot].setText(value)
+        self._updatePreview(slot)
 
     # Line-edit handlers
     def handleTextEdit0(self):
@@ -262,6 +287,7 @@ class TilesetsTab(QtWidgets.QWidget):
             # If there's no text, just select None
             if txt == '':
                 self.noneItems[slot].setSelected(True)
+                self._updatePreview(slot)
                 return
 
             # Find the item matching the description, and select it
@@ -273,6 +299,86 @@ class TilesetsTab(QtWidgets.QWidget):
             while parent is not None:
                 parent.setExpanded(True)
                 parent = parent.parent()
+            self._updatePreview(slot)
+        else:
+            self._updatePreview(slot)
+
+    def _setPreviewPixmap(self, slot, pixmap):
+        if slot < 0 or slot >= len(self.preview_labels):
+            return
+        label = self.preview_labels[slot]
+        if pixmap is None or pixmap.isNull():
+            label.setPixmap(QtGui.QPixmap())
+            label.setText(globals_.trans.string('AreaDlg', 15))
+            return
+
+        target_w = max(24, label.width() - 8)
+        target_h = max(24, label.height() - 8)
+        scaled = pixmap.scaled(
+            target_w,
+            target_h,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        label.setText('')
+        label.setPixmap(scaled)
+
+    def _buildPreviewPixmap(self, slot, name):
+        cache_key = (slot, str(name or ''))
+        if cache_key in self.preview_cache:
+            return self.preview_cache[cache_key]
+
+        name = str(name or '').strip()
+        if not name:
+            self.preview_cache[cache_key] = None
+            return None
+
+        original_name = self.original_tileset_names[slot]
+        loaded_name = str(getattr(globals_, 'TilesetFilesLoaded', [None] * 4)[slot] or '')
+        need_restore = False
+
+        try:
+            if name != original_name or not loaded_name:
+                if not LoadTileset(slot, name, reload_=True):
+                    self.preview_cache[cache_key] = None
+                    return None
+                need_restore = True
+
+            pm = QtGui.QPixmap(16 * 24, 16 * 24)
+            pm.fill(QtCore.Qt.GlobalColor.transparent)
+            p = QtGui.QPainter(pm)
+            tileoffset = slot * 256
+            for tile_idx in range(256):
+                tile = globals_.Tiles[tileoffset + tile_idx]
+                if tile is None:
+                    continue
+                x = (tile_idx % 16) * 24
+                y = (tile_idx // 16) * 24
+                current = tile.getCurrentTile(False)
+                if isinstance(current, QtGui.QImage):
+                    p.drawImage(x, y, current)
+                else:
+                    p.drawPixmap(x, y, current)
+            p.end()
+
+            self.preview_cache[cache_key] = pm
+            return pm
+        finally:
+            if need_restore:
+                if original_name:
+                    LoadTileset(slot, original_name, reload_=True)
+                else:
+                    UnloadTileset(slot)
+
+    def _updatePreview(self, slot):
+        txt = str(self.lineEdits[slot].text() or '').strip()
+        pixmap = self._buildPreviewPixmap(slot, txt)
+        self._setPreviewPixmap(slot, pixmap)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for slot in range(len(self.preview_labels)):
+            self._updatePreview(slot)
 
     def values(self):
         """
@@ -380,7 +486,7 @@ class LoadedSpritesTab(QtWidgets.QWidget):
         and saves the entered values in reggie.py. This code is pretty hacky,
         but at least it works.
         """
-        return ["[%d] %s" % (x, globals_.Sprites[x].name if 0 <= x < globals_.NumSprites and globals_.Sprites[x] is not None else "UNKNOWN") for x in list_of_sprites]
+        return ["[%d] %s" % (x, globals_.Sprites[x].name if 0 <= x < globals_.NumSprites else "UNKNOWN") for x in list_of_sprites]
 
     def handle_add_sprite(self, _):
         """
@@ -398,7 +504,7 @@ class LoadedSpritesTab(QtWidgets.QWidget):
             return
 
         index = self.custom_model.index(self.custom_model.rowCount() - 1, 0)
-        self.custom_model.setData(index, "[%d] %s" % (sprite_id, globals_.Sprites[sprite_id].name if 0 <= sprite_id < globals_.NumSprites and globals_.Sprites[sprite_id] is not None else "UNKNOWN"))
+        self.custom_model.setData(index, "[%d] %s" % (sprite_id, globals_.Sprites[sprite_id].name if 0 <= sprite_id < globals_.NumSprites else "UNKNOWN"))
 
         # Clear the input so the user can enter a new sprite number
         self.sprite_input.clear()

@@ -2,6 +2,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 import os
 import random
 import base64
+import uuid
 
 import spritelib as SLib
 import globals_
@@ -11,7 +12,15 @@ from ui import GetIcon, clipStr
 from dirty import SetDirty
 from undo import MoveItemUndoAction, SimultaneousUndoAction
 
-from raw_data import RawData
+
+def collab_selection_qcolor(item=None, alpha=None):
+    value = getattr(item, '_collab_selection_color', getattr(globals_, 'CollabHighlightColor', '#ffff00'))
+    color = QtGui.QColor(str(value or ''))
+    if not color.isValid():
+        color = QtGui.QColor('#ffff00')
+    if alpha is not None:
+        color.setAlpha(max(0, min(255, int(alpha))))
+    return color
 
 class InstanceDefinition:
     """
@@ -177,15 +186,7 @@ class InstanceDefinition_SpriteItem(InstanceDefinition):
         return globals_.Area.sprites
 
     def createNew(self):
-        data = RawData.from_sprite_id(self.fields[0][1])
-        data.original = self.fields[1][1]
-
-        return SpriteItem(
-            self.fields[0][1],
-            self.objx,
-            self.objy,
-            data
-        )
+        return SpriteItem(self.fields[0][1], self.objx, self.objy, self.fields[1][1])
 
 
 class InstanceDefinition_EntranceItem(InstanceDefinition):
@@ -224,7 +225,11 @@ class InstanceDefinition_PathItem(InstanceDefinition):
 
     @staticmethod
     def itemList():
-        return globals_.Area.paths
+        items = []
+        for path in getattr(globals_.Area, 'paths', []):
+            for node in getattr(path, '_nodes', []):
+                items.append(node)
+        return items
 
     def createNew(self):
         return PathItem(self.objx, self.objy, *(field[1] for field in self.fields))
@@ -356,7 +361,19 @@ class LevelEditorItem(QtWidgets.QGraphicsItem):
                 if self.positionChanged is not None:
                     self.positionChanged(self, oldx, oldy, x, y)
 
-                if not isinstance(self, PathEditorLineItem):
+                # Не записываем undo при программных перемещениях (создание/восстановление/применение снапшотов),
+                # иначе появляются "лишние" MoveItemUndoAction, которые при undo не находят инстанс и требуют
+                # нажимать Undo два раза.
+                mw = getattr(globals_, 'mainWindow', None)
+                can_record = (
+                    mw is not None
+                    and not getattr(mw, 'UndoRedoInProgress', False)
+                    and not getattr(mw, 'collabApplyingRemote', False)
+                    and not getattr(mw, 'collabApplyingRemoteHistory', False)
+                    and not getattr(mw, 'collabSwitchingArea', False)
+                    and not globals_.DirtyOverride
+                )
+                if can_record and not isinstance(self, PathEditorLineItem):
                     if len(globals_.mainWindow.CurrentSelection) == 1:
                         act = MoveItemUndoAction(self, oldx, oldy, x, y)
                         globals_.mainWindow.undoStack.addOrExtendAction(act)
@@ -522,6 +539,10 @@ class ObjectItem(LevelEditorItem):
         self.update()
 
         self.UpdateTooltip()
+        try:
+            globals_.mainWindow.CollabQueueObjectUpdate(self)
+        except Exception:
+            pass
 
     def UpdateTooltip(self):
         """
@@ -787,6 +808,8 @@ class ObjectItem(LevelEditorItem):
 
             # snap to 24x24
             newpos = value
+            old_scene_x = self.x()
+            old_scene_y = self.y()
             newpos.setX(int((newpos.x() + 12) / 24) * 24)
             newpos.setY(int((newpos.y() + 12) / 24) * 24)
             x = newpos.x()
@@ -811,19 +834,36 @@ class ObjectItem(LevelEditorItem):
                 if self.positionChanged is not None:
                     self.positionChanged(self, oldx, oldy, x, y)
 
-                if len(globals_.mainWindow.CurrentSelection) == 1:
-                    act = MoveItemUndoAction(self, oldx, oldy, x, y)
-                    globals_.mainWindow.undoStack.addOrExtendAction(act)
-                elif len(globals_.mainWindow.CurrentSelection) > 1:
-                    pass
+                mw = getattr(globals_, 'mainWindow', None)
+                can_record_undo = (
+                    mw is not None
+                    and not getattr(mw, 'UndoRedoInProgress', False)
+                    and not getattr(mw, 'collabApplyingRemote', False)
+                    and not getattr(mw, 'collabApplyingRemoteHistory', False)
+                    and not getattr(mw, 'collabSwitchingArea', False)
+                    and not globals_.DirtyOverride
+                )
+                if can_record_undo:
+                    if len(mw.CurrentSelection) == 1:
+                        act = MoveItemUndoAction(self, oldx, oldy, x, y)
+                        mw.undoStack.addOrExtendAction(act)
+                    elif len(mw.CurrentSelection) > 1:
+                        pass
 
                 SetDirty()
 
                 # updRect = QtCore.QRectF(self.x(), self.y(), self.BoundingRect.width(), self.BoundingRect.height())
                 # scene.invalidate(updRect)
 
-                scene.invalidate(self.x(), self.y(), self.width * 24, self.height * 24,
-                                 QtWidgets.QGraphicsScene.SceneLayer.BackgroundLayer)
+                redraw_rect = QtCore.QRectF(old_scene_x, old_scene_y, self.width * 24, self.height * 24)
+                redraw_rect = redraw_rect.united(QtCore.QRectF(newpos.x(), newpos.y(), self.width * 24, self.height * 24))
+                scene.invalidate(
+                    redraw_rect.x(),
+                    redraw_rect.y(),
+                    redraw_rect.width(),
+                    redraw_rect.height(),
+                    QtWidgets.QGraphicsScene.SceneLayer.BackgroundLayer,
+                )
                 # scene.invalidate(newpos.x(), newpos.y(), self.width*24, self.height*24, QtWidgets.QGraphicsScene.BackgroundLayer)
 
             return newpos
@@ -834,6 +874,13 @@ class ObjectItem(LevelEditorItem):
         """
         Paints the object
         """
+        remote_selected_by = str(getattr(self, '_collab_selected_by', '') or '')
+        if remote_selected_by and not self.isSelected():
+            remote_pen = QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine)
+            painter.setPen(remote_pen)
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.SelectionRect)
+
         if not self.isSelected():
             return
 
@@ -956,6 +1003,10 @@ class ObjectItem(LevelEditorItem):
 
         updaterect = oldrect.united(self.BoundingRect.translated(self.objx * 24, self.objy * 24))
         self.scene().update(updaterect)
+        try:
+            globals_.mainWindow.CollabQueueObjectUpdate(self)
+        except Exception:
+            pass
 
     def mouseMoveEvent(self, event):
         """
@@ -1226,6 +1277,10 @@ class ObjectItem(LevelEditorItem):
         """
         Delete the object from the level
         """
+        try:
+            globals_.mainWindow.CollabQueueObjectDelete(self)
+        except Exception:
+            pass
         globals_.Area.RemoveFromLayer(self)
         self.scene().update(self.x(), self.y(), self.BoundingRect.width(), self.BoundingRect.height())
 
@@ -1614,10 +1669,10 @@ class ZoneItem(LevelEditorItem):
 
             globals_.mainWindow.levelOverview.update()
 
-            for spr in globals_.Area.sprites:
-                spr.ImageObj.positionChanged()
+            globals_.mainWindow.QueueZoneSpriteRefresh()
 
             SetDirty()
+            globals_.mainWindow.CollabQueueMetaUpdate()
 
             event.accept()
         else:
@@ -1722,6 +1777,7 @@ class LocationItem(LevelEditorItem):
         Paints the location on screen
         """
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        remote_selected = bool(str(getattr(self, '_collab_selected_by', '') or '')) and not self.isSelected()
 
         # Paint liquids/fog
         if globals_.SpritesShown and globals_.RealViewEnabled:
@@ -1740,6 +1796,10 @@ class LocationItem(LevelEditorItem):
             painter.setBrush(QtGui.QBrush(globals_.theme.color('location_fill_s')))
             painter.setPen(QtGui.QPen(globals_.theme.color('location_lines_s'), 1, QtCore.Qt.PenStyle.DashLine))
         painter.drawRect(self.DrawRect)
+        if remote_selected:
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.setPen(QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine))
+            painter.drawRect(self.DrawRect)
 
         # Draw the ID
         painter.setPen(QtGui.QPen(globals_.theme.color('location_text')))
@@ -1851,6 +1911,15 @@ class LocationItem(LevelEditorItem):
         loclist.selectionModel().clearSelection()
         globals_.Area.locations.remove(self)
         self.scene().update(self.x(), self.y(), self.BoundingRect.width(), self.BoundingRect.height())
+        try:
+            globals_.mainWindow.CollabQueueLocationDelete(self)
+        except Exception:
+            pass
+        try:
+            if getattr(globals_, 'EventLinksShown', False):
+                globals_.mainWindow.UpdateEventLinks()
+        except Exception:
+            pass
 
 
 class SpriteItem(LevelEditorItem):
@@ -1861,7 +1930,7 @@ class SpriteItem(LevelEditorItem):
     BoundingRect = QtCore.QRectF(0, 0, 24, 24)
     SelectionRect = QtCore.QRectF(0, 0, 23, 23)
 
-    def __init__(self, type_, x, y, data: RawData):
+    def __init__(self, type_, x, y, data):
         """
         Creates a sprite with specific data
         """
@@ -1872,16 +1941,17 @@ class SpriteItem(LevelEditorItem):
         self.type = type_
         self.objx = x
         self.objy = y
-        self._spritedata: RawData = data
+        self.spritedata = data
         self.LevelRect = QtCore.QRectF(self.objx / 16, self.objy / 16, 1.5, 1.5)
         self.ChangingPos = False
 
         self.ImageObj = SLib.SpriteImage(self)
+        self.ImageObjFactory = None
 
-        if 0 <= type_ < globals_.NumSprites and globals_.Sprites[type_] is not None:
+        if 0 <= type_ < globals_.NumSprites:
             self.name = globals_.Sprites[type_].name
         else:
-            self.name = "UNKNOWN [%d]" % type_
+            self.name = "UNKNOWN"
 
         self.InitializeSprite()
 
@@ -1901,25 +1971,14 @@ class SpriteItem(LevelEditorItem):
             )
         globals_.DirtyOverride -= 1
 
-
-    @property
-    def spritedata(self) -> RawData:
-        return self._spritedata
-
-    @spritedata.setter
-    def spritedata(self, value: RawData):
-        assert isinstance(value, RawData)
-        self._spritedata = value
-
-
     def SetType(self, type_):
         """
         Sets the type of the sprite
         """
-        if 0 <= type_ < globals_.NumSprites and globals_.Sprites[type_] is not None:
+        if 0 <= type_ < globals_.NumSprites:
             self.name = globals_.Sprites[type_].name
         else:
-            self.name = "UNKNOWN [%d]" % type_
+            self.name = "UNKNOWN"
 
         self.setToolTip(globals_.trans.string('Sprites', 0, '[type]', type_, '[name]', self.name))
         self.type = type_
@@ -1927,6 +1986,10 @@ class SpriteItem(LevelEditorItem):
         self.InitializeSprite()
 
         self.UpdateListItem()
+        try:
+            globals_.mainWindow.CollabQueueSpriteUpdate(self, include_data=True)
+        except Exception:
+            pass
 
     def ListString(self):
         """
@@ -2050,11 +2113,8 @@ class SpriteItem(LevelEditorItem):
         """
         type_ = self.type
 
-        # Check if sprite type is valid and sprite data exists
-        if not 0 <= type_ < globals_.NumSprites or globals_.Sprites[type_] is None:
-            # Use a default name for unknown sprites
-            self.name = 'Unknown Sprite [%d]' % type_
-            self.setToolTip('Unknown sprite type %d' % type_)
+        if not 0 <= type_ < globals_.NumSprites:
+            print('Tried to initialize a sprite of type %d, but this is out of range %d.' % (type_, globals_.NumSprites))
             return
 
         self.name = globals_.Sprites[type_].name
@@ -2064,28 +2124,72 @@ class SpriteItem(LevelEditorItem):
         if type_ in imgs:
             self.setImageObj(imgs[type_])
 
-    def setImageObj(self, obj):
+    def _replaceImageObj(self, obj):
         """
-        Sets a new sprite image object for this SpriteItem
+        Replaces the current image object instance.
         """
         for auxObj in self.ImageObj.aux:
-            if auxObj.scene() is None: continue
+            if auxObj.scene() is None:
+                continue
             auxObj.scene().removeItem(auxObj)
 
         self.setZValue(26000)
         self.resetTransform()
+        self.ImageObj = obj(self) if obj else SLib.SpriteImage(self)
+
+        # Show auxiliary objects properly.
+        for aux in self.ImageObj.aux:
+            aux.setVisible(globals_.SpriteImagesShown)
+
+        self.UpdateDynamicSizing()
+
+    def hasDeferredImageObj(self):
+        """
+        Returns True if this sprite still uses a placeholder image object.
+        """
+        return self.ImageObjFactory not in (None, SLib.SpriteImage) and self.ImageObj.__class__ is SLib.SpriteImage
+
+    def ensureImageObjLoaded(self):
+        """
+        Forces a deferred image object to be loaded.
+        """
+        if not self.hasDeferredImageObj():
+            return
+
+        if self.type in globals_.gamedef.getImageClasses() and self.type not in SLib.SpriteImagesLoaded:
+            globals_.gamedef.getImageClasses()[self.type].loadImages()
+            SLib.SpriteImagesLoaded.add(self.type)
+
+        self._replaceImageObj(self.ImageObjFactory)
+
+    def shouldDeferImageObj(self, obj):
+        """
+        Returns True if image loading should be postponed until sprite images are shown.
+        """
+        if obj is None:
+            return False
+
+        return (
+            not globals_.SpriteImagesShown
+            and self.type in globals_.gamedef.getImageClasses()
+            and self.type not in SLib.SpriteImagesLoaded
+        )
+
+    def setImageObj(self, obj):
+        """
+        Sets a new sprite image object for this SpriteItem
+        """
+        self.ImageObjFactory = obj
+
+        if self.shouldDeferImageObj(obj):
+            self._replaceImageObj(None)
+            return
 
         if (self.type in globals_.gamedef.getImageClasses()) and (self.type not in SLib.SpriteImagesLoaded):
             globals_.gamedef.getImageClasses()[self.type].loadImages()
             SLib.SpriteImagesLoaded.add(self.type)
 
-        self.ImageObj = obj(self) if obj else SLib.SpriteImage(self)
-
-        # show auxiliary objects properly
-        for aux in self.ImageObj.aux:
-            aux.setVisible(globals_.SpriteImagesShown)
-
-        self.UpdateDynamicSizing()
+        self._replaceImageObj(obj)
 
     def UpdateDynamicSizing(self):
         """
@@ -2376,6 +2480,7 @@ class SpriteItem(LevelEditorItem):
         """
         Paints the sprite
         """
+        remote_selected = bool(str(getattr(self, '_collab_selected_by', '') or '')) and not self.isSelected()
 
         # Setup stuff
         if option is not None:
@@ -2396,10 +2501,15 @@ class SpriteItem(LevelEditorItem):
             drawSpritebox = self.ImageObj.spritebox.shown
 
             # Draw the selected-sprite-image overlay box
-            if self.isSelected() and (not drawSpritebox or self.ImageObj.size != (16, 16)):
-                painter.setPen(QtGui.QPen(globals_.theme.color('sprite_lines_s'), 1, QtCore.Qt.PenStyle.DashLine))
-                painter.drawRect(self.SelectionRect)
-                painter.fillRect(self.SelectionRect, globals_.theme.color('sprite_fill_s'))
+            if (self.isSelected() or remote_selected) and (not drawSpritebox or self.ImageObj.size != (16, 16)):
+                if self.isSelected():
+                    painter.setPen(QtGui.QPen(globals_.theme.color('sprite_lines_s'), 1, QtCore.Qt.PenStyle.DashLine))
+                    painter.drawRect(self.SelectionRect)
+                    painter.fillRect(self.SelectionRect, globals_.theme.color('sprite_fill_s'))
+                else:
+                    painter.setPen(QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine))
+                    painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                    painter.drawRect(self.SelectionRect)
 
             # Determine the spritebox position
             if drawSpritebox:
@@ -2419,6 +2529,14 @@ class SpriteItem(LevelEditorItem):
             else:
                 painter.drawRect(spriteboxRect)
 
+            if remote_selected:
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.setPen(QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine))
+                if globals_.theme.useRoundedRectangles:
+                    painter.drawRoundedRect(spriteboxRect, 4, 4)
+                else:
+                    painter.drawRect(spriteboxRect)
+
             painter.setFont(self.font)
             painter.drawText(spriteboxRect, QtCore.Qt.AlignmentFlag.AlignCenter, str(self.type))
 
@@ -2432,6 +2550,10 @@ class SpriteItem(LevelEditorItem):
         """
         Delete the sprite from the level
         """
+        try:
+            globals_.mainWindow.CollabQueueSpriteDelete(self)
+        except Exception:
+            pass
         self.ImageObj.remove()
         globals_.mainWindow.UpdateFlag = True
         globals_.mainWindow.spriteList.takeSprite(self)
@@ -2439,6 +2561,15 @@ class SpriteItem(LevelEditorItem):
         globals_.mainWindow.spriteList.selectionModel().clearSelection()
         globals_.Area.RemoveSprite(self)
         self.scene().update()  # The zone painters need for the whole thing to update
+        try:
+            globals_.mainWindow.UpdateRotationControllerPreviews()
+        except Exception:
+            pass
+        try:
+            if getattr(globals_, 'EventLinksShown', False):
+                globals_.mainWindow.UpdateEventLinks()
+        except Exception:
+            pass
 
 
 class EntranceItem(LevelEditorItem):
@@ -2448,6 +2579,7 @@ class EntranceItem(LevelEditorItem):
     instanceDef = InstanceDefinition_EntranceItem
     BoundingRect = QtCore.QRectF(0, 0, 24, 24)
     RoundedRect = QtCore.QRectF(1, 1, 22, 22)
+    EntranceImages = None
 
     class AuxEntranceItem(QtWidgets.QGraphicsItem):
         """
@@ -2538,20 +2670,12 @@ class EntranceItem(LevelEditorItem):
         """
         Creates an entrance with specific data
         """
-        if globals_.EntranceImages is None:
+        if EntranceItem.EntranceImages is None:
             ei = []
             src = QtGui.QPixmap(os.path.join('reggiedata', 'entrances.png'))
-            
-            # Calculate total number of 24x24 tiles in the image (supports multiple rows)
-            cols = src.width() // 24
-            rows = src.height() // 24
-            
-            # Load images row by row, left to right
-            for row in range(rows):
-                for col in range(cols):
-                    ei.append(src.copy(col * 24, row * 24, 24, 24))
-            
-            globals_.EntranceImages = ei
+            for i in range(18):
+                ei.append(src.copy(i * 24, 0, 24, 24))
+            EntranceItem.EntranceImages = ei
 
         LevelEditorItem.__init__(self)
 
@@ -2659,6 +2783,10 @@ class EntranceItem(LevelEditorItem):
         # Update the scene and level overview
         globals_.mainWindow.scene.update(old_rect.united(self.getFullRect()))
         globals_.mainWindow.levelOverview.update()
+        try:
+            globals_.mainWindow.UpdatePipeEntranceLinks()
+        except Exception:
+            pass
 
     def paint(self, painter, option, widget):
         """
@@ -2666,6 +2794,7 @@ class EntranceItem(LevelEditorItem):
         """
         painter.setClipRect(option.exposedRect)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        remote_selected = bool(str(getattr(self, '_collab_selected_by', '') or '')) and not self.isSelected()
 
         if self.isSelected():
             painter.setBrush(QtGui.QBrush(globals_.theme.color('entrance_fill_s')))
@@ -2678,10 +2807,36 @@ class EntranceItem(LevelEditorItem):
             painter.drawRoundedRect(self.RoundedRect, 4, 4)
         else:
             painter.drawRect(self.RoundedRect)
+        if remote_selected:
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.setPen(QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine))
+            if globals_.theme.useRoundedRectangles:
+                painter.drawRoundedRect(self.RoundedRect, 4, 4)
+            else:
+                painter.drawRect(self.RoundedRect)
 
-        # Direct 1:1 mapping: entrance type ID = image index
-        img_index = min(self.enttype, len(globals_.EntranceImages) - 1)
-        painter.drawPixmap(0, 0, globals_.EntranceImages[img_index])
+        icontype = 0
+        enttype = self.enttype
+        if enttype == 0 or enttype == 1: icontype = 1  # normal
+        if enttype == 2: icontype = 2  # door exit
+        if enttype == 3: icontype = 4  # pipe up
+        if enttype == 4: icontype = 5  # pipe down
+        if enttype == 5: icontype = 6  # pipe left
+        if enttype == 6: icontype = 7  # pipe right
+        if enttype == 8: icontype = 12  # ground pound
+        if enttype == 9: icontype = 13  # sliding
+        # 0F/15 is unknown?
+        if enttype == 16: icontype = 8  # mini pipe up
+        if enttype == 17: icontype = 9  # mini pipe down
+        if enttype == 18: icontype = 10  # mini pipe left
+        if enttype == 19: icontype = 11  # mini pipe right
+        if enttype == 20: icontype = 15  # jump out facing right
+        if enttype == 21: icontype = 17  # vine entrance
+        if enttype == 23: icontype = 14  # boss battle entrance
+        if enttype == 24: icontype = 16  # jump out facing left
+        if enttype == 27: icontype = 3  # door entrance
+
+        painter.drawPixmap(0, 0, EntranceItem.EntranceImages[icontype])
 
         painter.setFont(self.font)
         painter.drawText(3, 12, str(self.entid))
@@ -2697,6 +2852,14 @@ class EntranceItem(LevelEditorItem):
         elist.selectionModel().clearSelection()
         globals_.Area.entrances.remove(self)
         self.scene().update(self.x(), self.y(), self.BoundingRect.width(), self.BoundingRect.height())
+        try:
+            globals_.mainWindow.CollabQueueEntranceDelete(self)
+        except Exception:
+            pass
+        try:
+            globals_.mainWindow.UpdatePipeEntranceLinks()
+        except Exception:
+            pass
 
     def itemChange(self, change, value):
         """
@@ -2762,12 +2925,23 @@ class Path:
         """
         if self._id == new_id:
             return False
-
+        old_id = self._id
         self._id = new_id
 
         for node in self._nodes:
             node.set_path_id(new_id)
 
+        try:
+            mw = globals_.mainWindow
+            if not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False):
+                mw._CollabMarkItemHot(self)
+        except Exception:
+            pass
+        try:
+            globals_.mainWindow.CollabQueuePathDelete(old_id)
+            globals_.mainWindow.CollabQueuePathSet(self)
+        except Exception:
+            pass
         return True
 
     def set_node_data(self, node, speed=None, accel=None, delay=None):
@@ -2787,7 +2961,20 @@ class Path:
         if delay is not None:
             data.delay = delay
 
-        return (data.speed, data.accel, data.delay) != old_data
+        changed = (data.speed, data.accel, data.delay) != old_data
+        if changed:
+            try:
+                mw = globals_.mainWindow
+                if not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False):
+                    mw._CollabMarkItemHot(self)
+                    mw._CollabMarkItemHot(node)
+            except Exception:
+                pass
+            try:
+                globals_.mainWindow.CollabQueuePathNodeUpdate(node)
+            except Exception:
+                pass
+        return changed
 
     def set_loops(self, value):
         """
@@ -2799,11 +2986,17 @@ class Path:
 
         self._loops = value
         self._line_item.update_path()
-        
-        # Force scene update to ensure the visual change is rendered
-        if self._has_line:
-            self._scene.update()
 
+        try:
+            mw = globals_.mainWindow
+            if not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False):
+                mw._CollabMarkItemHot(self)
+        except Exception:
+            pass
+        try:
+            globals_.mainWindow.CollabQueuePathConfigUpdate(self)
+        except Exception:
+            pass
         return True
 
     def set_freeze(self, frozen):
@@ -2859,7 +3052,10 @@ class Path:
         return points
 
     def get_data_for_node(self, node_id):
-        data = self._node_data[node_id]
+        try:
+            data = self._node_data[int(node_id)]
+        except Exception:
+            return 0.5, 0.00498, 0
         return data.speed, data.accel, data.delay
 
     def add_node(self, x, y, speed = 0.5, accel = 0.00498, delay = 0, index = None, add_to_list = True, add_to_scene = True):
@@ -2872,6 +3068,10 @@ class Path:
             index = len(self._nodes)
 
         node = PathItem(x, y, self._id, index, self)
+        try:
+            node._collab_id = uuid.uuid4().hex
+        except Exception:
+            pass
 
         self._nodes.insert(index, node)
         self._node_data.insert(index, Path.NodeData(speed, accel, delay))
@@ -2893,6 +3093,17 @@ class Path:
             self._has_line = True
 
         self._line_item.update_path()
+        try:
+            mw = globals_.mainWindow
+            if not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False):
+                mw._CollabMarkItemHot(self)
+                mw._CollabMarkItemHot(node)
+        except Exception:
+            pass
+        try:
+            globals_.mainWindow.CollabQueuePathNodeAdd(self, node)
+        except Exception:
+            pass
 
         return node
 
@@ -2902,6 +3113,7 @@ class Path:
         this node has been removed.
         """
         node = self._nodes[index]
+        node_collab_id = str(getattr(node, '_collab_id', '') or '')
 
         # hacky stuff
         plist = globals_.mainWindow.pathList
@@ -2916,13 +3128,43 @@ class Path:
         del self._nodes[index]
         del self._node_data[index]
 
+        try:
+            node.setSelected(False)
+        except Exception:
+            pass
+        try:
+            self._scene.removeItem(node)
+        except Exception:
+            pass
+
         # Update ids of later nodes
         for new_id, later_node in enumerate(self._nodes[index:], index):
             later_node.nodeid = new_id
             later_node.update()
 
         # Update line item
-        self._line_item.update_path()
+        if len(self._nodes) == 0:
+            if self._has_line:
+                try:
+                    self._scene.removeItem(self._line_item)
+                except Exception:
+                    pass
+                self._has_line = False
+        else:
+            self._line_item.update_path()
+        try:
+            mw = globals_.mainWindow
+            if not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False):
+                mw._CollabMarkItemHot(self)
+        except Exception:
+            pass
+        try:
+            if len(self._nodes) == 0:
+                globals_.mainWindow.CollabQueuePathDelete(getattr(self, '_id', None))
+            else:
+                globals_.mainWindow.CollabQueuePathNodeDelete(getattr(self, '_id', None), index, node_collab_id)
+        except Exception:
+            pass
 
         return len(self._nodes) == 0
 
@@ -2957,9 +3199,29 @@ class Path:
             node.update_id(new_id)
 
         self._line_item.update_path()
+        try:
+            mw = globals_.mainWindow
+            if not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False):
+                mw._CollabMarkItemHot(self)
+                mw._CollabMarkItemHot(node)
+        except Exception:
+            pass
+        try:
+            globals_.mainWindow.CollabQueuePathNodeOrder(self)
+        except Exception:
+            pass
 
     def node_moved(self, node):
         self._line_item.update_path()
+        try:
+            mw = globals_.mainWindow
+            if not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False):
+                mw._CollabMarkItemHot(self)
+                mw._CollabMarkItemHot(node)
+        except Exception:
+            pass
+        # Network sync for node dragging is handled by the editor's drag handler
+        # (delta ops). Avoid full meta snapshots from here.
 
     def __len__(self):
         """
@@ -2988,6 +3250,7 @@ class PathItem(LevelEditorItem):
         self.pathid = path_id
         self.nodeid = node_id
         self.path = parent
+        self._collab_id = uuid.uuid4().hex
 
         self.listitem = ListWidgetItem_SortsByOther(self, self.ListString())
 
@@ -3051,6 +3314,7 @@ class PathItem(LevelEditorItem):
         """
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         painter.setClipRect(option.exposedRect)
+        remote_selected = bool(str(getattr(self, '_collab_selected_by', '') or '')) and not self.isSelected()
 
         if self.isSelected():
             painter.setBrush(QtGui.QBrush(globals_.theme.color('path_fill_s')))
@@ -3063,6 +3327,13 @@ class PathItem(LevelEditorItem):
             painter.drawRoundedRect(self.RoundedRect, 4, 4)
         else:
             painter.drawRect(self.RoundedRect)
+        if remote_selected:
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.setPen(QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine))
+            if globals_.theme.useRoundedRectangles:
+                painter.drawRoundedRect(self.RoundedRect, 4, 4)
+            else:
+                painter.drawRect(self.RoundedRect)
 
         painter.setFont(self.font)
         painter.drawText(4, 11, str(self.pathid))
@@ -3112,9 +3383,6 @@ class PathEditorLineItem(QtWidgets.QGraphicsPathItem):
         line_path.addPolygon(QtGui.QPolygonF(points))
 
         old_rect = self.boundingRect()
-        
-        # Notify Qt that the geometry is about to change
-        self.prepareGeometryChange()
 
         self.setPath(line_path)
 
@@ -3122,11 +3390,173 @@ class PathEditorLineItem(QtWidgets.QGraphicsPathItem):
         # remain on the scene if we do not update the scene manually...
         if old_rect:
             globals_.mainWindow.scene.update(old_rect)
-        
-        # Also update the new rect to ensure the loop connection is drawn
-        new_rect = self.boundingRect()
-        if new_rect:
-            globals_.mainWindow.scene.update(new_rect)
+
+
+class PipeEntranceLinkItem(QtWidgets.QGraphicsPathItem):
+    def __init__(self, src, dst, label):
+        super().__init__()
+
+        self.src = src
+        self.dst = dst
+        self.hover = False
+
+        self.setFlag(self.GraphicsItemFlag.ItemIsMovable, False)
+        self.setFlag(self.GraphicsItemFlag.ItemIsSelectable, False)
+
+        color = globals_.theme.color('entrance_pipe_connector')
+        self.setPen(QtGui.QPen(color, 3, join=QtCore.Qt.PenJoinStyle.RoundJoin, cap=QtCore.Qt.PenCapStyle.RoundCap))
+
+        self._text_item = QtWidgets.QGraphicsSimpleTextItem(str(label), self)
+        self._text_item.setBrush(QtGui.QBrush(color))
+        self._text_item.setFont(globals_.NumberFont)
+
+        self.update_link()
+        self.setZValue(25001)
+
+    def update_link(self):
+        try:
+            p1 = self.src.sceneBoundingRect().center()
+            p2 = self.dst.sceneBoundingRect().center()
+        except Exception:
+            return
+
+        old_rect = self.boundingRect()
+
+        line_path = QtGui.QPainterPath(p1)
+        line_path.lineTo(p2)
+        self.setPath(line_path)
+
+        tx = p1.x() + (p2.x() - p1.x()) * 0.35
+        ty = p1.y() + (p2.y() - p1.y()) * 0.35
+        tr = self._text_item.boundingRect()
+        self._text_item.setPos(tx - tr.width() / 2, ty - tr.height() / 2)
+
+        if old_rect:
+            globals_.mainWindow.scene.update(old_rect)
+
+
+class RotationControllerPreviewItem(QtWidgets.QGraphicsPathItem):
+    def __init__(self, controller, rects, color=None, fill=None):
+        super().__init__()
+
+        self.controller = controller
+        self.rects = rects
+        self.hover = False
+
+        self.setFlag(self.GraphicsItemFlag.ItemIsMovable, False)
+        self.setFlag(self.GraphicsItemFlag.ItemIsSelectable, False)
+
+        if color is None:
+            color = QtGui.QColor(0, 255, 255, 160)
+        self.setPen(QtGui.QPen(color, 2, join=QtCore.Qt.PenJoinStyle.RoundJoin, cap=QtCore.Qt.PenCapStyle.RoundCap))
+        if fill is None:
+            self.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        else:
+            self.setBrush(QtGui.QBrush(fill))
+
+        self.update_preview()
+        self.setZValue(25000)
+
+    def update_preview(self):
+        if not self.rects:
+            self.setPath(QtGui.QPainterPath())
+            return
+
+        old_rect = self.boundingRect()
+
+        path = QtGui.QPainterPath()
+        for r in self.rects:
+            path.addRect(r)
+        self.setPath(path)
+
+        if old_rect:
+            globals_.mainWindow.scene.update(old_rect)
+
+
+class EventLinkItem(QtWidgets.QGraphicsPathItem):
+    def __init__(self, src, dst, label):
+        super().__init__()
+
+        self.src = src
+        self.dst = dst
+        self.hover = False
+
+        self.setFlag(self.GraphicsItemFlag.ItemIsMovable, False)
+        self.setFlag(self.GraphicsItemFlag.ItemIsSelectable, False)
+
+        color = QtGui.QColor(255, 0, 0, 180)
+        self.setPen(QtGui.QPen(color, 3, join=QtCore.Qt.PenJoinStyle.RoundJoin, cap=QtCore.Qt.PenCapStyle.RoundCap))
+
+        self._text_item = QtWidgets.QGraphicsSimpleTextItem(str(label), self)
+        self._text_item.setBrush(QtGui.QBrush(color))
+        self._text_item.setFont(globals_.NumberFont)
+
+        self.update_link()
+        self.setZValue(25001)
+
+    def update_link(self):
+        try:
+            p1 = self.src.sceneBoundingRect().center()
+            p2 = self.dst.sceneBoundingRect().center()
+        except Exception:
+            return
+
+        old_rect = self.boundingRect()
+
+        line_path = QtGui.QPainterPath(p1)
+        line_path.lineTo(p2)
+        self.setPath(line_path)
+
+        tx = p1.x() + (p2.x() - p1.x()) * 0.35
+        ty = p1.y() + (p2.y() - p1.y()) * 0.35
+        tr = self._text_item.boundingRect()
+        self._text_item.setPos(tx - tr.width() / 2, ty - tr.height() / 2)
+
+        if old_rect:
+            globals_.mainWindow.scene.update(old_rect)
+
+
+class LocationLinkItem(QtWidgets.QGraphicsPathItem):
+    def __init__(self, src, dst, label):
+        super().__init__()
+
+        self.src = src
+        self.dst = dst
+        self.hover = False
+
+        self.setFlag(self.GraphicsItemFlag.ItemIsMovable, False)
+        self.setFlag(self.GraphicsItemFlag.ItemIsSelectable, False)
+
+        color = QtGui.QColor(180, 0, 255, 180)
+        self.setPen(QtGui.QPen(color, 3, join=QtCore.Qt.PenJoinStyle.RoundJoin, cap=QtCore.Qt.PenCapStyle.RoundCap))
+
+        self._text_item = QtWidgets.QGraphicsSimpleTextItem(str(label), self)
+        self._text_item.setBrush(QtGui.QBrush(color))
+        self._text_item.setFont(globals_.NumberFont)
+
+        self.update_link()
+        self.setZValue(25002)
+
+    def update_link(self):
+        try:
+            p1 = self.src.sceneBoundingRect().center()
+            p2 = self.dst.sceneBoundingRect().center()
+        except Exception:
+            return
+
+        old_rect = self.boundingRect()
+
+        line_path = QtGui.QPainterPath(p1)
+        line_path.lineTo(p2)
+        self.setPath(line_path)
+
+        tx = p1.x() + (p2.x() - p1.x()) * 0.35
+        ty = p1.y() + (p2.y() - p1.y()) * 0.35
+        tr = self._text_item.boundingRect()
+        self._text_item.setPos(tx - tr.width() / 2, ty - tr.height() / 2)
+
+        if old_rect:
+            globals_.mainWindow.scene.update(old_rect)
 
 
 class CommentItem(LevelEditorItem):
@@ -3230,6 +3660,7 @@ class CommentItem(LevelEditorItem):
         """
         painter.setClipRect(option.exposedRect)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        remote_selected = bool(str(getattr(self, '_collab_selected_by', '') or '')) and not self.isSelected()
 
         if self.isSelected():
             painter.setBrush(QtGui.QBrush(globals_.theme.color('comment_fill_s')))
@@ -3243,6 +3674,11 @@ class CommentItem(LevelEditorItem):
             painter.setPen(p)
 
         painter.drawEllipse(self.Circle)
+        if remote_selected:
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            p = QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine)
+            painter.setPen(p)
+            painter.drawEllipse(self.Circle)
         if not self.isSelected(): painter.setOpacity(.5)
         painter.drawPixmap(4, 4, GetIcon('comments', 24).pixmap(24, 24))
         painter.setOpacity(1)
@@ -3312,4 +3748,7 @@ class CommentItem(LevelEditorItem):
         globals_.Area.comments.remove(self)
         self.scene().update(self.x(), self.y(), self.BoundingRect.width(), self.BoundingRect.height())
         globals_.mainWindow.SaveComments()
-
+        try:
+            globals_.mainWindow.CollabQueueCommentDelete(self)
+        except Exception:
+            pass

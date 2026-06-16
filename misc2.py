@@ -4,6 +4,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 import globals_
 from levelitems import ListWidgetItem_SortsByOther, PathItem, CommentItem, SpriteItem, EntranceItem, LocationItem, ObjectItem, PathEditorLineItem
+from tiles import RenderObject
 from dirty import SetDirty
 
 class LevelScene(QtWidgets.QGraphicsScene):
@@ -21,10 +22,6 @@ class LevelScene(QtWidgets.QGraphicsScene):
         """
         QtWidgets.QGraphicsScene.drawBackground(self, painter, rect)
         if not hasattr(globals_.Area, 'layers'): return
-
-        # PyQt6 fix: Disable smooth transform to prevent sub-pixel gaps between tiles
-        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, False)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
 
         drawrect = QtCore.QRectF(rect.x() / 24, rect.y() / 24, rect.width() / 24 + 1, rect.height() / 24 + 1)
         isect = drawrect.intersects
@@ -114,6 +111,186 @@ class LevelScene(QtWidgets.QGraphicsScene):
         return globals_.mainWindow
 
 
+class ChatWindow(QtWidgets.QWidget):
+    def __init__(self, parent=None, send_callback=None):
+        super().__init__(parent)
+        self._send_callback = send_callback
+        self._expanded = False
+
+        self.setWindowTitle('Chat')
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.Tool
+            | QtCore.Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        self.setObjectName('CollabChatOverlay')
+        self.setFixedWidth(360)
+
+        self._collapse_timer = QtCore.QTimer(self)
+        self._collapse_timer.setSingleShot(True)
+        self._collapse_timer.setInterval(4500)
+        self._collapse_timer.timeout.connect(self._CollapseIfIdle)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.panel = QtWidgets.QFrame(self)
+        self.panel.setObjectName('CollabChatPanel')
+        layout.addWidget(self.panel)
+
+        panel_layout = QtWidgets.QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(10, 8, 10, 10)
+        panel_layout.setSpacing(6)
+
+        self.levelLabel = QtWidgets.QLabel('Level: -', self.panel)
+        self.levelLabel.setObjectName('CollabChatLevel')
+        self.levelLabel.setWordWrap(False)
+        panel_layout.addWidget(self.levelLabel)
+
+        self.view = QtWidgets.QPlainTextEdit(self.panel)
+        self.view.setReadOnly(True)
+        self.view.setMaximumBlockCount(300)
+        self.view.setMinimumHeight(150)
+        self.view.setMaximumHeight(180)
+        self.view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.view.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        panel_layout.addWidget(self.view, 1)
+
+        self.input = QtWidgets.QLineEdit(self.panel)
+        self.input.setPlaceholderText('Enter to send...')
+        self.input.setFrame(False)
+        self.input.returnPressed.connect(self._HandleSend)
+        self.input.installEventFilter(self)
+        panel_layout.addWidget(self.input)
+
+        self.setStyleSheet(
+            '#CollabChatOverlay { background: transparent; }'
+            '#CollabChatPanel {'
+            '  background: rgba(18, 24, 32, 112);'
+            '  border: 1px solid rgba(255, 255, 255, 28);'
+            '  border-radius: 12px;'
+            '}'
+            '#CollabChatLevel {'
+            '  color: rgba(255, 255, 255, 205);'
+            '  font-weight: 600;'
+            '  padding: 0 2px 2px 2px;'
+            '}'
+            'QPlainTextEdit {'
+            '  background: rgba(255, 255, 255, 10);'
+            '  border: 1px solid rgba(255, 255, 255, 18);'
+            '  border-radius: 8px;'
+            '  color: white;'
+            '  padding: 6px;'
+            '  selection-background-color: rgba(255,255,255,80);'
+            '}'
+            'QLineEdit {'
+            '  background: rgba(255, 255, 255, 14);'
+            '  border: 1px solid rgba(255, 255, 255, 22);'
+            '  border-radius: 8px;'
+            '  color: white;'
+            '  padding: 7px 9px;'
+            '  selection-background-color: rgba(255,255,255,80);'
+            '}'
+        )
+
+        self.setExpanded(False)
+
+    def eventFilter(self, obj, event):
+        if obj is self.input:
+            if event.type() == QtCore.QEvent.Type.FocusIn:
+                self.setExpanded(True)
+            elif event.type() == QtCore.QEvent.Type.FocusOut:
+                QtCore.QTimer.singleShot(0, self._ScheduleCollapse)
+        return super().eventFilter(obj, event)
+
+    def _HandleSend(self):
+        text = self.input.text().strip()
+        if not text:
+            return
+        self.input.clear()
+        self.setExpanded(True)
+        cb = self._send_callback
+        if cb is not None:
+            try:
+                cb(text)
+            except Exception:
+                pass
+
+    def addLine(self, text):
+        try:
+            self.view.appendPlainText(str(text))
+            self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+        except Exception:
+            pass
+        self.setExpanded(True, auto_collapse=True)
+
+    def setLevelText(self, text):
+        self.levelLabel.setText(str(text or 'Level: -'))
+
+    def setAutoHideDelay(self, delay_ms):
+        try:
+            delay_ms = int(delay_ms)
+        except Exception:
+            delay_ms = 4500
+        self._collapse_timer.setInterval(max(0, delay_ms))
+
+    def activateInput(self):
+        self.setExpanded(True)
+        self.raise_()
+        self.activateWindow()
+        self.input.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
+        self.input.selectAll()
+        QtCore.QTimer.singleShot(0, self._ForceInputFocus)
+
+    def setExpanded(self, expanded, auto_collapse=False):
+        self._expanded = bool(expanded)
+        if self._expanded:
+            self.panel.show()
+            self.view.show()
+            self.show()
+            self.adjustSize()
+            if auto_collapse and not self.input.hasFocus():
+                self._ScheduleCollapse()
+            else:
+                self._collapse_timer.stop()
+        else:
+            self._collapse_timer.stop()
+            self.panel.hide()
+            self.view.hide()
+            self.input.clearFocus()
+            self.clearFocus()
+            self.hide()
+
+    def _ScheduleCollapse(self):
+        if self.input.hasFocus():
+            return
+        self._collapse_timer.start()
+
+    def _CollapseIfIdle(self):
+        if self.input.hasFocus():
+            return
+        self.setExpanded(False)
+
+    def _ForceInputFocus(self):
+        if not self.isVisible():
+            return
+        self.raise_()
+        self.activateWindow()
+        self.input.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            self.clearFocus()
+            self.input.clearFocus()
+            self.setExpanded(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class LevelViewWidget(QtWidgets.QGraphicsView):
     """
     QGraphicsView subclass for the level view
@@ -145,19 +322,71 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         short_END.activated.connect(lambda: self.XScrollBar.setValue(self.XScrollBar.value() + self.XScrollBar.pageStep()))
 
         self.currentobj = None
+        self.pendingPaintUndo = None
+        self.pixelBrushStroke = None
         self.lastCursorPosForMidButtonScroll = None
         self.cursorEdgeScrollTimer = None
+
+    def _GetPixelBrushTilePos(self, scene_pos, footprint):
+        clickedx = int(max(0, scene_pos.x()) / 24)
+        clickedy = int(max(0, scene_pos.y()) / 24)
+        width, height = footprint
+        if width > 1:
+            clickedx = (clickedx // width) * width
+        if height > 1:
+            clickedy = (clickedy // height) * height
+        return clickedx, clickedy
+
+    def _BeginPixelBrushStroke(self, scene_pos):
+        mw = globals_.mainWindow
+        footprint = mw.GetPixelBrushObjectSize(globals_.CurrentPaintType, globals_.CurrentObject)
+        stroke = {
+            'tileset': int(globals_.CurrentPaintType),
+            'type': int(globals_.CurrentObject),
+            'layer': int(globals_.CurrentLayer),
+            'footprint': footprint,
+            'positions': set(),
+            'objects': [],
+        }
+        self.pixelBrushStroke = stroke
+        self._PaintPixelBrushAt(scene_pos)
+
+    def _PaintPixelBrushAt(self, scene_pos):
+        stroke = self.pixelBrushStroke
+        if stroke is None:
+            return None
+
+        clickedx, clickedy = self._GetPixelBrushTilePos(scene_pos, stroke['footprint'])
+        key = (clickedx, clickedy)
+        if key in stroke['positions']:
+            return None
+
+        obj = globals_.mainWindow.CreateObject(
+            stroke['tileset'],
+            stroke['type'],
+            stroke['layer'],
+            clickedx,
+            clickedy,
+            stroke['footprint'][0],
+            stroke['footprint'][1],
+            record_undo=False,
+        )
+        if obj is None:
+            return None
+
+        obj.wasExtended = True
+        stroke['positions'].add(key)
+        stroke['objects'].append(obj)
+        return obj
 
     def mousePressEvent(self, event):
         """
         Overrides mouse pressing events if needed
         """
-        # Check if Quick Paint Tool should handle this event
         try:
             qpt_funcs = getattr(globals_, 'qpt_functions', None)
-            if qpt_funcs:
-                result = qpt_funcs['press'](event)
-                if result:
+            if qpt_funcs and qpt_funcs.get('press'):
+                if qpt_funcs['press'](event):
                     event.accept()
                     return
         except Exception as e:
@@ -170,47 +399,58 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
             self.xButtonScrollTimer.timeout.connect(
                 lambda: self.XScrollBar.setValue(self.XScrollBar.value() - self.XScrollBar.singleStep())
             )
-            self.xButtonScrollTimer.start(30)
+            self.xButtonScrollTimer.start(100)
 
         elif event.button() == QtCore.Qt.MouseButton.ForwardButton:
             self.xButtonScrollTimer = QtCore.QTimer()
             self.xButtonScrollTimer.timeout.connect(
                 lambda: self.XScrollBar.setValue(self.XScrollBar.value() + self.XScrollBar.singleStep())
             )
-            self.xButtonScrollTimer.start(30)
+            self.xButtonScrollTimer.start(100)
 
         elif event.button() == QtCore.Qt.MouseButton.RightButton:
             clicked = globals_.mainWindow.view.mapToScene(event.pos().x(), event.pos().y())
             if clicked.x() < 0: clicked.setX(0)
             if clicked.y() < 0: clicked.setY(0)
 
+            self.pendingPaintUndo = None
+
             if 0 <= globals_.CurrentPaintType < 4 and globals_.CurrentObject != -1 and [globals_.Layer0Shown, globals_.Layer1Shown, globals_.Layer2Shown][globals_.CurrentLayer]:
                 # paint an object
-                clickedx = int(clicked.x() / 24)
-                clickedy = int(clicked.y() / 24)
+                if globals_.mainWindow.ShouldUsePixelBrush():
+                    self.dragstamp = False
+                    self.currentobj = None
+                    self._BeginPixelBrushStroke(clicked)
+                else:
+                    clickedx = int(clicked.x() / 24)
+                    clickedy = int(clicked.y() / 24)
 
-                obj = globals_.mainWindow.CreateObject(
-                    globals_.CurrentPaintType, globals_.CurrentObject, globals_.CurrentLayer,
-                    clickedx, clickedy
-                )
+                    obj = globals_.mainWindow.CreateObject(
+                        globals_.CurrentPaintType, globals_.CurrentObject, globals_.CurrentLayer,
+                        clickedx, clickedy, record_undo=False
+                    )
 
-                self.dragstamp = False
-                self.currentobj = obj
-                self.dragstartx = clickedx
-                self.dragstarty = clickedy
+                    self.dragstamp = False
+                    self.currentobj = obj
+                    self.dragstartx = clickedx
+                    self.dragstarty = clickedy
+                    if obj is not None:
+                        self.pendingPaintUndo = ('inst', (obj,))
 
             elif globals_.CurrentPaintType == 4 and globals_.CurrentSprite >= 0 and globals_.SpritesShown:
                 # paint a sprite
                 clickedx = int((clicked.x() - 12) / 12) * 8
                 clickedy = int((clicked.y() - 12) / 12) * 8
 
-                spr = globals_.mainWindow.CreateSprite(clickedx, clickedy, globals_.CurrentSprite)
+                spr = globals_.mainWindow.CreateSprite(clickedx, clickedy, globals_.CurrentSprite, record_undo=False)
                 spr.UpdateDynamicSizing()
 
                 self.dragstamp = False
                 self.currentobj = spr
                 self.dragstartx = clickedx
                 self.dragstarty = clickedy
+                if spr is not None:
+                    self.pendingPaintUndo = ('inst', (spr,))
 
                 self.scene().update()
 
@@ -219,12 +459,138 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                 clickedx = int((clicked.x() - 12) / 1.5)
                 clickedy = int((clicked.y() - 12) / 1.5)
 
-                ent = globals_.mainWindow.CreateEntrance(clickedx, clickedy)
+                enttype = None
+                try:
+                    tilex = int(clicked.x() / 24)
+                    tiley = int(clicked.y() / 24)
+                    under = self.scene().items(clicked)
+                    door_sprite_types = {182, 259, 276, 277, 278, 452}
+                    for it in under:
+                        if isinstance(it, SpriteItem):
+                            st = int(it.type)
+                            if st in door_sprite_types:
+                                enttype = 27
+                                break
+                            if st in (339, 377, 450):
+                                enttype = 3
+                                break
+                            if st in (353, 378):
+                                enttype = 4
+                                break
+                            if st == 379:
+                                enttype = 6
+                                break
+                            if st == 380:
+                                enttype = 5
+                                break
+                        if isinstance(it, ObjectItem):
+                            ot = int(getattr(it, 'type', -1))
+                            if ot in (65, 73, 79):
+                                enttype = 3
+                                break
+                            if ot in (66, 74, 80):
+                                enttype = 4
+                                break
+                            if ot in (67, 75, 81):
+                                enttype = 5
+                                break
+                            if ot in (68, 76, 82):
+                                enttype = 6
+                                break
+                            if ot == 86:
+                                enttype = 16
+                                break
+                            if ot == 87:
+                                enttype = 17
+                                break
+                            if ot == 88:
+                                enttype = 18
+                                break
+                            if ot == 89:
+                                enttype = 19
+                                break
+                    if enttype is None:
+                        candidates = (
+                            (3, {65, 73, 79}),
+                            (4, {66, 74, 80}),
+                            (5, {67, 75, 81}),
+                            (6, {68, 76, 82}),
+                            (16, {86}),
+                            (17, {87}),
+                            (18, {88}),
+                            (19, {89}),
+                        )
+                        for layer in getattr(globals_.Area, 'layers', []):
+                            for obj in reversed(layer):
+                                if not isinstance(obj, ObjectItem):
+                                    continue
+                                ox = int(obj.objx)
+                                oy = int(obj.objy)
+                                bw = int(obj.width)
+                                bh = int(obj.height)
+                                rx = tilex - ox
+                                ry = tiley - oy
+                                if not (0 <= rx < bw and 0 <= ry < bh):
+                                    continue
+                                ot = int(getattr(obj, 'type', -1))
+                                if ot in (65, 73, 79):
+                                    enttype = 3
+                                    break
+                                if ot in (66, 74, 80):
+                                    enttype = 4
+                                    break
+                                if ot in (67, 75, 81):
+                                    enttype = 5
+                                    break
+                                if ot in (68, 76, 82):
+                                    enttype = 6
+                                    break
+                                if ot == 86:
+                                    enttype = 16
+                                    break
+                                if ot == 87:
+                                    enttype = 17
+                                    break
+                                if ot == 88:
+                                    enttype = 18
+                                    break
+                                if ot == 89:
+                                    enttype = 19
+                                    break
+                                if enttype is not None:
+                                    break
+                                tiles = RenderObject(int(obj.tileset), int(obj.type), bw, bh)
+                                best = None
+                                for y in range(bh):
+                                    for x in range(bw):
+                                        tt = int(tiles[y][x]) % 256
+                                        for et, allowed in candidates:
+                                            if tt in allowed:
+                                                d = abs(x - rx) + abs(y - ry)
+                                                if best is None or d < best[0]:
+                                                    best = (d, et)
+                                if best is not None:
+                                    enttype = best[1]
+                                    break
+                            if enttype is not None:
+                                break
+                except Exception:
+                    enttype = None
+
+                ent = globals_.mainWindow.CreateEntrance(clickedx, clickedy, record_undo=False)
+                if ent is not None and enttype is not None:
+                    ent.enttype = enttype
+                    ent.TypeChange()
+                    ent.update()
+                    ent.UpdateTooltip()
+                    ent.UpdateListItem()
 
                 self.dragstamp = False
                 self.currentobj = ent
                 self.dragstartx = clickedx
                 self.dragstarty = clickedy
+                if ent is not None:
+                    self.pendingPaintUndo = ('inst', (ent,))
 
             elif globals_.CurrentPaintType == 6 and globals_.PathsShown:
                 # paint a path node
@@ -250,15 +616,21 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                     newpathid = getids.index(False)
 
                     from levelitems import Path
+                    from undo import PathNodeUndoAction
 
-                    path = Path(newpathid, globals_.mainWindow.scene)
+                    mw = globals_.mainWindow
+                    path = Path(newpathid, mw.scene)
                     new_node = path.add_node(clickedx, clickedy)
 
                     new_node.listitem.setSelected(True)
                     new_node.setSelected(True)
-                    new_node.positionChanged = globals_.mainWindow.HandlePathPosChange
+                    new_node.positionChanged = mw.HandlePathPosChange
 
                     globals_.Area.paths.append(path)
+                    try:
+                        mw.pathEditor.UpdatePathLength()
+                    except Exception:
+                        pass
 
                 else:
                     path_node = selectedpn.reference
@@ -270,16 +642,21 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                     else:
                         idx = len(path)
 
+                    from undo import PathNodeUndoAction
+
+                    mw = globals_.mainWindow
                     new_node = path.add_node(clickedx, clickedy, index=idx)
-                    new_node.positionChanged = globals_.mainWindow.HandlePathPosChange
+                    new_node.positionChanged = mw.HandlePathPosChange
 
                     # The path length changed, so update the editor's maximums
-                    globals_.mainWindow.pathEditor.UpdatePathLength()
+                    mw.pathEditor.UpdatePathLength()
 
                 self.dragstamp = False
                 self.currentobj = new_node
                 self.dragstartx = clickedx
                 self.dragstarty = clickedy
+                if new_node is not None:
+                    self.pendingPaintUndo = ('path_node', new_node)
 
                 SetDirty()
 
@@ -288,12 +665,14 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                 clickedx = int(clicked.x() / 1.5)
                 clickedy = int(clicked.y() / 1.5)
 
-                loc = globals_.mainWindow.CreateLocation(clickedx, clickedy)
+                loc = globals_.mainWindow.CreateLocation(clickedx, clickedy, record_undo=False)
 
                 self.dragstamp = False
                 self.currentobj = loc
                 self.dragstartx = clickedx
                 self.dragstarty = clickedy
+                if loc is not None:
+                    self.pendingPaintUndo = ('inst', (loc,))
 
             elif globals_.CurrentPaintType == 8:
                 # paint a stamp
@@ -303,7 +682,7 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
 
                 stamp = globals_.mainWindow.stampChooser.currentlySelectedStamp()
                 if stamp is not None:
-                    objs = globals_.mainWindow.placeEncodedObjects(stamp.ReggieClip, False, clickedx, clickedy)
+                    objs = globals_.mainWindow.placeEncodedObjects(stamp.ReggieClip, False, clickedx, clickedy, record_undo=False)
 
                     for obj in objs:
                         obj.dragstartx = obj.objx
@@ -316,6 +695,8 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                     self.dragstartx = clickedx
                     self.dragstarty = clickedy
                     self.currentobj = objs
+                    if objs:
+                        self.pendingPaintUndo = ('inst', tuple(objs))
 
                     SetDirty()
 
@@ -324,25 +705,16 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                 clickedx = int((clicked.x() - 12) / 1.5)
                 clickedy = int((clicked.y() - 12) / 1.5)
 
-                com = CommentItem(clickedx, clickedy, '')
                 mw = globals_.mainWindow
-                com.positionChanged = mw.HandleComPosChange
-                com.textChanged = mw.HandleComTxtChange
-                mw.scene.addItem(com)
+                com = mw.CreateComment(clickedx, clickedy, '', record_undo=False)
                 com.setVisible(globals_.CommentsShown)
-
-                clist = mw.commentList
-                com.listitem = QtWidgets.QListWidgetItem()
-                clist.addItem(com.listitem)
-
-                globals_.Area.comments.append(com)
 
                 self.dragstamp = False
                 self.currentobj = com
                 self.dragstartx = clickedx
                 self.dragstarty = clickedy
-
-                globals_.mainWindow.SaveComments()
+                if com is not None:
+                    self.pendingPaintUndo = ('inst', (com,))
 
                 com.UpdateListItem()
 
@@ -353,6 +725,80 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         elif event.button() == QtCore.Qt.MouseButton.MiddleButton:
             self.setDragMode(QtWidgets.QGraphicsView.DragMode.NoDrag)
             self.lastCursorPosForMidButtonScroll = event.pos()
+            QtWidgets.QGraphicsView.mousePressEvent(self, event)
+
+        elif event.button() == QtCore.Qt.MouseButton.LeftButton and QtWidgets.QApplication.keyboardModifiers() != QtCore.Qt.KeyboardModifier.ShiftModifier:
+            mw = globals_.mainWindow
+            source = getattr(mw, '_pipeEntranceLinkSource', None)
+            if source is not None:
+                pos = mw.view.mapToScene(event.pos().x(), event.pos().y())
+                items = mw.scene.items(pos)
+                target = None
+                for it in items:
+                    if isinstance(it, EntranceItem):
+                        target = it
+                        break
+                    if isinstance(it, EntranceItem.AuxEntranceItem) and isinstance(it.parentItem(), EntranceItem):
+                        target = it.parentItem()
+                        break
+                if target is not None:
+                    mw.HandlePipeEntranceLinkClick(target)
+                    event.accept()
+                    return
+                mw.CancelPipeEntranceLink()
+            source = getattr(mw, '_eventLinkSource', None)
+            if source is not None:
+                pos = mw.view.mapToScene(event.pos().x(), event.pos().y())
+                items = mw.scene.items(pos)
+                target = None
+                for it in items:
+                    if isinstance(it, SpriteItem):
+                        target = it
+                        break
+                    try:
+                        p = it.parentItem()
+                    except Exception:
+                        p = None
+                    if isinstance(p, SpriteItem):
+                        target = p
+                        break
+                if target is not None:
+                    mw.HandleEventLinkClick(target)
+                    event.accept()
+                    return
+            source = getattr(mw, '_rotationLinkSource', None)
+            if source is not None:
+                pos = mw.view.mapToScene(event.pos().x(), event.pos().y())
+                items = mw.scene.items(pos)
+                target = None
+                for it in items:
+                    if isinstance(it, SpriteItem):
+                        target = it
+                        break
+                    try:
+                        p = it.parentItem()
+                    except Exception:
+                        p = None
+                    if isinstance(p, SpriteItem):
+                        target = p
+                        break
+                if target is not None:
+                    mw.HandleRotationLinkClick(target)
+                    event.accept()
+                    return
+            source = getattr(mw, '_locationLinkSource', None)
+            if source is not None:
+                pos = mw.view.mapToScene(event.pos().x(), event.pos().y())
+                items = mw.scene.items(pos)
+                target = None
+                for it in items:
+                    if isinstance(it, LocationItem):
+                        target = it
+                        break
+                if target is not None:
+                    mw.HandleLocationLinkClick(target)
+                    event.accept()
+                    return
             QtWidgets.QGraphicsView.mousePressEvent(self, event)
 
         elif (event.button() == QtCore.Qt.MouseButton.LeftButton) and (QtWidgets.QApplication.keyboardModifiers() == QtCore.Qt.KeyboardModifier.ShiftModifier):
@@ -382,13 +828,12 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         """
         Overrides mouse movement events if needed
         """
-        # Check if Quick Paint Tool should handle this event
         try:
             qpt_funcs = getattr(globals_, 'qpt_functions', None)
-            if qpt_funcs and qpt_funcs['move'](event):
+            if qpt_funcs and qpt_funcs.get('move') and qpt_funcs['move'](event):
                 event.accept()
                 return
-        except Exception as e:
+        except Exception:
             pass
 
         pos = self.mapToScene(event.pos())
@@ -423,13 +868,12 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         """
         Overrides mouse release events if needed
         """
-        # Check if Quick Paint Tool should handle this event
         try:
             qpt_funcs = getattr(globals_, 'qpt_functions', None)
-            if qpt_funcs and qpt_funcs['release'](event):
+            if qpt_funcs and qpt_funcs.get('release') and qpt_funcs['release'](event):
                 event.accept()
                 return
-        except Exception as e:
+        except Exception:
             pass
 
         if event.button() in (QtCore.Qt.MouseButton.BackButton, QtCore.Qt.MouseButton.ForwardButton):
@@ -437,6 +881,58 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
             return
 
         if event.button() == QtCore.Qt.MouseButton.RightButton:
+            if self.pixelBrushStroke is not None:
+                try:
+                    final_objects = globals_.mainWindow.FinalizePixelBrushStroke(self.pixelBrushStroke)
+                except Exception:
+                    final_objects = tuple()
+                self.pixelBrushStroke = None
+                self.currentobj = None
+                self.pendingPaintUndo = ('inst', final_objects) if final_objects else None
+
+            pending = self.pendingPaintUndo
+            if pending is not None:
+                mw = getattr(globals_, 'mainWindow', None)
+                if mw is not None and not mw.UndoRedoInProgress and not getattr(mw, 'collabApplyingRemote', False) and not getattr(mw, 'collabApplyingRemoteHistory', False) and not getattr(mw, 'collabSwitchingArea', False) and not globals_.DirtyOverride:
+                    kind, payload = pending
+                    if kind == 'inst':
+                        try:
+                            from undo import CreateOrDeleteInstanceUndoAction, SimultaneousUndoAction
+                            acts = []
+                            for item in payload:
+                                if isinstance(item, ObjectItem):
+                                    cid = getattr(mw, '_CollabEnsureItemId', None)
+                                    collab_id = cid(item) if cid is not None else getattr(item, '_collab_id', None)
+                                    acts.append(CreateOrDeleteInstanceUndoAction('create', item.instanceDef(item), collab_id=collab_id, extra={'z': item.zValue()}))
+                                elif isinstance(item, SpriteItem):
+                                    cid = getattr(mw, '_CollabEnsureItemId', None)
+                                    collab_id = cid(item) if cid is not None else getattr(item, '_collab_id', None)
+                                    acts.append(CreateOrDeleteInstanceUndoAction('create', item.instanceDef(item), collab_id=collab_id))
+                                elif isinstance(item, (EntranceItem, LocationItem, CommentItem)):
+                                    cid = getattr(mw, '_CollabEnsureItemId', None)
+                                    collab_id = cid(item) if cid is not None else getattr(item, '_collab_id', None)
+                                    acts.append(CreateOrDeleteInstanceUndoAction('create', item.instanceDef(item), collab_id=collab_id))
+                            if acts:
+                                if len(acts) == 1:
+                                    mw.undoStack.addAction(acts[0])
+                                else:
+                                    mw.undoStack.addAction(SimultaneousUndoAction(acts))
+                        except Exception:
+                            pass
+                    elif kind == 'path_node':
+                        node = payload
+                        try:
+                            from undo import PathNodeUndoAction
+                            path = getattr(node, 'path', None)
+                            if path is not None:
+                                cid = getattr(mw, '_CollabEnsureItemId', None)
+                                node_collab_id = cid(node) if cid is not None else getattr(node, '_collab_id', None)
+                                idx = int(path.get_index(node))
+                                x, y, speed, accel, delay = path.get_node_data(idx)
+                                mw.undoStack.addAction(PathNodeUndoAction('create', int(path._id), idx, (int(x), int(y), float(speed), float(accel), int(delay)), bool(path.get_loops()), node_collab_id=node_collab_id))
+                        except Exception:
+                            pass
+            self.pendingPaintUndo = None
             self.currentobj = None
         elif event.button() == QtCore.Qt.MouseButton.MiddleButton:
             self.setDragMode(QtWidgets.QGraphicsView.DragMode.RubberBandDrag)
@@ -451,10 +947,34 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         """Update items that are being paint-dragged (painted with
         right-click, and dragged while it's still held down). Returns
         True if any items are being paint-dragged, False otherwise"""
+        if self.pixelBrushStroke is not None:
+            if not (globals_.app.mouseButtons() & QtCore.Qt.MouseButton.RightButton):
+                return False
+            pos = self.mapToScene(self.mapFromGlobal(QtGui.QCursor.pos()))
+            self._PaintPixelBrushAt(pos)
+            try:
+                globals_.mainWindow.levelOverview.update()
+            except Exception:
+                pass
+            return True
+
         if globals_.app.mouseButtons() != QtCore.Qt.MouseButton.RightButton or self.currentobj is None:
             return False
 
         pos = self.mapToScene(self.mapFromGlobal(QtGui.QCursor.pos()))
+
+        if isinstance(self.currentobj, (list, tuple)):
+            alive_items = [item for item in self.currentobj if getattr(item, 'scene', None) is not None and item.scene() is not None]
+            if not alive_items:
+                self.currentobj = None
+                self.pendingPaintUndo = None
+                return False
+            self.currentobj = tuple(alive_items) if isinstance(self.currentobj, tuple) else alive_items
+        elif getattr(self.currentobj, 'scene', None) is None or self.currentobj.scene() is None:
+            self.currentobj = None
+            self.pendingPaintUndo = None
+            return False
+
         obj = self.currentobj
 
         if not self.dragstamp:
@@ -473,6 +993,8 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                 objlist = (self.currentobj,)
 
             for obj in objlist:
+                if obj.scene() is None:
+                    continue
 
                 if isinstance(obj, type_obj):
                     # Resize the current object. The new object should fill a
@@ -499,11 +1021,13 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                         continue
 
                     # if the position changed, set the new one
+                    changed = False
                     if obj.objx != x or obj.objy != y:
                         obj.objx = x
                         obj.objy = y
                         obj.setPos(x * 24, y * 24)
                         globals_.mainWindow.levelOverview.update()
+                        changed = True
 
                     # if the size changed, recache it and update the area
                     if obj.width != width or obj.height != height:
@@ -517,8 +1041,16 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                         updaterect = oldrect.united(newrect)
 
                         obj.UpdateRects()
-                        obj.scene().update(updaterect)
+                        item_scene = obj.scene()
+                        if item_scene is not None:
+                            item_scene.update(updaterect)
                         globals_.mainWindow.levelOverview.update()
+                        changed = True
+                    if changed:
+                        try:
+                            globals_.mainWindow.CollabQueueObjectUpdate(obj)
+                        except Exception:
+                            pass
 
                 elif isinstance(obj, type_loc):
                     # resize/move the current location
@@ -527,6 +1059,10 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                     if change:  # Update the location editor
                         globals_.mainWindow.locationEditor.setLocation(obj)
                         globals_.mainWindow.levelOverview.update()
+                        try:
+                            globals_.mainWindow.CollabQueueMetaUpdate()
+                        except Exception:
+                            pass
 
                 elif isinstance(obj, type_spr):
                     # move the created sprite
@@ -545,12 +1081,34 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                     clickedy = int((pos.y() - 12) / 1.5)
 
                     if obj.objx != clickedx or obj.objy != clickedy:
+                        oldx = int(getattr(obj, 'objx', 0))
+                        oldy = int(getattr(obj, 'objy', 0))
                         obj.objx = clickedx
                         obj.objy = clickedy
                         obj.setPos(int(clickedx * 1.5), int(clickedy * 1.5))
 
-                        if isinstance(obj, type_path):
-                            obj.path.node_moved(obj)
+                        # Важно для collaboration: не шлём meta-снапшот при каждом
+                        # пиксельном перемещении. Для Path/Entrance/Comment есть
+                        # delta-операции через positionChanged/соответствующие очереди.
+                        try:
+                            cb = getattr(obj, 'positionChanged', None)
+                            if cb is not None:
+                                cb(obj, oldx, oldy, clickedx, clickedy)
+                            else:
+                                mw = getattr(globals_, 'mainWindow', None)
+                                if mw is not None and hasattr(mw, '_CollabEnabled') and mw._CollabEnabled():
+                                    if isinstance(obj, type_path):
+                                        mw._CollabMarkItemHot(obj)
+                                        mw._CollabMarkItemHot(getattr(obj, 'path', None))
+                                        mw.CollabQueuePathNodeUpdate(obj)
+                                    elif isinstance(obj, type_ent):
+                                        mw._CollabMarkItemHot(obj)
+                                        mw.CollabQueueEntranceUpsert(obj, is_add=False)
+                                    elif isinstance(obj, type_com):
+                                        mw._CollabMarkItemHot(obj)
+                                        mw.CollabQueueCommentUpsert(obj, is_add=False)
+                        except Exception:
+                            pass
 
                         obj.UpdateListItem()
                         globals_.mainWindow.levelOverview.update()
@@ -576,6 +1134,8 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
             changeyspr = changey * 2 / 3
 
             for obj in objlist:
+                if obj.scene() is None:
+                    continue
                 if isinstance(obj, type_obj):
                     # move the current object
                     newx = int(obj.dragstartx + changexobj)
@@ -586,6 +1146,10 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                         obj.objy = newy
                         obj.setPos(newx * 24, newy * 24)
                         obj.UpdateRects()
+                        try:
+                            globals_.mainWindow.CollabQueueObjectUpdate(obj)
+                        except Exception:
+                            pass
 
                 elif isinstance(obj, type_spr):
                     # move the created sprite
@@ -596,6 +1160,10 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                     if obj.objx != newx or obj.objy != newy:
                         obj.setNewObjPos(newx, newy)
                         obj.ImageObj.positionChanged()
+                        try:
+                            globals_.mainWindow.CollabQueueSpriteUpdate(obj)
+                        except Exception:
+                            pass
 
             self.scene().update()
             globals_.mainWindow.levelOverview.update()
@@ -655,7 +1223,12 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         Draws a foreground grid and other stuff
         """
         # Draws a foreground grid
-        if globals_.GridType is None: return
+        if globals_.GridType is None:
+            try:
+                globals_.mainWindow.DrawCollabPings(self, painter)
+            except Exception:
+                pass
+            return
 
         Zoom = globals_.mainWindow.ZoomLevel
         drawLine = painter.drawLine
@@ -746,6 +1319,7 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
                 p.drawRect(x + (6 * size), y + (4 * size), size, size)
                 p.drawRect(x + (6 * size), y + (6 * size), size, size)
 
+            p.end()
             del p
 
             # Adjust the rectangle to align with the grid, so we don't have to
@@ -755,6 +1329,11 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
             rect.adjust(-(x % mod), -(y % mod), 0, 0)
 
             painter.drawTiledPixmap(rect, board)
+
+        try:
+            globals_.mainWindow.DrawCollabPings(self, painter)
+        except Exception:
+            pass
 
 def DecodeOldReggieInfo(data, validKeys):
     """

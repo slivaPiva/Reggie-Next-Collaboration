@@ -249,6 +249,8 @@ class SpriteImage_LineBlock(SLib.SpriteImage):  # 219
                 painter_a.drawPixmap(QtCore.QPointF(j * 24 * squish_factor_a, 0), block_img)
                 painter_b.drawPixmap(QtCore.QPointF(j * 24 * squish_factor_b, 0), block_img)
 
+        painter_a.end()
+        painter_b.end()
         del painter_a, painter_b
 
         xposA = (1 - width_a) * 8

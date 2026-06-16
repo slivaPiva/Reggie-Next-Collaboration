@@ -139,6 +139,7 @@ class TilesetTile:
         if globals_.CollisionsShown and show_collision and (self.collOverlay is not None):
             p = QtGui.QPainter(result)
             p.drawPixmap(0, 0, self.collOverlay)
+            p.end()
             del p
 
         return result
@@ -570,6 +571,8 @@ class TilesetTile:
         else:  # No fill
             pass
 
+        painter.end()
+        del painter
         self.collOverlay = collPix
 
 
@@ -846,29 +849,48 @@ def LoadTileset(idx, name, reload_=False):
     if not name:
         return False
 
-    # find the tileset path
-    tileset_paths = reversed(globals_.gamedef.GetTexturePaths())
-
     found = False
-    for path in tileset_paths:
-        if path is None: break
+    compressed = False
 
-        arcname = os.path.join(path, name + ".arc.LH")
+    # Collaboration override: allow host-provided tilesets to take precedence
+    # over the user's local game files.
+    collab_overrides = getattr(globals_, 'CollabTilesetOverrides', None)
+    if isinstance(collab_overrides, dict):
+        override_path = collab_overrides.get(name)
+    else:
+        override_path = None
+    if override_path and os.path.isfile(str(override_path)):
+        arcname = str(override_path)
+        compressed = arcname.lower().endswith('.lh')
+        found = True
+    else:
+        arcname = None
 
-        # Prioritise .arc.LH over regular .arc, just like the game does.
-        if os.path.isfile(arcname):
-            compressed = True
-            found = True
-            break
+    if not found:
+        # find the tileset path
+        tileset_paths = reversed(globals_.gamedef.GetTexturePaths())
 
-        arcname = os.path.splitext(arcname)[0]  # strip away the .LH suffix
-        if os.path.isfile(arcname):
-            compressed = False
-            found = True
-            break
+        for path in tileset_paths:
+            if path is None: break
+
+            arcname = os.path.join(path, name + ".arc.LH")
+
+            # Prioritise .arc.LH over regular .arc, just like the game does.
+            if os.path.isfile(arcname):
+                compressed = True
+                found = True
+                break
+
+            arcname = os.path.splitext(arcname)[0]  # strip away the .LH suffix
+            if os.path.isfile(arcname):
+                compressed = False
+                found = True
+                break
 
     # warning if not found
     if not found:
+        if getattr(globals_, 'CollabSuppressMissingTilesetWarnings', False):
+            return False
         QtWidgets.QMessageBox.warning(None, globals_.trans.string('Err_MissingTileset', 0),
                                       globals_.trans.string('Err_MissingTileset', 1, '[file]', name))
         return False
@@ -1147,6 +1169,8 @@ def ProcessOverrides(idx, name):
         p.drawPixmap(0, 0, base)
         p.drawPixmap(0, 0, overlay)
 
+        p.end()
+        del p
         return img
 
     tsidx = globals_.OverriddenTilesets
@@ -1427,4 +1451,3 @@ def LoadOverrides():
             sourcex += 24
         sourcex = 0
         sourcey += 24
-

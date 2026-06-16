@@ -10,8 +10,6 @@ from levelitems import EntranceItem, SpriteItem, ZoneItem, LocationItem, ObjectI
 from misc2 import DecodeOldReggieInfo
 from spriteeditor import SpriteEditorWidget
 
-from raw_data import RawData
-
 class AbstractLevel:
     """
     Class for an abstract level from any game. Defines the API.
@@ -185,11 +183,6 @@ class Level_NSMBW(AbstractLevel):
         # Add new area
         new_area = Area(len(self.areas) + 1)
         new_area.set_data(course_new, L0_new, L1_new, L2_new)
-        
-        # If creating a completely new area (all None), load defaults
-        if course_new is None and L0_new is None and L1_new is None and L2_new is None:
-            new_area.load_defaults()
-        
         self.areas.append(new_area)
 
     def changeArea(self, number):
@@ -207,9 +200,7 @@ class Level_NSMBW(AbstractLevel):
         SLib.Area = self.areas[number - 1]
 
         # self.areas[number - 1] should be loaded.
-        # Skip if already loaded (e.g. new area created with load_defaults)
-        if not self.areas[number - 1]._is_loaded:
-            self.areas[number - 1].load()
+        self.areas[number - 1].load()
 
         return True
 
@@ -245,7 +236,7 @@ class Area:
         self.timeLimit = 300
         self.creditsFlag = False
         self.startEntrance = 0
-        self.ambushFlag = False
+        self.faceLeftFlag = False
         self.toadHouseType = 0
         self.wrapFlag = False
         self.unkFlag1 = False
@@ -253,7 +244,6 @@ class Area:
 
         self.unkVal1 = 0
         self.unkVal2 = 0
-        self.spriteSettings = []
 
         self.entrances = []
         self.sprites = []
@@ -269,7 +259,6 @@ class Area:
         self.loaded_sprites = set()
         self.force_loaded_sprites = set()
         self.sprite_idtypes = {}  # {idtype: {id: number of usages of id}}
-        self.preview_loaded_sprites = set()  # Internal: sprites loaded for preview rendering only
 
         self.MetaData = None
         self._is_loaded = False
@@ -286,9 +275,6 @@ class Area:
         """
         Loads default data.
         """
-        # Clear preview loaded sprites from previous level/patch
-        self.preview_loaded_sprites = set()
-        
         # Metadata
         self.LoadReggieInfo(None)
 
@@ -330,7 +316,6 @@ class Area:
         del self.defEvents
         del self.unkVal1
         del self.unkVal2
-        del self.spriteSettings
         del self.entrances
         del self.sprites
         del self.bgA
@@ -355,47 +340,6 @@ class Area:
         # already initialised self.blocks)
         if self.course is not None:
             self.LoadBlocks(self.course)
-        else:
-            # If course is None and blocks don't exist (e.g., after unload()),
-            # reinitialize them with default values
-            if not hasattr(self, 'blocks'):
-                self.blocks = [b''] * 14
-                self.blocks[0] = b'Pa0_jyotyu' + bytes(128 - len('Pa0_jyotyu'))
-                self.blocks[1] = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x2c\x00\x00\x00\x00\x00\x00\x00\x00'
-                self.blocks[3] = bytes(8)
-                self.blocks[7] = b'\xff\xff\xff\xff'
-            
-            # Also reinitialize other attributes that may have been deleted by unload()
-            if not hasattr(self, 'spriteSettings'):
-                self.spriteSettings = []
-            if not hasattr(self, 'entrances'):
-                self.entrances = []
-            if not hasattr(self, 'sprites'):
-                self.sprites = []
-            if not hasattr(self, 'bounding'):
-                self.bounding = []
-            if not hasattr(self, 'bgA'):
-                self.bgA = []
-            if not hasattr(self, 'bgB'):
-                self.bgB = []
-            if not hasattr(self, 'zones'):
-                self.zones = []
-            if not hasattr(self, 'locations'):
-                self.locations = []
-            if not hasattr(self, 'camprofiles'):
-                self.camprofiles = []
-            if not hasattr(self, 'paths'):
-                self.paths = []
-            if not hasattr(self, 'comments'):
-                self.comments = []
-            if not hasattr(self, 'loaded_sprites'):
-                self.loaded_sprites = set()
-            if not hasattr(self, 'force_loaded_sprites'):
-                self.force_loaded_sprites = set()
-            if not hasattr(self, 'sprite_idtypes'):
-                self.sprite_idtypes = {}
-            if not hasattr(self, 'preview_loaded_sprites'):
-                self.preview_loaded_sprites = set()
 
         # Load the editor metadata
         if self.course is not None and self.block1pos[0] != 0x70:
@@ -567,7 +511,7 @@ class Area:
         Loads block 2, the general options
         """
         data = struct.unpack('>IIHh?BxxB?Bx', self.blocks[1])
-        defEventsA, defEventsB, wrapByte, self.timeLimit, self.creditsFlag, unkVal, self.startEntrance, self.ambushFlag, self.toadHouseType = data
+        defEventsA, defEventsB, wrapByte, self.timeLimit, self.creditsFlag, unkVal, self.startEntrance, self.faceLeftFlag, self.toadHouseType = data
 
         self.wrapFlag = bool(wrapByte & 1)
         self.unkFlag1 = bool(wrapByte >> 3)
@@ -575,30 +519,12 @@ class Area:
         self.defEvents = defEventsA | defEventsB << 32
 
         """
-        Loads block 4, the unknown maybe-more-general-options block + extended settings
+        Loads block 4, the unknown maybe-more-general-options block
         """
-        optdata2 = self.blocks[3][:8]
+        optdata2 = self.blocks[3]
         optdata2struct = struct.Struct('>xxHHxx')
         data = optdata2struct.unpack(optdata2)
         self.unkVal1, self.unkVal2 = data
-
-        def LoadOneSetting(data):
-            length = struct.unpack('>I', data[:4])[0]
-            settingArray = []
-            for i in range(length):
-                settingArray.append(data[4+4*i:8+4*i])
-            return settingArray
-
-        self.spriteSettings = []
-        if len(self.blocks[3]) <= 8:
-            amountOfSettings = 0
-        else:
-            amountOfSettings = struct.unpack('>I', self.blocks[3][8:12])[0]
-
-        for i in range(amountOfSettings):
-            offset = struct.unpack('>I', self.blocks[3][12+4*i:16+4*i])[0]
-            setting = LoadOneSetting(self.blocks[3][offset:])
-            self.spriteSettings.append(setting)
 
     def LoadEntrances(self):
         """
@@ -623,7 +549,7 @@ class Area:
         spritedata = self.blocks[7]
         sprstruct = struct.Struct('>HHH8sxx')
         sprites = []
-        unknown_sprite_ids = set()
+        unknown_sprite_ids = None
 
         unpack = sprstruct.unpack_from
         append = sprites.append
@@ -632,43 +558,22 @@ class Area:
         # Ignore the last 4 bytes because they are always 0xFFFFFFFF
         for offset in range(0, len(spritedata) - 4, 16):
             data = unpack(spritedata, offset)
+            append(obj(*data))
             type_, x, y, sd = data
-            
+
             # Check if sprite ID is valid
             if 0 <= type_ < globals_.NumSprites and globals_.Sprites[type_] is not None:
-                is_extended = globals_.Sprites[type_].extendedSettings
+                pass
             else:
                 # Unknown sprite ID - track it and use default settings
+                unknown_sprite_ids = set()
                 unknown_sprite_ids.add(type_)
-                is_extended = False
-            
-            extended_id = int.from_bytes(sd[2:6], 'big')
-            extended_settings = self.spriteSettings[extended_id] if is_extended else []
-
-            append(
-                obj(
-                    type_,
-                    x,
-                    y,
-                    RawData(
-                        sd,
-                        *extended_settings,
-                        format = RawData.Format.Extended if is_extended else RawData.Format.Vanilla,
-                    )
-                )
-            )
 
         self.sprites = sprites
         self.force_loaded_sprites = self.loaded_sprites - set(sprite.type for sprite in sprites)
 
-        # Adjust block counts for extended sprites
-        for sprite in self.sprites:
-            sprite: SpriteItem # type hint
-            sprite.spritedata.fix_size_if_needed(sprite.type)
-        
         # Store unknown sprite IDs for later warning
         self.unknown_sprite_ids = unknown_sprite_ids
-
 
     def LoadLoadedSprites(self):
         """
@@ -898,50 +803,13 @@ class Area:
         self.blocks[1] = struct.pack('>IIHh?BBBB?Bx',
             self.defEvents & 0xFFFFFFFF, self.defEvents >> 32, wrapByte,
             self.timeLimit, self.creditsFlag, unkVal, unkVal, unkVal,
-            self.startEntrance, self.ambushFlag, self.toadHouseType
+            self.startEntrance, self.faceLeftFlag, self.toadHouseType
         )
 
         """
-        Saves block 4, the unknown maybe-more-general-options block + extended settings
+        Saves block 4, the unknown maybe-more-general-options block
         """
-        self.spriteSettings = []
-        for sprite in self.sprites:
-            sprite: SpriteItem # type hint
-
-            if sprite.spritedata.format == RawData.Format.Extended:
-                sprite.spritedata.original = sprite.spritedata[0:2] + len(self.spriteSettings).to_bytes(4, 'big') + sprite.spritedata[6:]
-                self.spriteSettings.append(sprite.spritedata.optimized.blocks)
-
         self.blocks[3] = struct.pack('>xxHHxx', self.unkVal1, self.unkVal2)
-
-        def SaveOneSetting(length, settingArray):
-            data = struct.pack('>I', length)
-            for sett in settingArray:
-                data += sett
-            return data
-
-        if len(self.spriteSettings) > 0:
-            data = struct.pack('>I', len(self.spriteSettings))
-
-            settings = []
-            offsets = []
-
-            currentOffset = 12 + 4 * len(self.spriteSettings)
-            for setting in self.spriteSettings:
-                oneSetting = SaveOneSetting(len(setting), setting)
-                settings.append(oneSetting)
-                offsets.append(currentOffset)
-                currentOffset += len(oneSetting)
-
-            for i in range(len(self.spriteSettings)):
-                data += struct.pack('>I', offsets[i])
-
-            for i in range(len(self.spriteSettings)):
-                data += settings[i]
-
-            self.blocks[3] += data
-
-
 
     def SaveLayer(self, idx):
         """
@@ -1197,7 +1065,7 @@ class Area:
             if not (0 <= sprite.type < globals_.NumSprites) or globals_.Sprites[sprite.type] is None:
                 # Unknown sprite, skip it
                 continue
-            
+
             sdef = globals_.Sprites[sprite.type]
 
             # Find what values are used by this sprite
@@ -1208,7 +1076,7 @@ class Area:
                     # Only values and lists can be idtypes
                     continue
 
-                idtype = field[-2]
+                idtype = field[-1]
                 if idtype is None:
                     # Only look at settings with idtypes
                     continue
@@ -1229,14 +1097,16 @@ class Area:
         This properly removes a sprite from the area.
         """
         # Remove the sprite from the sprites list
-        self.sprites.remove(sprite)
+        try:
+            self.sprites.remove(sprite)
+        except ValueError:
+            return
+
+        # Skip unknown sprites
+        if sprite.type >= globals_.NumSprites or globals_.Sprites[sprite.type] is None:
+            return
 
         # Remove the ids the sprite used from the id list
-        # Check if sprite data exists for this type
-        if not (0 <= sprite.type < globals_.NumSprites) or globals_.Sprites[sprite.type] is None:
-            # Unknown sprite, nothing to clean up
-            return
-        
         decoder = SpriteEditorWidget.PropertyDecoder()
         sdef = globals_.Sprites[sprite.type]
 
@@ -1246,7 +1116,7 @@ class Area:
                 # Only <value> and <list> tags can have id types
                 continue
 
-            idtype = field[-2]
+            idtype = field[-1]
             if idtype is None:
                 # Only look at settings with idtypes
                 continue
@@ -1254,10 +1124,16 @@ class Area:
             value = decoder.retrieve(sprite.spritedata, field[2])
 
             # 3. Decrement the counter for this idtype
-            counter = self.sprite_idtypes[idtype]
-
-            if counter[value] == 1:
-                del counter[value]
+            counter = self.sprite_idtypes.get(idtype)
+            if not isinstance(counter, dict):
+                continue
+            if value not in counter:
+                continue
+            if counter.get(value, 0) <= 1:
+                try:
+                    del counter[value]
+                except Exception:
+                    pass
             else:
                 counter[value] -= 1
 

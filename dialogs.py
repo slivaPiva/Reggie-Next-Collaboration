@@ -9,7 +9,6 @@ from levelitems import ListWidgetItem_SortsByOther, SpriteItem, ZoneItem
 from dirty import SetDirty
 from zones import CameraModeZoomSettingsLayout
 from ui import createHorzLine
-from raw_data import RawData
 
 class AboutDialog(QtWidgets.QDialog):
     """
@@ -612,6 +611,7 @@ class DiagnosticToolDialog(QtWidgets.QDialog):
             p.setFont(f)
             p.setPen(QtGui.QColor(0, 200, 0))
             p.drawText(0, pointsize, globals_.trans.string('Diag', 19))
+            p.end()
             del p
             L = QtWidgets.QLabel()
             L.setPixmap(px)
@@ -631,6 +631,7 @@ class DiagnosticToolDialog(QtWidgets.QDialog):
             p.setFont(f)
             p.setPen(QtGui.QColor(210, 210, 0))
             p.drawText(0, pointsize, globals_.trans.string('Diag', 21))
+            p.end()
             del p
             L = QtWidgets.QLabel()
             L.setPixmap(px)
@@ -650,6 +651,7 @@ class DiagnosticToolDialog(QtWidgets.QDialog):
             p.setFont(f)
             p.setPen(QtGui.QColor(255, 0, 0))
             p.drawText(0, pointsize, globals_.trans.string('Diag', 23))
+            p.end()
             del p
             L = QtWidgets.QLabel()
             L.setPixmap(px)
@@ -864,7 +866,7 @@ class DiagnosticToolDialog(QtWidgets.QDialog):
                     addsprites.append((419, sprite.objx - 128, sprite.objy - 128))
 
             for id_, x, y in addsprites:
-                globals_.mainWindow.CreateSprite(x, y, id_, RawData.from_sprite_id(id_))
+                globals_.mainWindow.CreateSprite(x, y, id_, bytes(8))
 
             globals_.mainWindow.scene.update()
 

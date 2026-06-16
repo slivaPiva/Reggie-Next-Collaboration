@@ -88,45 +88,35 @@ class GameDefMenu(QtWidgets.QMenu):
             src_path = QtWidgets.QFileDialog.getExistingDirectory(None, "Select Reggie Patch Folder ...")
             return src_path
 
+        def create_symlink(src_path, dst_path):
+            try:
+                os.symlink(src_path, dst_path)
+                return True
+            except:
+                return False
+
         def restart_reggie_info():
             # Warn the user that they may need to restart
             QtWidgets.QMessageBox.warning(None, globals_.trans.string('PrefsDlg', 0), globals_.trans.string('PrefsDlg', 30))
 
-        # Select the patch folder
-        patch_path = select_reggie_patch_folder()
-        if patch_path == "":
-            return
+        if sys.platform == 'win32':
+            import subprocess
+            child = subprocess.Popen(os.path.join(os.getcwd(), 'add_reggie_patch.exe'), stdout=subprocess.PIPE)
+            streamdata = child.communicate()[0]
+            rc = child.returncode
+            del subprocess
+            if rc == 0:
+                restart_reggie_info()
 
-        patch_path = os.path.normpath(patch_path)
-        patch_name = os.path.basename(patch_path)
-        
-        # Verify that main.xml exists in the selected folder
-        if not os.path.isfile(os.path.join(patch_path, 'main.xml')):
-            QtWidgets.QMessageBox.warning(None, 'Invalid Patch', 
-                f'The selected folder does not contain a valid Reggie patch (main.xml not found).')
-            return
-        
-        # Check if a patch with this name already exists (in patches dir or settings)
-        patches_dir_path = os.path.join(os.getcwd(), 'reggiedata', 'patches', patch_name)
-        if os.path.exists(patches_dir_path):
-            QtWidgets.QMessageBox.warning(None, 'Error', 
-                f'A patch with this name already exists in the patches directory:\n{patch_name}')
-            return
-        
-        # Check if already configured in settings
-        existing_path = setting('PatchPath_' + patch_name)
-        if existing_path:
-            QtWidgets.QMessageBox.warning(None, 'Error', 
-                f'A patch with this name is already configured:\n{patch_name}\nPath: {existing_path}')
-            return
-        
-        # Save the patch path to settings
-        # setSetting will automatically normalize the path format
-        setSetting('PatchPath_' + patch_name, patch_path)
-        
-        # Refresh the menu to show the new patch
-        self.refreshMenu()
-        self.gameChanged.emit()
+        else:
+            src_path = select_reggie_patch_folder()
+            if src_path == "":
+                return
+
+            dst_path = os.path.join(os.getcwd(), 'reggiedata', 'patches', os.path.basename(src_path))
+            src_path = os.path.normpath(src_path)
+            if create_symlink(src_path, dst_path):
+                restart_reggie_info()
 
 
     def __init__(self):
@@ -201,42 +191,6 @@ class GameDefMenu(QtWidgets.QMenu):
         for act in self.actGroup.actions():
             act.setChecked(act.data() == real_gamedef)
         self.update_flag = False
-    
-    def refreshMenu(self):
-        """
-        Refresh the menu to show newly added patches
-        """
-        # Clear existing patch actions (but keep the viewer and add button)
-        for act in self.actGroup.actions():
-            self.removeAction(act)
-            self.actGroup.removeAction(act)
-        
-        # Reload game defs
-        self.GameDefs = getAvailableGameDefs()
-        
-        # Re-add entries for each gamedef
-        loadedDef = setting('LastGameDef')
-        for folder in self.GameDefs:
-            def_ = ReggieGameDefinition(folder)
-            
-            act = QtGui.QAction(self)
-            act.setText(def_.name)
-            act.setToolTip(def_.description)
-            act.setData(folder)
-            act.setActionGroup(self.actGroup)
-            act.setCheckable(True)
-            act.setChecked(folder == loadedDef)
-            act.toggled.connect(self.handleGameDefClicked)
-            
-            # Insert before the separator and "Add" button
-            actions = self.actions()
-            if len(actions) >= 3:  # viewer, separator, patches..., separator, add button
-                self.insertAction(actions[-2], act)  # Insert before last separator
-
-        # Also refresh the main window's patch combo box if it exists
-        if hasattr(globals_, 'mainWindow') and globals_.mainWindow:
-            if hasattr(globals_.mainWindow, 'updatePatchComboBox'):
-                globals_.mainWindow.updatePatchComboBox()
 
 
 class ReggieGameDefinition:
@@ -257,10 +211,9 @@ class ReggieGameDefinition:
             self.path = path
             self.patch = patch
 
-    def __init__(self, name=None, custom_path=None):
+    def __init__(self, name=None):
         """
         Initializes the ReggieGameDefinition
-        custom_path: Optional custom path to the patch folder (from settings)
         """
         self.InitAsEmpty()
 
@@ -270,7 +223,7 @@ class ReggieGameDefinition:
             return
 
         try:
-            self.InitFromName(name, custom_path)
+            self.InitFromName(name)
         except Exception:
             self.InitAsEmpty()
             raise
@@ -289,7 +242,6 @@ class ReggieGameDefinition:
         self.version = '2'
 
         self.sprites = sprites
-        self.plugins = {}  # Dictionary of enabled plugins
 
         self.files = {
             'bga': gdf(os.path.join('reggiedata', 'bga.txt'), False),
@@ -312,29 +264,17 @@ class ReggieGameDefinition:
             'external': gdf(None, False),
         }
 
-    def InitFromName(self, name, custom_path=None):
+    def InitFromName(self, name):
         """
         Attempts to open/load a Game Definition from a name string. Just loads
         the name and description to avoid referring to other game definitions.
-        custom_path: Optional custom path to the patch folder (from settings)
         """
         self.custom = True
         name = str(name)
         self.gamepath = name
-        self.custom_patch_path = custom_path  # Store custom path if provided
 
-        # Determine the path to main.xml
-        if custom_path:
-            path = os.path.join(custom_path, "main.xml")
-        else:
-            path = os.path.join("reggiedata", "patches", name, "main.xml")
-            
-            # Check if there's a custom path in settings
-            custom_setting_path = setting('PatchPath_' + name)
-            if custom_setting_path and os.path.isfile(os.path.join(custom_setting_path, "main.xml")):
-                path = os.path.join(custom_setting_path, "main.xml")
-                self.custom_patch_path = custom_setting_path
-        
+        # Parse the file (errors are handled by __init__())
+        path = os.path.join("reggiedata", "patches", name, "main.xml")
         tree = etree.parse(path)
         root = tree.getroot()
 
@@ -357,21 +297,7 @@ class ReggieGameDefinition:
         if not self.custom:
             return
 
-        # Use custom path if available, otherwise use default patches directory
-        if hasattr(self, 'custom_patch_path') and self.custom_patch_path:
-            addpath = self.custom_patch_path
-            path = os.path.join(addpath, "main.xml")
-        else:
-            # Check settings for custom path
-            custom_setting_path = setting('PatchPath_' + self.gamepath)
-            if custom_setting_path and os.path.isfile(os.path.join(custom_setting_path, "main.xml")):
-                addpath = custom_setting_path
-                self.custom_patch_path = custom_setting_path
-                path = os.path.join(addpath, "main.xml")
-            else:
-                addpath = os.path.join("reggiedata", "patches", self.gamepath)
-                path = os.path.join(addpath, "main.xml")
-            
+        path = os.path.join("reggiedata", "patches", self.gamepath, "main.xml")
         tree = etree.parse(path)
         root = tree.getroot()
 
@@ -382,7 +308,7 @@ class ReggieGameDefinition:
             self.base = ReggieGameDefinition()
 
         # Parse the nodes
-        # addpath is already set above
+        addpath = os.path.join("reggiedata", "patches", self.gamepath)
         for node in root:
             n = node.tag.lower()
             if n not in ('file', 'folder'):
@@ -405,12 +331,8 @@ class ReggieGameDefinition:
         # Get rid of the XML stuff
         del tree, root
 
-        # Load plugins.xml if it exists
-        self.LoadPlugins(addpath)
-
         # Load sprites.py if provided
         if 'sprites' in self.files:
-            print(f"[DEBUG] Loading sprites.py from: {self.files['sprites'].path}")
             with open(self.files['sprites'].path, 'r', encoding='utf-8') as f:
                 filedata = f.read()
             
@@ -429,131 +351,8 @@ class ReggieGameDefinition:
             new_module = importlib.util.module_from_spec(spec)
 
             exec(filedata, new_module.__dict__)
-            
-            # Assign the loaded module to self.sprites
+            sys.modules[new_module.__name__] = new_module
             self.sprites = new_module
-
-    def LoadPlugins(self, addpath):
-        """
-        Loads plugins from plugins.xml if it exists, creates default if missing
-        """
-        plugins_path = os.path.join(addpath, "plugins.xml")
-        
-        # Start with base plugins if we have a base
-        if self.base is not None and hasattr(self.base, 'plugins'):
-            self.plugins = self.base.plugins.copy()
-        else:
-            self.plugins = {}
-        
-        # Load patch-specific plugins if plugins.xml exists
-        if os.path.isfile(plugins_path):
-            try:
-                tree = etree.parse(plugins_path)
-                root = tree.getroot()
-                
-                for plugin in root.findall('plugin'):
-                    name = plugin.get('name')
-                    enabled = plugin.get('enabled', 'false').lower() == 'true'
-                    
-                    if enabled:
-                        # Check if plugin has parameters
-                        params = {}
-                        for param in plugin.findall('param'):
-                            param_name = param.get('name')
-                            param_value = param.get('value')
-                            params[param_name] = param_value
-                        
-                        self.plugins[name] = params if params else True
-                    elif name in self.plugins:
-                        # Plugin explicitly disabled, remove from inherited plugins
-                        del self.plugins[name]
-                
-                del tree, root
-            except Exception as e:
-                # If plugins.xml is malformed, create default
-                print(f"Warning: Failed to load plugins.xml: {e}")
-                self.CreateDefaultPluginsXML(plugins_path)
-        else:
-            # Create default plugins.xml if it doesn't exist
-            self.CreateDefaultPluginsXML(plugins_path)
-    
-    def CreateDefaultPluginsXML(self, plugins_path):
-        """
-        Creates a default plugins.xml file with all plugins disabled
-        """
-        try:
-            # Only create for custom patches (not base game)
-            if not self.custom:
-                return
-            
-            # Define all available plugins with their parameters
-            available_plugins = [
-                {
-                    'name': 'connected_pipe_exit',
-                    'desc': 'Connected Pipe Exit Direction',
-                    'params': []
-                },
-                {
-                    'name': 'special_event_sprite',
-                    'desc': 'Custom Special Event Sprite ID',
-                    'params': [
-                        {'name': 'sprite_name', 'value': 'Special Event'}
-                    ]
-                },
-            ]
-            
-            # Create XML structure
-            root = etree.Element('plugins')
-            root.text = '\n  '
-            root.tail = '\n'
-            
-            for i, plugin_def in enumerate(available_plugins):
-                # Add comment
-                comment = etree.Comment(f' {plugin_def["desc"]} ')
-                comment.tail = '\n  '
-                root.append(comment)
-                
-                # Add plugin element
-                plugin = etree.SubElement(root, 'plugin')
-                plugin.set('name', plugin_def['name'])
-                plugin.set('enabled', 'false')
-                plugin.tail = '\n  ' if i < len(available_plugins) - 1 else '\n'
-                
-                # Add parameters if any
-                if plugin_def['params']:
-                    plugin.text = '\n    '
-                    for j, param in enumerate(plugin_def['params']):
-                        param_elem = etree.SubElement(plugin, 'param')
-                        param_elem.set('name', param['name'])
-                        param_elem.set('value', param['value'])
-                        param_elem.tail = '\n    ' if j < len(plugin_def['params']) - 1 else '\n  '
-            
-            # Write to file with proper formatting
-            tree = etree.ElementTree(root)
-            # Indent the XML manually since standard ElementTree doesn't support pretty_print
-            self._indent_xml(root)
-            tree.write(plugins_path, encoding='utf-8', xml_declaration=True)
-            print(f"Created default plugins.xml at {plugins_path}")
-        except Exception as e:
-            print(f"Warning: Failed to create default plugins.xml: {e}")
-    
-    def _indent_xml(self, elem, level=0):
-        """
-        Helper to indent XML for pretty printing (since standard ElementTree doesn't support it)
-        """
-        indent = "\n" + "  " * level
-        if len(elem):
-            if not elem.text or not elem.text.strip():
-                elem.text = indent + "  "
-            if not elem.tail or not elem.tail.strip():
-                elem.tail = indent
-            for child in elem:
-                self._indent_xml(child, level + 1)
-            if not child.tail or not child.tail.strip():
-                child.tail = indent
-        else:
-            if level and (not elem.tail or not elem.tail.strip()):
-                elem.tail = indent
 
     def bgFile(self, name, layer):
         """
@@ -771,108 +570,17 @@ class ReggieGameDefinition:
         return images
 
 
-def cleanupOrphanedPatchPaths():
-    """
-    Remove PatchPath_ and other game path settings from settings.ini that point to non-existent patches.
-    This prevents errors when patches are deleted manually outside Reggie.
-    Also handles URL-encoded patch names (e.g., NSMBWer%2B -> NSMBWer+) and @Invalid() entries.
-    """
-    from dirty import setSetting
-    from urllib.parse import unquote
-    
-    patches_dir = os.path.join('reggiedata', 'patches')
-    orphaned_keys = []
-    
-    # Prefixes to check for patch-related settings
-    path_prefixes = ['PatchPath_', 'StageGamePath_', 'TextureGamePath_', 'LastLevel_']
-    
-    # Check all patch-related settings
-    all_keys = globals_.settings.allKeys()
-    for key in all_keys:
-        # Handle both grouped (GamePaths/PatchPath_X) and flat (PatchPath_X) keys
-        key_name = key.split('/')[-1] if '/' in key else key
-        
-        # Check if this is a patch-related setting
-        for prefix in path_prefixes:
-            if key_name.startswith(prefix):
-                # Extract patch name (may be URL-encoded)
-                patch_name_encoded = key_name[len(prefix):]
-                patch_name = unquote(patch_name_encoded)  # Decode URL encoding
-                patch_path = setting(key_name)  # Use setting() which handles groups
-                
-                # Check for @Invalid() entries or empty settings
-                if not patch_path or str(patch_path) == '@Invalid()':
-                    orphaned_keys.append((key_name, patch_path))
-                elif patch_path:
-                    # Normalize the path to handle different slash conventions
-                    patch_path = os.path.normpath(str(patch_path))
-                    
-                    # For LastLevel_, just check if the file exists
-                    if prefix == 'LastLevel_':
-                        if not os.path.isfile(patch_path):
-                            orphaned_keys.append((key_name, patch_path))
-                    # For path settings, check if the directory exists
-                    elif not os.path.exists(patch_path):
-                        # Path doesn't exist - mark for removal
-                        orphaned_keys.append((key_name, patch_path))
-                    elif prefix == 'PatchPath_':
-                        # For PatchPath_, also check if main.xml exists
-                        if not os.path.isfile(os.path.join(patch_path, 'main.xml')):
-                            # Also check if it exists in the patches directory (redundant setting)
-                            patches_dir_path = os.path.join(patches_dir, patch_name)
-                            if not os.path.isfile(os.path.join(patches_dir_path, 'main.xml')):
-                                # Orphaned path - mark for removal
-                                orphaned_keys.append((key_name, patch_path))
-                
-                break  # Found a matching prefix, no need to check others
-    
-    # Remove orphaned settings
-    for key_name, path in orphaned_keys:
-        setSetting(key_name, None)
-    
-    return len(orphaned_keys)
-
-
 def getAvailableGameDefs():
     game_defs = []
-    patches_dir = os.path.join('reggiedata', 'patches')
 
-    # Add patches from the patches directory
-    if os.path.exists(patches_dir):
-        folders = os.listdir(patches_dir)
-        for folder in folders:
-            if not os.path.isfile(os.path.join(patches_dir, folder, 'main.xml')): 
-                continue
+    # Add them
+    folders = os.listdir(os.path.join('reggiedata', 'patches'))
+    for folder in folders:
+        if not os.path.isfile(os.path.join('reggiedata', 'patches', folder, 'main.xml')): continue
 
-            def_ = ReggieGameDefinition(folder)
-            if def_.custom:
-                game_defs.append((def_.name, folder))
-    
-    # Add patches from custom paths stored in settings
-    all_keys = globals_.settings.allKeys()
-    for key in all_keys:
-        # Handle both grouped (GamePaths/PatchPath_X) and flat (PatchPath_X) keys
-        key_name = key.split('/')[-1] if '/' in key else key
-        
-        if key_name.startswith('PatchPath_'):
-            patch_name = key_name[10:]  # Remove 'PatchPath_' prefix
-            patch_path = setting(key_name)  # Use setting() which handles groups
-            
-            if patch_path:
-                # Normalize the path to handle different slash conventions
-                patch_path = os.path.normpath(patch_path)
-                
-                if os.path.isfile(os.path.join(patch_path, 'main.xml')):
-                    # Check if not already added from patches directory
-                    if not any(folder == patch_name for _, folder in game_defs):
-                        try:
-                            def_ = ReggieGameDefinition(patch_name, custom_path=patch_path)
-                            if def_.custom:
-                                game_defs.append((def_.name, patch_name))
-                        except Exception as e:
-                            # Skip invalid patches but log the error for debugging
-                            print(f"Failed to load patch {patch_name} from {patch_path}: {e}")
-                            pass
+        def_ = ReggieGameDefinition(folder)
+        if def_.custom:
+            game_defs.append((def_.name, folder))
 
     # Alphabetize them, and then add the default
     game_defs.sort()
@@ -898,7 +606,7 @@ def loadNewGameDef(def_):
     return res
 
 # Game Definitions
-def LoadGameDef(name=None, dlg=None):
+def LoadGameDef(name=None, dlg=None, prompt_for_stage_path=True):
     """
     Loads a game definition
     """
@@ -907,23 +615,14 @@ def LoadGameDef(name=None, dlg=None):
     # Put the whole thing into a try-except clause
     # to catch whatever errors may happen
     try:
-        sprite_images_enabled = False
-        if globals_.mainWindow is not None and hasattr(globals_.mainWindow, 'sprPicker'):
-            sprite_images_enabled = globals_.mainWindow.sprPicker.show_sprite_images
-            if sprite_images_enabled:
-                globals_.mainWindow.sprPicker.show_sprite_images = False
 
+        # Load the globals_.gamedef
         if dlg: dlg.setLabelText(globals_.trans.string('Gamedefs', 1))  # Loading game patch...
-
-        # Clear any existing warning icons when changing patches
-        if globals_.mainWindow is not None:
-            for icon in list(globals_.mainWindow.warningIcons):
-                globals_.mainWindow.RemoveWarningIcon(icon)
 
         globals_.gamedef = ReggieGameDefinition(name)
         globals_.gamedef.__init2__()
 
-        if globals_.gamedef.custom and (setting('StageGamePath_' + globals_.gamedef.name) is None):
+        if prompt_for_stage_path and globals_.gamedef.custom and (not globals_.settings.contains('StageGamePath_' + globals_.gamedef.name)):
             # First-time usage of this globals_.gamedef. Have the
             # user pick a stage folder so we can load stages
             # and tilesets from there
@@ -1019,38 +718,41 @@ def LoadGameDef(name=None, dlg=None):
 
             spriteClasses = globals_.gamedef.getImageClasses()
 
-            for s in globals_.Area.sprites:
-                if s.type in SLib.SpriteImagesLoaded: continue
-                if s.type not in spriteClasses: continue
+            if globals_.SpriteImagesShown:
+                for s in globals_.Area.sprites:
+                    if s.type in SLib.SpriteImagesLoaded: continue
+                    if s.type not in spriteClasses: continue
 
-                spriteClasses[s.type].loadImages()
+                    spriteClasses[s.type].loadImages()
 
-                SLib.SpriteImagesLoaded.add(s.type)
+                    SLib.SpriteImagesLoaded.add(s.type)
 
             for s in globals_.Area.sprites:
                 if s.type in spriteClasses:
                     s.setImageObj(spriteClasses[s.type])
                 else:
                     s.setImageObj(SLib.SpriteImage)
-            
+
+            # https://github.com/Zement/Reggie/blob/master/gamedef.py#L1036-L1053
             # Recalculate unknown sprite IDs based on current patch's sprite definitions
             unknown_sprite_ids = set()
             for sprite in globals_.Area.sprites:
                 if sprite.type >= globals_.NumSprites or globals_.Sprites[sprite.type] is None:
                     unknown_sprite_ids.add(sprite.type)
-            
+
             # Update the Area's unknown_sprite_ids
             globals_.Area.unknown_sprite_ids = unknown_sprite_ids
             
             # Check for unknown sprite IDs and show warning icon in status bar
             if unknown_sprite_ids:
                 sprite_ids = sorted(unknown_sprite_ids)
-                if globals_.mainWindow is not None:
-                    if len(sprite_ids) == 1:
-                        msg = globals_.trans.string('Err_UnknownSprite', 0, '[id]', str(sprite_ids[0]))
-                    else:
-                        msg = globals_.trans.string('Err_UnknownSprite', 1, '[ids]', ', '.join(map(str, sprite_ids)))
-                    globals_.mainWindow.AddWarningIcon(msg)
+
+                title = globals_.trans.string('Err_UnknownSprite', 0)
+                if len(sprite_ids) == 1:
+                    msg = globals_.trans.string('Err_UnknownSprite', 1, '[id]', str(sprite_ids[0]))
+                else:
+                    msg = globals_.trans.string('Err_UnknownSprite', 2, '[ids]', ', '.join(map(str, sprite_ids)))
+                QtWidgets.QMessageBox.warning(None, title, msg)
 
         if dlg: dlg.setValue(5)
 
@@ -1064,48 +766,19 @@ def LoadGameDef(name=None, dlg=None):
         # Load entrance names
         if dlg: dlg.setLabelText(globals_.trans.string('Gamedefs', 16))  # Loading entrance names...
         LoadEntranceNames(True)
-        
-        # Reload the entrance editor to update entrance types and images
-        if globals_.mainWindow is not None and hasattr(globals_.mainWindow, 'entranceEditor'):
-            globals_.mainWindow.entranceEditor.reloadEntranceTypes()
-        
-        # Update all entrance items in the current area to use new images
-        if globals_.Area is not None:
-            for ent in globals_.Area.entrances:
-                ent.update()  # Redraws the entrance with new images
-                ent.UpdateListItem()  # Updates the list item text
-        
         if dlg: dlg.setValue(7)
 
-    except Exception as e:
-        if dlg: dlg.setValue(7)
-        
-        if sprite_images_enabled and globals_.mainWindow is not None and hasattr(globals_.mainWindow, 'sprPicker'):
-            globals_.mainWindow.sprPicker.show_sprite_images = True
-        
-        # If we were trying to load a specific patch and it failed, show a message
-        # and fall back to the base game
-        if name is not None:
-            QtWidgets.QMessageBox.warning(
-                None,
-                'Patch Not Found',
-                f'The patch "{name}" could not be loaded.\n\n'
-                f'Error: {str(e)}\n\n'
-                f'Reggie will load the base game (New Super Mario Bros. Wii) instead.',
-                QtWidgets.QMessageBox.StandardButton.Ok
-            )
-            # Try to load the base game instead
-            return LoadGameDef(None, dlg)
-        else:
-            # We failed to load even the base game, this is a critical error
-            raise
+    except Exception:
+        raise
+    #    # Something went wrong.
+    #    if dlg: dlg.setValue(7) # autocloses it
+    #    QtWidgets.QMessageBox.information(None, globals_.trans.string('Gamedefs', 17), globals_.trans.string('Gamedefs', 18, '[error]', str(e)))
+    #    if name is not None: LoadGameDef(None)
+    #    return False
 
 
+    # Success!
     if dlg: setSetting('LastGameDef', name)
-    
-    if sprite_images_enabled and globals_.mainWindow is not None and hasattr(globals_.mainWindow, 'sprPicker'):
-        globals_.mainWindow.sprPicker.show_sprite_images = True
-    
     return True
 
 @functools.lru_cache(maxsize=None)

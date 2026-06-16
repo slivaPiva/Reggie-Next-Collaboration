@@ -1,32 +1,31 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*$py.class
 
 # C extensions
 *.so
 
 # Distribution / packaging
 .Python
+env/
+bin/
 build/
 develop-eggs/
 dist/
-downloads/
+distrib/
 eggs/
-.eggs/
 lib/
 lib64/
 parts/
 sdist/
 var/
-wheels/
+Backups/
+collab_tilesets/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# PyInstaller
-*.manifest
 *.spec
+build.bat
 
 # Installer logs
 pip-log.txt
@@ -36,80 +35,34 @@ pip-delete-this-directory.txt
 htmlcov/
 .tox/
 .coverage
-.coverage.*
 .cache
 nosetests.xml
 coverage.xml
-*.cover
-.hypothesis/
 
 # Translations
 *.mo
-*.pot
+
+# Mr Developer
+.mr.developer.cfg
+.project
+.pydevproject
+
+# Rope
+.ropeproject
 
 # Django stuff:
 *.log
-local_settings.py
+*.pot
 
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
+# PyCharm stuff:
+.idea/
 
 # Sphinx documentation
 docs/_build/
 
-# PyBuilder
-target/
+# Quick Paint presets
+*.qpp
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# celery beat schedule file
-celerybeat-schedule
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Reggie-specific
-reggiedata/
-assets/mods/
-internal/
 
 # =========================
 # Operating System Files
@@ -118,6 +71,7 @@ internal/
 # OSX
 # =========================
 
+.DS_Store
 .AppleDouble
 .LSOverride
 
@@ -134,6 +88,7 @@ Icon
 # =========================
 
 # Windows image file caches
+Thumbs.db
 ehthumbs.db
 
 # Folder config file
@@ -152,20 +107,3 @@ $RECYCLE.BIN/
 log.txt
 settings.ini
 settings.ini.bak
-temp/
-
-# Development and analysis files
-.gitignore
-git-workflow-standards.md
-BRANCH_MERGE_ANALYSIS.md
-reggiedata/patches/*
-Reggie-Next.code-workspace
-
-# Documentation and test files (moved to _docs folder)
-_docs/
-
-# Assets folder contents (keep folder structure only)
-assets/mods/*
-assets/snapshots/*
-assets/qpt/presets/*
-

@@ -1,13 +1,14 @@
 import base64
+import collections
 
 from PyQt6 import QtWidgets, QtGui, QtCore
 
 import globals_
+from dirty import setting, setSetting
 from tiles import RenderObject, TilesetTile
 from ui import ListWidgetWithToolTipSignal
 from misc import LoadSpriteData, LoadSpriteListData, LoadSpriteCategories
 from spriteeditor import SpriteEditorWidget
-from dirty import setting, setSetting
 
 class LevelOverviewWidget(QtWidgets.QWidget):
     """
@@ -22,9 +23,6 @@ class LevelOverviewWidget(QtWidgets.QWidget):
         QtWidgets.QWidget.__init__(self)
         self.setSizePolicy(
             QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Policy.MinimumExpanding, QtWidgets.QSizePolicy.Policy.MinimumExpanding))
-        
-        # Set minimum height to ensure visibility when docked
-        self.setMinimumHeight(80)
 
         self.bgbrush = QtGui.QBrush(globals_.theme.color('bg'))
         self.objbrush = QtGui.QBrush(globals_.theme.color('overview_object'))
@@ -130,6 +128,9 @@ class LevelOverviewWidget(QtWidgets.QWidget):
             scalar * self.Xposlocator, scalar * self.Yposlocator,
             scalar * self.Wlocator, scalar * self.Hlocator
         ))
+
+        painter.end()
+        del painter
 
     def CalcSize(self):
         """
@@ -571,7 +572,8 @@ class Stamp:
 
         minX, minY, maxX, maxY = 24576, 12288, 0, 0
 
-        layers, sprites = globals_.mainWindow.getEncodedObjects(self.ReggieClip)
+        # Preview rendering must not leave temporary stamp contents on the level.
+        layers, sprites = globals_.mainWindow.getEncodedObjects(self.ReggieClip, add_to_scene=False)
 
         # Go through the sprites and find the maxs and mins
         for spr in sprites:
@@ -620,7 +622,7 @@ class Stamp:
         pixmapSize = (maxX - minX, maxY - minY)
 
         # Create the pixmap, and a painter
-        pix = QtGui.QPixmap(int(pixmapSize[0]), int(pixmapSize[1]))
+        pix = QtGui.QPixmap(pixmapSize[0], pixmapSize[1])
         pix.fill(QtCore.Qt.GlobalColor.transparent)
         painter = QtGui.QPainter(pix)
         painter.setRenderHint(painter.RenderHint.Antialiasing)
@@ -725,6 +727,8 @@ class Stamp:
         painter.drawText(textRect, QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.TextFlag.TextWordWrap, self.Name)
 
         # Return the pixmap
+        painter.end()
+        del painter
         return pix
 
     @staticmethod
@@ -749,36 +753,257 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
     Widget that shows a list of available sprites
     """
 
-    # Signal emitted with (current, total) during batch loading; total=-1 means done
-    loadingProgress = QtCore.pyqtSignal(int, int)
+    PREVIEW_SIZE = QtCore.QSize(52, 40)
+    PREVIEW_CONTENT_SIZE = QtCore.QSize(44, 36)
+    PREVIEW_PADDING = 4
+    PREVIEW_ROW_HEIGHT = 46
 
     def __init__(self):
         """
         Initializes the widget
         """
         super().__init__()
+        self.preview_cache = {}
+        self.preview_items = {}
+        self.preview_queue = collections.deque()
+        self.preview_queued = set()
+        self.preview_enabled = setting('ShowSpritePalettePreview', False)
+        self.preview_timer = QtCore.QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self._processPreviewQueue)
         self.setColumnCount(1)
         self.setHeaderHidden(True)
         self.setIndentation(16)
+        self.setIconSize(self.PREVIEW_SIZE)
+        self.setUniformRowHeights(False)
         self.currentItemChanged.connect(self.HandleItemChange)
-        
-        # Set icon size for sprite images
-        self.setIconSize(QtCore.QSize(48, 48))
-
-        # Load setting for showing sprite images
-        self.show_sprite_images = setting('ShowSpriteListImages', False)
-
-        # Batch loading state
-        self._batch_queue = []      # list of (item, sprite_id) pending render
-        self._batch_timer = QtCore.QTimer(self)
-        self._batch_timer.setInterval(0)  # fire as fast as possible between events
-        self._batch_timer.timeout.connect(self._processBatch)
-        self._batch_total = 0
 
         LoadSpriteData()
         LoadSpriteListData()
         LoadSpriteCategories()
         self.LoadItems()
+
+    def previewEnabled(self):
+        """
+        Returns whether palette previews are enabled.
+        """
+        return self.preview_enabled
+
+    def _clearPreviewQueue(self):
+        self.preview_queue.clear()
+        self.preview_queued.clear()
+        if self.preview_timer.isActive():
+            self.preview_timer.stop()
+
+    def _setItemPreview(self, item, icon):
+        """
+        Applies a cached preview icon to a tree item.
+        """
+        if icon is None:
+            item.setIcon(0, QtGui.QIcon())
+        else:
+            item.setIcon(0, QtGui.QIcon(icon))
+
+    def _updateItemSizeHint(self, item, sprite_id):
+        """
+        Updates the row size for one item based on preview visibility.
+        """
+        if sprite_id is None or sprite_id < 0:
+            item.setSizeHint(0, QtCore.QSize())
+            return
+
+        if self.preview_enabled:
+            item.setSizeHint(0, QtCore.QSize(self.PREVIEW_SIZE.width() + 12, self.PREVIEW_ROW_HEIGHT))
+        else:
+            item.setSizeHint(0, QtCore.QSize())
+
+    def _refreshItemSizeHints(self):
+        """
+        Applies the current row height rules to all picker items.
+        """
+        for sprite_id, items in self.preview_items.items():
+            for item in items:
+                self._updateItemSizeHint(item, sprite_id)
+
+    def _setPreviewForSpriteId(self, sprite_id, icon):
+        """
+        Applies a preview icon to all nodes for a sprite id.
+        """
+        for item in self.preview_items.get(sprite_id, ()):
+            self._setItemPreview(item, icon)
+
+    def _clearVisiblePreviews(self):
+        """
+        Removes preview icons from the picker.
+        """
+        for items in self.preview_items.values():
+            for item in items:
+                item.setIcon(0, QtGui.QIcon())
+
+    def _queueSpritePreview(self, sprite_id):
+        """
+        Queues a preview to be rendered if needed.
+        """
+        if sprite_id in self.preview_cache:
+            self._setPreviewForSpriteId(sprite_id, self.preview_cache[sprite_id])
+            return
+
+        if sprite_id in self.preview_queued:
+            return
+
+        self.preview_queued.add(sprite_id)
+        self.preview_queue.append(sprite_id)
+
+        if not self.preview_timer.isActive():
+            self.preview_timer.start(0)
+
+    def _queueVisibleSpritePreviews(self):
+        """
+        Queues previews for the currently visible sprite items only.
+        """
+        if not self.preview_enabled:
+            return
+
+        visible_ids = set()
+
+        for i in range(self.topLevelItemCount()):
+            cnode = self.topLevelItem(i)
+            if cnode.isHidden():
+                continue
+
+            for j in range(cnode.childCount()):
+                snode = cnode.child(j)
+                if snode.isHidden():
+                    continue
+
+                sprite_id = snode.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if sprite_id is None or sprite_id < 0:
+                    continue
+
+                visible_ids.add(sprite_id)
+
+        for sprite_id in visible_ids:
+            self._queueSpritePreview(sprite_id)
+
+    def _renderPreviewPixmap(self, sprite_id):
+        """
+        Renders a compact cached preview for one sprite type.
+        """
+        from levelitems import SpriteItem
+
+        sprite = SpriteItem(sprite_id, 0, 0, bytes(10))
+        sprite.ensureImageObjLoaded()
+
+        bounds = QtCore.QRectF(sprite.BoundingRect)
+        if bounds.isNull():
+            bounds = QtCore.QRectF(0, 0, 24, 24)
+
+        bounds = bounds.adjusted(
+            -self.PREVIEW_PADDING,
+            -self.PREVIEW_PADDING,
+            self.PREVIEW_PADDING,
+            self.PREVIEW_PADDING,
+        )
+
+        image = QtGui.QImage(
+            max(1, int(bounds.width())),
+            max(1, int(bounds.height())),
+            QtGui.QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        image.fill(QtCore.Qt.GlobalColor.transparent)
+
+        painter = QtGui.QPainter(image)
+        try:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            painter.translate(-bounds.left(), -bounds.top())
+            sprite.paint(painter, overrideGlobals=True)
+        finally:
+            painter.end()
+            del painter
+
+        scaled = QtGui.QPixmap.fromImage(image).scaled(
+            self.PREVIEW_CONTENT_SIZE,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+
+        framed = QtGui.QPixmap(self.PREVIEW_SIZE)
+        framed.fill(QtCore.Qt.GlobalColor.transparent)
+
+        painter = QtGui.QPainter(framed)
+        try:
+            x = max(0, (self.PREVIEW_SIZE.width() - scaled.width()) // 2)
+            y = max(0, (self.PREVIEW_SIZE.height() - scaled.height()) // 2)
+            painter.drawPixmap(x, y, scaled)
+        finally:
+            painter.end()
+            del painter
+
+        return framed
+
+    def _processPreviewQueue(self):
+        """
+        Renders palette previews incrementally to keep the UI responsive.
+        """
+        if not self.preview_enabled:
+            self._clearPreviewQueue()
+            return
+
+        deadline = QtCore.QElapsedTimer()
+        deadline.start()
+
+        while self.preview_queue:
+            sprite_id = self.preview_queue.popleft()
+            self.preview_queued.discard(sprite_id)
+
+            try:
+                icon = self._renderPreviewPixmap(sprite_id)
+            except Exception:
+                icon = None
+
+            self.preview_cache[sprite_id] = icon
+            self._setPreviewForSpriteId(sprite_id, icon)
+
+            # Keep each batch short so palette interaction remains smooth.
+            if deadline.elapsed() >= 12:
+                break
+
+        if self.preview_queue:
+            self.preview_timer.start(0)
+
+    def setPreviewEnabled(self, enabled):
+        """
+        Toggles inline sprite previews in the palette.
+        """
+        self.preview_enabled = bool(enabled)
+        setSetting('ShowSpritePalettePreview', self.preview_enabled)
+
+        self._clearPreviewQueue()
+        self._refreshItemSizeHints()
+
+        if not self.preview_enabled:
+            self._clearVisiblePreviews()
+            self.doItemsLayout()
+            self.viewport().update()
+            return
+
+        for sprite_id, icon in self.preview_cache.items():
+            self._setPreviewForSpriteId(sprite_id, icon)
+
+        self._queueVisibleSpritePreviews()
+        self.doItemsLayout()
+        self.viewport().update()
+
+    def clearPreviewCache(self):
+        """
+        Clears cached palette previews and regenerates them if needed.
+        """
+        self.preview_cache.clear()
+        self._clearPreviewQueue()
+        self._clearVisiblePreviews()
+
+        if self.preview_enabled:
+            self._queueVisibleSpritePreviews()
 
     def UpdateSpriteNames(self):
         """
@@ -795,7 +1020,7 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
 
                     id_ = snode.data(0, QtCore.Qt.ItemDataRole.UserRole)
 
-                    if 0 <= id_ < globals_.NumSprites and globals_.Sprites[id_] is not None:
+                    if 0 <= id_ < globals_.NumSprites:
                         sdef = globals_.Sprites[id_]
                     else:
                         sdef = None
@@ -811,7 +1036,9 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
         """
         Loads tree widget items
         """
+        self._clearPreviewQueue()
         self.clear()
+        self.preview_items = {}
 
         for viewname, view, nodelist in globals_.SpriteCategories:
             for n in nodelist: nodelist.remove(n)
@@ -832,7 +1059,7 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
                         snode.setData(0, QtCore.Qt.ItemDataRole.UserRole, -2)
                         self.NoSpritesFound = snode
                     else:
-                        if 0 <= id_ < globals_.NumSprites and globals_.Sprites[id_] is not None:
+                        if 0 <= id_ < globals_.NumSprites:
                             sdef = globals_.Sprites[id_]
                         else:
                             sdef = None
@@ -844,6 +1071,11 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
 
                         snode.setText(0, globals_.trans.string('Sprites', 18, '[id]', id_, '[name]', sname))
                         snode.setData(0, QtCore.Qt.ItemDataRole.UserRole, id_)
+                        self.preview_items.setdefault(id_, []).append(snode)
+                        self._updateItemSizeHint(snode, id_)
+
+                        if self.preview_enabled and id_ in self.preview_cache:
+                            self._setItemPreview(snode, self.preview_cache[id_])
 
                     if isSearch:
                         SearchableItems.append(snode)
@@ -860,76 +1092,6 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
         self.itemClicked.connect(self.HandleSprReplace)
 
         self.SwitchView(globals_.SpriteCategories[0])
-        
-        # Connect to itemExpanded signal to render search results when expanded
-        self.itemExpanded.connect(self.onItemExpanded)
-
-    def clearAllIcons(self):
-        """
-        Removes sprite icons from every item in the tree.
-        """
-        null_icon = QtGui.QIcon()
-        def clearRecursive(item):
-            item.setIcon(0, null_icon)
-            for i in range(item.childCount()):
-                clearRecursive(item.child(i))
-        for i in range(self.topLevelItemCount()):
-            clearRecursive(self.topLevelItem(i))
-
-    def _collectVisibleItems(self):
-        """
-        Returns a list of (item, sprite_id) for all visible sprite items.
-        """
-        result = []
-        def collectRecursive(item):
-            sprite_id = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-            if sprite_id is not None and sprite_id >= 0:
-                result.append((item, sprite_id))
-            for i in range(item.childCount()):
-                collectRecursive(item.child(i))
-        for i in range(self.topLevelItemCount()):
-            top = self.topLevelItem(i)
-            if not top.isHidden():
-                collectRecursive(top)
-        return result
-
-    def _startBatchQueue(self, items):
-        """
-        Starts (or restarts) the batch rendering queue with the given list of
-        (item, sprite_id) pairs. Emits loadingProgress signals as work proceeds.
-        """
-        # Cancel any in-progress batch
-        self._batch_timer.stop()
-        self._batch_queue = list(items)
-        self._batch_total = len(self._batch_queue)
-        if self._batch_total == 0:
-            self.loadingProgress.emit(0, -1)
-            return
-        self.loadingProgress.emit(0, self._batch_total)
-        self._batch_timer.start()
-
-    def _processBatch(self):
-        """
-        Processes a small batch of sprite renders per timer tick to keep the UI responsive.
-        """
-        BATCH_SIZE = 5
-        if not self._batch_queue:
-            self._batch_timer.stop()
-            self.loadingProgress.emit(self._batch_total, -1)
-            return
-
-        for _ in range(BATCH_SIZE):
-            if not self._batch_queue:
-                break
-            item, sprite_id = self._batch_queue.pop(0)
-            self.updateSpriteImageForItem(item, sprite_id)
-
-        done = self._batch_total - len(self._batch_queue)
-        if self._batch_queue:
-            self.loadingProgress.emit(done, self._batch_total)
-        else:
-            self._batch_timer.stop()
-            self.loadingProgress.emit(self._batch_total, -1)
 
     def SwitchView(self, view):
         """
@@ -940,24 +1102,8 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
 
         for node in view[2]:
             node.setHidden(False)
-        
-        # Queue images for newly visible items (only if scene is ready)
-        if self.show_sprite_images:
-            import spritelib as SLib
-            if SLib.Tiles and not all(tile is None for tile in SLib.Tiles):
-                self._startBatchQueue(self._collectVisibleItems())
-    
-    def updateItemsInCategory(self, category_item):
-        """
-        Updates sprite images for all items in a category
-        """
-        items = []
-        for i in range(category_item.childCount()):
-            item = category_item.child(i)
-            sprite_id = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-            if sprite_id is not None and sprite_id >= 0:
-                items.append((item, sprite_id))
-        self._startBatchQueue(items)
+
+        self._queueVisibleSpritePreviews()
 
     def HandleItemChange(self, current, previous):
         """
@@ -983,21 +1129,7 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
 
         self.NoSpritesFound.setHidden(bool(results))
         self.SearchResultsCategory.setExpanded(True)
-
-    def onItemExpanded(self, item):
-        """
-        Called when a tree item is expanded - render images for that category
-        """
-        if not self.show_sprite_images:
-            return
-        
-        import spritelib as SLib
-        if not (SLib.Tiles and not all(tile is None for tile in SLib.Tiles)):
-            return
-
-        # Only render if it's the search results category
-        if hasattr(self, 'SearchResultsCategory') and item == self.SearchResultsCategory:
-            self.updateItemsInCategory(item)
+        self._queueVisibleSpritePreviews()
 
     def HandleSprReplace(self, item, column):
         """
@@ -1007,141 +1139,6 @@ class SpritePickerWidget(QtWidgets.QTreeWidget):
             id_ = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
             if id_ != -1:
                 self.SpriteReplace.emit(id_)
-
-    def toggleSpriteImages(self, state):
-        """
-        Toggles the display of sprite images in the list
-        """
-        # state is 0 (unchecked) or 2 (checked) from stateChanged signal
-        self.show_sprite_images = state == 2
-        setSetting('ShowSpriteListImages', self.show_sprite_images)
-
-        if not self.show_sprite_images:
-            # Cancel any pending batch and remove all icons
-            self._batch_timer.stop()
-            self._batch_queue = []
-            self.loadingProgress.emit(0, -1)
-            self.clearAllIcons()
-            return
-
-        # Load images: only if scene is ready (tiles loaded)
-        import spritelib as SLib
-        if SLib.Tiles and not all(tile is None for tile in SLib.Tiles):
-            self._startBatchQueue(self._collectVisibleItems())
-
-    def updateSpriteImageForItem(self, item, sprite_id):
-        """
-        Updates the sprite image for a specific tree item.
-        Uses a temporary scene to avoid artifacts on the main canvas.
-        """
-        if not self.show_sprite_images:
-            return
-        
-        try:
-            from levelitems import SpriteItem
-            from raw_data import RawData
-            
-            if globals_.Area is None:
-                return
-            
-            temp_sprite = None
-            temp_scene = None
-            try:
-                temp_data = RawData(b'\x00\x00\x00\x00\x00\x00\x00\x00', format=RawData.Format.Vanilla)
-                temp_sprite = SpriteItem(sprite_id, 0, 0, temp_data)
-            except:
-                return
-            
-            try:
-                # Use a temporary scene instead of the main scene to avoid rendering artifacts
-                temp_scene = QtWidgets.QGraphicsScene()
-                temp_scene.addItem(temp_sprite)
-            except:
-                return
-            
-            img = None
-            try:
-                # Render from the temporary scene, not the main scene
-                img = self._renderSpriteIcon(temp_sprite, temp_scene)
-                if img is None:
-                    return
-            except:
-                return
-            finally:
-                try:
-                    if temp_sprite is not None and temp_scene is not None:
-                        temp_scene.removeItem(temp_sprite)
-                except:
-                    pass
-            
-            background = QtGui.QPixmap(48, 48)
-            background.fill(globals_.theme.color('bg'))
-            
-            scaled_img = img.scaled(
-                48, 48,
-                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                QtCore.Qt.TransformationMode.SmoothTransformation
-            )
-            
-            scaled_pixmap = QtGui.QPixmap.fromImage(scaled_img)
-            
-            painter = QtGui.QPainter(background)
-            try:
-                x = (48 - scaled_pixmap.width()) // 2
-                y = (48 - scaled_pixmap.height()) // 2
-                painter.drawPixmap(x, y, scaled_pixmap)
-            finally:
-                painter.end()
-            
-            item.setIcon(0, QtGui.QIcon(background))
-        except:
-            pass
-
-    def _renderSpriteIcon(self, sprite, scene):
-        """
-        Renders a sprite icon from a temporary scene.
-        This avoids using the main scene which can cause zoom artifacts.
-        """
-        # Constants from renderInLevelIcon
-        maxSize = QtCore.QSize(256, 256)
-        marginPct = 0.08
-        maxMargin = 96
-
-        # Get the full bounding rectangle
-        br = sprite.getFullRect()
-
-        # Expand the rect to add extra margins
-        marginX = br.width() * marginPct
-        marginY = br.height() * marginPct
-        marginX = min(marginX, maxMargin)
-        marginY = min(marginY, maxMargin)
-        br.setX(br.x() - marginX)
-        br.setY(br.y() - marginY)
-        br.setWidth(br.width() + marginX)
-        br.setHeight(br.height() + marginY)
-
-        # Take the screenshot from the temporary scene
-        ScreenshotImage = QtGui.QImage(br.size().toSize(), QtGui.QImage.Format.Format_ARGB32)
-        ScreenshotImage.fill(QtCore.Qt.GlobalColor.transparent)
-
-        RenderPainter = QtGui.QPainter(ScreenshotImage)
-        scene.render(
-            RenderPainter,
-            QtCore.QRectF(0, 0, br.width(), br.height()),
-            br,
-        )
-        RenderPainter.end()
-
-        # Shrink if too big
-        final = ScreenshotImage
-        if ScreenshotImage.width() > maxSize.width() or ScreenshotImage.height() > maxSize.height():
-            final = ScreenshotImage.scaled(
-                maxSize,
-                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                QtCore.Qt.TransformationMode.SmoothTransformation,
-            )
-
-        return final
 
     SpriteChanged = QtCore.pyqtSignal(int)
     SpriteReplace = QtCore.pyqtSignal(int)
@@ -1255,7 +1252,7 @@ class SpriteList(QtWidgets.QWidget):
         filtertype = self.idtypes[filteridx - 1]
         sprite = self.table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
 
-        if 0 <= sprite.type < globals_.NumSprites and globals_.Sprites[sprite.type] is not None:
+        if 0 <= sprite.type < globals_.NumSprites:
             sdef = globals_.Sprites[sprite.type]
         else:
             # No sprite definition -> hide
@@ -1271,7 +1268,7 @@ class SpriteList(QtWidgets.QWidget):
                 continue
 
             # The idtype is the last element in the field tuple.
-            if field[-2] == filtertype:
+            if field[-1] == filtertype:
                 self.table.setRowHidden(row, False)
                 return
 
@@ -1456,7 +1453,7 @@ class SpriteList(QtWidgets.QWidget):
         Returns an (idtype, [values]) dict for every
         idtype this sprite has
         """
-        if not (0 <= sprite.type < globals_.NumSprites) or globals_.Sprites[sprite.type] is None:
+        if not 0 <= sprite.type < globals_.NumSprites:
             return {}
 
         sdef = globals_.Sprites[sprite.type]
@@ -1472,7 +1469,7 @@ class SpriteList(QtWidgets.QWidget):
 
             # The idtype is the last element in the field tuple, bit is the
             # third element in the field tuple (for both list and value).
-            idtype = field[-2]
+            idtype = field[-1]
 
             # No id type specified
             if idtype is None:

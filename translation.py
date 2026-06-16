@@ -118,8 +118,8 @@ class ReggieTranslation:
                 ),
                 34: 'Credits',
                 35: '[b]Credits:[/b][br]Activates the game\'s Credits mode for this area',
-                36: 'Ambush',
-                37: '[b]Ambush:[/b][br]Activates the game\'s Ambush mode for this area',
+                36: 'Spawn Facing Left',
+                37: '[b]Spawn Facing Left:[/b][br]Spawns all players facing left instead of right. Enabled in all Ambush stages.',
                 38: 'Unknown Option 1',
                 39: '[b]Unknown Option 1:[/b] We haven\'t managed to figure out what this does, or if it does anything. This option is turned off in most levels.',
                 40: 'Unknown Option 2',
@@ -286,6 +286,8 @@ class ReggieTranslation:
                 30: '[b]Send to World Map:[/b][br]If this is checked, the player will be sent to the world map when entering this entrance.',
                 31: 'Spawn Half a Tile Left',
                 32: '[b]Spawn Half a Tile Left:[/b][br]If this is checked, the entrance will spawn Mario half a tile to the left.',
+                33: 'Link',
+                34: '[b]Link:[/b][br]Click this, then click another entrance to link them (dest id/area in both).',
             },
             'Entrances': {
                 0: '[b]Entrance [ent]:[/b][br]Type: [type][br][i][dest][/i]',
@@ -337,9 +339,11 @@ class ReggieTranslation:
                 2: 'Error while Reggie was trying to save the level:[br]The original file data ([orig-len] bytes) exceeded the fixed length ([pad-len] bytes).[br][br](Your work has not been saved! Increase the fixed length in the Preferences Dialog.)',
                 3: 'Error while Reggie was trying to save the level:[br]An error occurred while compressing the level. Is it too big? The uncompressed size is [file-size] bytes.[br][br](Your work has not been saved! Try saving without compression or removing elements from your level.)',
             },
-            'Err_UnknownSprite': {
-                0: 'Warning: This level contains sprite ID [id] which is not defined in the current game patch. The sprite will be displayed as "UNKNOWN" but can still be edited and saved.',
-                1: 'Warning: This level contains sprite IDs ([ids]) which are not defined in the current game patch. These sprites will be displayed as "UNKNOWN" but can still be edited and saved.',
+            'Warn_NullSave': {
+                0: 'Warning',
+                1: 'The level data being saved for [file] appears to be filled entirely with null bytes. Continue anyway?',
+                2: 'The saved file [file] appears to be filled entirely with null bytes. The level file may be corrupted.',
+                3: 'The current level data appears to be filled entirely with null bytes. A backup was not created.',
             },
             'FileDlgs': {
                 0: 'Choose a level archive',
@@ -353,6 +357,7 @@ class ReggieTranslation:
                 8: 'Save Copy: Choose a new filename',
                 9: 'All Supported Level Archives',
                 10: 'LZ-Compressed Level Archives',
+                11: 'Reggie Raw Level Files',
             },
             'Gamedefs': {
                 0: 'This game has custom sprite images',
@@ -425,7 +430,6 @@ class ReggieTranslation:
                 3: '&Settings',
                 4: '&Help',
                 5: 'Editor Toolbar',
-                6: 'Patch Toolbar',
             },
             'MenuItems': {
                 0: 'New Level',
@@ -564,7 +568,10 @@ class ReggieTranslation:
                 139: 'Reload the spritedata file, including any changes made since the level was loaded',
                 140: 'Camera Profiles...',
                 141: 'Edit event-activated camera settings',
-                142: 'Game Patches',
+                142: 'Show Pipes',
+                143: 'Toggle viewing of pipe entrance links',
+                144: 'Show Events',
+                145: 'Toggle viewing of sprite event links',
             },
             'Objects': {
                 0: '[b]Tileset [tileset], object [obj]:[/b][br][width]x[height] on layer [layer]',
@@ -676,7 +683,6 @@ class ReggieTranslation:
                 39: 'Insert new path node after selected node',
                 40: 'Themes',
                 41: 'Theme:',
-                42: 'Interface',
             },
             'ScrShtDlg': {
                 0: 'Choose a Screenshot source',
@@ -741,6 +747,8 @@ class ReggieTranslation:
                 26: 'Add Sprite',
                 27: 'Resize',
                 28: 'NO TITLE GIVEN!',
+                29: 'Rotation Link',
+                30: 'Location Link',
             },
             'Sprites': {
                 0: '[b]Sprite [type]:[/b][br][name]',
@@ -796,8 +804,6 @@ class ReggieTranslation:
                     'Entrance ID',
                     'Path Node ID',
                 ),
-                24: 'Show Sprite Images',
-                25: 'Loading images... [current]/[total]',
             },
             'Statusbar': {
                 0: '- 1 object selected',
@@ -1031,7 +1037,12 @@ class ReggieTranslation:
             'SpriteUpgradeDlg': {
                 0: 'Sprite Upgrader',
                 1: 'Reggie Next has detected that the game patch\'s sprites.py file is outdated, and must be upgraded to PyQt6 in order to work correctly.[br][br]Would you like to upgrade?[br]A copy of the old file will remain in the game patch folder.',
-            }
+            },
+            'Err_UnknownSprite': {
+                0: 'Warning',
+                1: 'This level contains sprite ID [id], which is not defined in the current game patch. The sprite will be displayed as "UNKNOWN" but can still be edited and saved.',
+                2: 'This level contains sprite IDs ([ids]) which are not defined in the current game patch. These sprites will be displayed as "UNKNOWN" but can still be edited and saved.',
+            },
         }
 
     def InitFromXML(self, name):
@@ -1110,12 +1121,19 @@ class ReggieTranslation:
                 if string.tag.lower() == 'string':
                     # String node
                     strValue = string.text
+                    if strValue is not None:
+                        strValue = strValue.strip()
+                        if strValue == '':
+                            strValue = None
                 elif string.tag.lower() == 'stringlist':
                     # Not as easy, but not hard
                     strValue = []
                     for entry in string:
                         if entry.tag.lower() == 'entry':
-                            strValue.append(entry.text)
+                            entryText = entry.text
+                            if entryText is None:
+                                entryText = ''
+                            strValue.append(entryText.strip())
                     strValue = tuple(strValue)
 
                 # Add this string to sectionStrings
@@ -1142,7 +1160,9 @@ class ReggieTranslation:
         try:
             return self.string_(*args)
         except Exception as e:
-            text = '\nReggieTranslation.string() ERROR: ' + str(args[1]) + '; ' + str(args[2]) + '; ' + repr(e) + '\n'
+            section = args[0] if len(args) > 0 else None
+            code = args[1] if len(args) > 1 else None
+            text = '\nReggieTranslation.string() ERROR: ' + str(section) + '; ' + str(code) + '; ' + repr(e) + '\n'
             # do 3 things with the text - print it, save it to ReggieErrors.txt, return it
             print(text)
 
@@ -1270,4 +1290,3 @@ class ReggieTranslation:
 
         tree = ElementTree.ElementTree(root)
         tree.write('strings.xml', encoding='utf-8')
-

@@ -17,7 +17,6 @@ from translation import ReggieTranslation
 from libs import lh
 from misc2 import LevelViewWidget
 from levelitems import Path, CommentItem
-from raw_data import RawData
 
 ################################################################################
 ################################################################################
@@ -133,120 +132,6 @@ def areValidGamePaths(stage_check='ug', texture_check='ug'):
             return True
 
     return False
-
-
-def isNewerStageFolder(path):
-    """
-    Check if the Stage folder is from Newer Super Mario Bros. Wii
-    Returns True if it contains 10-01.arc or 10-01.arc.LH
-    """
-    return (os.path.isfile(os.path.join(path, '10-01.arc')) or 
-            os.path.isfile(os.path.join(path, '10-01.arc.LH')) or 
-            os.path.isfile(os.path.join(path, '10-01.arc.LZ')))
-
-
-def isNewerTextureFolder(path):
-    """
-    Check if the Texture folder is from Newer Super Mario Bros. Wii
-    Returns True if it contains Cloudscape.arc or Cloudscape.arc.LH
-    """
-    return (os.path.isfile(os.path.join(path, 'Cloudscape.arc')) or 
-            os.path.isfile(os.path.join(path, 'Cloudscape.arc.LH')) or 
-            os.path.isfile(os.path.join(path, 'Cloudscape.arc.LZ')))
-
-
-def getExistingDirectoryWithSidebar(parent, caption, directory='', options=None):
-    """
-    Helper function to show a directory picker with proper sidebar URLs on macOS.
-    On macOS with DontUseNativeDialog, adds /Volumes to sidebar for external drive access.
-    
-    Args:
-        parent: Parent widget
-        caption: Dialog title
-        directory: Starting directory
-        options: QFileDialog options
-    
-    Returns:
-        Selected directory path or empty string if cancelled
-    """
-    if sys.platform == 'darwin' and options and (options & QtWidgets.QFileDialog.Option.DontUseNativeDialog):
-        # Create a QFileDialog instance to customize sidebar
-        dialog = QtWidgets.QFileDialog(parent, caption, directory)
-        dialog.setFileMode(QtWidgets.QFileDialog.FileMode.Directory)
-        dialog.setOptions(options)
-        
-        # Add /Volumes to sidebar for external drive access
-        sidebar_urls = dialog.sidebarUrls()
-        volumes_url = QtCore.QUrl.fromLocalFile('/Volumes')
-        if volumes_url not in sidebar_urls:
-            sidebar_urls.insert(0, volumes_url)  # Add at top
-            dialog.setSidebarUrls(sidebar_urls)
-        
-        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            selected = dialog.selectedFiles()
-            return selected[0] if selected else ''
-        return ''
-    else:
-        # Use static method for other platforms or native dialog
-        return QtWidgets.QFileDialog.getExistingDirectory(parent, caption, directory, options)
-
-
-def validateFolderForPatch(folder_path, is_stage, patch_name, parent_widget=None):
-    """
-    Validates if a folder matches the expected patch type (base game vs Newer).
-    Returns a tuple: (validated_path, validated_patch_name)
-    
-    Args:
-        folder_path: The selected folder path
-        is_stage: True if this is a Stage folder, False if Texture folder
-        patch_name: The name of the patch being configured
-        parent_widget: Parent widget for message boxes
-    
-    Returns:
-        Tuple of (folder_path, patch_name) - may be modified if user chooses to switch patches
-    """
-    from PyQt6 import QtWidgets
-    
-    # Only validate for base game and Newer Super Mario Bros. Wii
-    if patch_name not in ['New Super Mario Bros. Wii', 'Newer Super Mario Bros. Wii']:
-        return (folder_path, patch_name)
-    
-    # Check if this is a Newer folder
-    if is_stage:
-        is_newer = isNewerStageFolder(folder_path)
-    else:
-        is_newer = isNewerTextureFolder(folder_path)
-    
-    is_base_expected = (patch_name == 'New Super Mario Bros. Wii')
-    
-    # If mismatch, ask user
-    if is_newer and is_base_expected:
-        # User selected Newer folder for base game
-        result = QtWidgets.QMessageBox.question(
-            parent_widget,
-            'Wrong Folder Type',
-            f'The selected folder appears to be from Newer Super Mario Bros. Wii, not the base game.\n\n'
-            f'Do you want to set this folder for Newer Super Mario Bros. Wii instead?',
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
-        )
-        
-        if result == QtWidgets.QMessageBox.StandardButton.Yes:
-            return (folder_path, 'Newer Super Mario Bros. Wii')
-    
-    elif not is_newer and not is_base_expected:
-        # User selected base game folder for Newer
-        result = QtWidgets.QMessageBox.question(
-            parent_widget,
-            'Wrong Folder Type',
-            f'The selected folder appears to be from the base game (New Super Mario Bros. Wii), not Newer Super Mario Bros. Wii.\n\n'
-            f'Do you want to set this folder for the base game instead?',
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
-        )
-        
-        if result == QtWidgets.QMessageBox.StandardButton.Yes:
-            return (folder_path, 'New Super Mario Bros. Wii')
-    
-    return (folder_path, patch_name)
 
 
 def getResourcePaths(res_name):
@@ -567,20 +452,8 @@ class SpriteDefinition:
         """
         self.fields = []
         fields = self.fields
-        allowed = [
-            'checkbox',
-            'list',
-            'value',
-            'bitfield',
-            'multibox',
-            'dualbox',
-            'dependency',
-            'external',
-            'multidualbox',
-            'dynamicblockvalues',
-            'hexvalue',
-            'dynamicstring'
-        ]
+        allowed = ['checkbox', 'list', 'value', 'bitfield', 'multibox', 'dualbox',
+                   'dependency', 'external', 'multidualbox']
 
         for field in elem:
             if field.tag not in allowed:
@@ -597,7 +470,7 @@ class SpriteDefinition:
             else:
                 title = globals_.trans.string('SpriteDataEditor', 28)
 
-            advanced = attribs.get("advanced", "False").lower() == "true"
+            advanced = attribs.get("advanced", "False") == "True"
             comment = comment2 = advancedcomment = required = idtype = None
 
             if 'comment' in attribs:
@@ -608,22 +481,6 @@ class SpriteDefinition:
 
             if 'advancedcomment' in attribs:
                 advancedcomment = globals_.trans.string('SpriteDataEditor', 1, '[name]', title, '[note]', attribs['advancedcomment'])
-
-
-            if not field.tag == 'dependency':
-                if "extended" in elem.attrib and elem.attrib["extended"].lower() == "true":
-                    block = attribs.get("block", None)
-
-                    if block:
-                        block = int(block)
-                        if block <= 0:
-                            raise ValueError("Extended spritedata need block values >= 1")
-
-                    else:
-                        block = 0
-
-                else:
-                    block = 0
 
             if 'requirednybble' in attribs:
                 bit_ranges, _ = self.parseBits(attribs.get("requirednybble"))
@@ -637,15 +494,6 @@ class SpriteDefinition:
                 else:
                     vals = [None] * len(bit_ranges)
 
-                if 'requiredblock' in attribs:
-                    blocks = [abs(int(x.strip())) for x in attribs['requiredblock'].split(',')] if attribs['requiredblock'] else [0] * len(bit_ranges)
-
-                    if len(blocks) != len(bit_ranges):
-                        raise ValueError("Required bits and blocks have different lengths.")
-                    
-                else:
-                    blocks = [0] * len(bit_ranges)
-
                 # The associated values are a comma-separated list of values or
                 # (inclusive) ranges.
                 for bit_range, sval in zip(bit_ranges, vals):
@@ -657,7 +505,7 @@ class SpriteDefinition:
                     else:
                         a, b = map(int, sval.split('-'))
 
-                    required.append(((bit_range,), (a, b + 1), blocks.pop(0)))
+                    required.append(((bit_range,), (a, b + 1)))
 
             if 'idtype' in attribs:
                 idtype = attribs['idtype']
@@ -670,7 +518,7 @@ class SpriteDefinition:
                 bit, _ = self.parseBits(attribs.get("nybble"))
                 mask = int(attribs.get('mask', 1))
 
-                fields.append((0, attribs['title'], bit, mask, comment, required, advanced, comment2, advancedcomment, block))
+                fields.append((0, attribs['title'], bit, mask, comment, required, advanced, comment2, advancedcomment))
 
             elif field.tag == 'list':
                 bit, _ = self.parseBits(attribs.get("nybble"))
@@ -682,28 +530,28 @@ class SpriteDefinition:
                     entries.append((int(e.attrib['value']), e.text))
 
                 model = SpriteDefinition.ListPropertyModel(entries)
-                fields.append((1, title, bit, model, comment, required, advanced, comment2, advancedcomment, idtype, block))
+                fields.append((1, title, bit, model, comment, required, advanced, comment2, advancedcomment, idtype))
 
             elif field.tag == 'value':
                 bit, max_ = self.parseBits(attribs.get("nybble"))
 
-                fields.append((2, attribs['title'], bit, max_, comment, required, advanced, comment2, advancedcomment, idtype, block))
+                fields.append((2, attribs['title'], bit, max_, comment, required, advanced, comment2, advancedcomment, idtype))
 
             elif field.tag == 'bitfield':
                 startbit = int(attribs['startbit'])
                 bitnum = int(attribs['bitnum'])
 
-                fields.append((3, attribs['title'], startbit, bitnum, comment, required, advanced, comment2, advancedcomment, block))
+                fields.append((3, attribs['title'], startbit, bitnum, comment, required, advanced, comment2, advancedcomment))
 
             elif field.tag == 'multibox':
                 bit, _ = self.parseBits(attribs.get("nybble"))
 
-                fields.append((4, attribs['title'], bit, comment, required, advanced, comment2, advancedcomment, block))
+                fields.append((4, attribs['title'], bit, comment, required, advanced, comment2, advancedcomment))
 
             elif field.tag == 'dualbox':
                 bit, _ = self.parseBits(attribs.get("nybble"))
 
-                fields.append((5, attribs['title1'], attribs['title2'], bit, comment, required, advanced, comment2, advancedcomment, block))
+                fields.append((5, attribs['title1'], attribs['title2'], bit, comment, required, advanced, comment2, advancedcomment))
 
             elif field.tag == 'dependency':
                 type_dict = {'required': 0, 'suggested': 1}
@@ -722,29 +570,15 @@ class SpriteDefinition:
                 bit, _ = self.parseBits(attribs.get("nybble"))
                 type_ = attribs['type']
 
-                fields.append((6, title, bit, comment, required, advanced, comment2, advancedcomment, type_, block))
+                fields.append((6, title, bit, comment, required, advanced, comment2, advancedcomment, type_))
 
             elif field.tag == 'multidualbox':
                 # multibox but with dualboxes instead of checkboxes
                 bit, _ = self.parseBits(attribs.get("nybble"))
 
-                fields.append((7, attribs['title1'], attribs['title2'], bit, comment, required, advanced, comment2, advancedcomment, block))
+                fields.append((7, attribs['title1'], attribs['title2'], bit, comment, required, advanced, comment2, advancedcomment))
 
-            elif field.tag == 'dynamicblockvalues':
-                fields.append((8, attribs['title'], comment, required, advanced, comment2, advancedcomment, idtype, block))
-
-            elif field.tag == 'hexvalue':
-                bit, _ = self.parseBits(attribs.get("nybble"))
-
-                round_bit0 = bit[0][0] // 4 * 4 + 1
-                round_bit1 = bit[0][1] // 4 * 4 + 1
-
-                fields.append((9, attribs['title'], [(round_bit0, round_bit1)], comment, required, advanced, comment2, advancedcomment, block))
-
-            elif field.tag == 'dynamicstring':
-                fields.append((10, attribs['title'], comment, required, advanced, comment2, advancedcomment, idtype, block))
-
-    def parseBits(self, nybble_val: str) -> tuple[list[tuple[int, int]], int]:
+    def parseBits(self, nybble_val):
         """
         Parses a description of the bits a setting affects into a tuple of a
         list of ranges and the number of possible values. Ranges include the
@@ -867,10 +701,9 @@ def LoadSpriteData():
                 yoshiNotes = globals_.trans.string('SpriteDataEditor', 9, '[notes]',
                                                 sprite.get('yoshinotes'))
 
-            noyoshi = sprite.get('noyoshi', 'False').lower() == "true"
-            asm = sprite.get('asmhacks', 'False').lower() == "true"
-            size = sprite.get('sizehacks', 'False').lower() == "true"
-            extendedSettings = sprite.get('extended', 'False').lower() == "true"
+            noyoshi = sprite.get('noyoshi', 'False') == "True"
+            asm = sprite.get('asmhacks', 'False') == "True"
+            size = sprite.get('sizehacks', 'False') == "True"
 
             sdef = SpriteDefinition()
             sdef.id = spriteid
@@ -882,15 +715,6 @@ def LoadSpriteData():
             sdef.noyoshi = noyoshi
             sdef.asm = asm
             sdef.size = size
-            sdef.extendedSettings = 0
-            if extendedSettings:
-                block_count = 1
-                for elem in sprite:
-                    if 'block' in elem.attrib:
-                        block_count = max(block_count, int(elem.attrib['block']))
-
-                sdef.extendedSettings = block_count
-
             sdef.dependencies = []
             sdef.dependencynotes = None
 
@@ -1007,22 +831,6 @@ def LoadEntranceNames(reload_=False):
             for line in f.readlines():
                 id_, name = line.strip().split(':')
                 names[int(id_)] = name
-
-        if os.path.exists(os.path.join(os.path.dirname(path), 'entrances.png')):
-            ei = []
-            entrance_img_path = os.path.join(os.path.dirname(path), 'entrances.png')
-            src = QtGui.QPixmap(entrance_img_path)
-            
-            # Calculate total number of 24x24 tiles in the image (supports multiple rows)
-            cols = src.width() // 24
-            rows = src.height() // 24
-            
-            # Load images row by row, left to right
-            for row in range(rows):
-                for col in range(cols):
-                    ei.append(src.copy(col * 24, row * 24, 24, 24))
-            
-            globals_.EntranceImages = ei
 
     globals_.EntranceTypeNames = collections.OrderedDict()
     for idx in names:
@@ -1583,7 +1391,6 @@ def LoadActionsLists():
         (globals_.trans.string('MenuItems', 50), True, 'showlay1'),
         (globals_.trans.string('MenuItems', 52), True, 'showlay2'),
         (globals_.trans.string('MenuItems', 54), True, 'showsprites'),
-        (globals_.trans.string('MenuItems', 56), False, 'showspriteimages'),
         (globals_.trans.string('MenuItems', 58), True, 'showlocations'),
         (globals_.trans.string('MenuItems', 130), True, 'showpaths'),
         (globals_.trans.string('MenuItems', 60), True, 'grid'),
@@ -1602,7 +1409,6 @@ def LoadActionsLists():
         (globals_.trans.string('MenuItems', 82), False, 'deletearea'),
         (globals_.trans.string('MenuItems', 84), False, 'reloadgfx'),
         (globals_.trans.string('MenuItems', 138), False, 'reloaddata'),
-        (globals_.trans.string('MenuItems', 142), True, 'gamepatches'),
     )
     globals_.HelpActions = (
         (globals_.trans.string('MenuItems', 86), False, 'infobox'),
@@ -1610,6 +1416,41 @@ def LoadActionsLists():
         (globals_.trans.string('MenuItems', 90), False, 'tipbox'),
         (globals_.trans.string('MenuItems', 92), False, 'aboutqt'),
     )
+
+
+def GetDefaultToolbarToggles():
+    """
+    Returns the default on/off state for every toolbar action.
+    """
+    toggled = {}
+    for action_list in (
+        globals_.FileActions,
+        globals_.EditActions,
+        globals_.ViewActions,
+        globals_.SettingsActions,
+        globals_.HelpActions,
+    ):
+        for name, activated, key in action_list:
+            toggled[key] = activated
+
+    return toggled
+
+
+def NormalizeToolbarToggles(toggled):
+    """
+    Converts toolbar settings to plain Python strings and fills in missing keys.
+    """
+    defaults = GetDefaultToolbarToggles()
+
+    if toggled in (None, 'None', 'none', '', 0):
+        return defaults
+
+    normalized = {str(key): toggled[key] for key in toggled}
+
+    for key, value in defaults.items():
+        normalized.setdefault(key, value)
+
+    return normalized
 
 
 class PreferencesDialog(QtWidgets.QDialog):
@@ -1633,11 +1474,9 @@ class PreferencesDialog(QtWidgets.QDialog):
         self.infoLabel = QtWidgets.QLabel()
         self.generalTab = self.getGeneralTab()
         self.toolbarTab = self.getToolbarTab()
-        self.interfaceTab = self.getInterfaceTab()
         self.themesTab = self.getThemesTab(QtWidgets.QWidget)()
         self.tabWidget.addTab(self.generalTab, globals_.trans.string('PrefsDlg', 1))
         self.tabWidget.addTab(self.toolbarTab, globals_.trans.string('PrefsDlg', 2))
-        self.tabWidget.addTab(self.interfaceTab, globals_.trans.string('PrefsDlg', 42))
         self.tabWidget.addTab(self.themesTab, globals_.trans.string('PrefsDlg', 3))
 
         # Create the buttonbox
@@ -1794,17 +1633,7 @@ class PreferencesDialog(QtWidgets.QDialog):
                 QtWidgets.QWidget.__init__(self)
 
                 # Determine which keys are activated
-                if setting('ToolbarActs') in (None, 'None', 'none', '', 0):
-                    # Get the default settings
-                    toggled = {}
-                    for List in (globals_.FileActions, globals_.EditActions, globals_.ViewActions, globals_.SettingsActions, globals_.HelpActions):
-                        for name, activated, key in List:
-                            toggled[key] = activated
-                else:
-                    # Get the settings from the .ini
-                    toggled = setting('ToolbarActs')
-                    # Replace the QString keys with python string keys
-                    toggled = {str(key): toggled[key] for key in toggled}
+                toggled = NormalizeToolbarToggles(setting('ToolbarActs'))
 
                 # Create some data
                 self.FileBoxes = []
@@ -1882,168 +1711,6 @@ class PreferencesDialog(QtWidgets.QDialog):
                         box.setChecked(default[1])
 
         return ToolbarTab()
-
-    def getInterfaceTab(self):
-        """
-        Returns the Interface Tab
-        """
-
-        class InterfaceTab(QtWidgets.QWidget):
-            """
-            Interface Tab
-            """
-            info = 'Configure interface and window behavior settings.'  # TODO: Add to translations
-
-            def __init__(self):
-                """
-                Initializes the Interface Tab
-                """
-                QtWidgets.QWidget.__init__(self)
-
-                # Create toolbar docking mode radio buttons
-                self.toolbarDockingLabel = QtWidgets.QLabel('<b>Toolbar Layout:</b>')
-                
-                self.toolbarCombinedRadio = QtWidgets.QRadioButton('1-Line Combined Bar')
-                self.toolbarCombinedRadio.setToolTip('Combine menu and toolbar into a single line (Windows only)')
-                
-                self.toolbarSeparateRadio = QtWidgets.QRadioButton('2-Line Menu and Toolbar')
-                self.toolbarSeparateRadio.setToolTip('Separate menu bar and toolbar on two lines (recommended for Mac/Linux)')
-
-                # Create a button group for the radio buttons
-                self.toolbarDockingGroup = QtWidgets.QButtonGroup()
-                self.toolbarDockingGroup.addButton(self.toolbarCombinedRadio, 0)
-                self.toolbarDockingGroup.addButton(self.toolbarSeparateRadio, 1)
-
-                # UI Scaling section
-                self.scalingLabel = QtWidgets.QLabel('<b>UI Scaling:</b>')
-                
-                # Use grid layout for aligned columns
-                scalingGrid = QtWidgets.QGridLayout()
-                scalingGrid.setColumnStretch(1, 1)  # Slider column stretches
-                
-                # Widget Scale slider (row 0)
-                scalingGrid.addWidget(QtWidgets.QLabel('Widget Scale:'), 0, 0)
-                self.uiScaleSlider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-                self.uiScaleSlider.setMinimum(50)
-                self.uiScaleSlider.setMaximum(300)
-                self.uiScaleSlider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
-                self.uiScaleSlider.setTickInterval(25)
-                self.uiScaleSlider.valueChanged.connect(self.onUIScaleChanged)
-                scalingGrid.addWidget(self.uiScaleSlider, 0, 1)
-                self.uiScaleLabel = QtWidgets.QLabel('100%')
-                self.uiScaleLabel.setMinimumWidth(50)
-                scalingGrid.addWidget(self.uiScaleLabel, 0, 2)
-                
-                # Font Scale slider (row 1)
-                scalingGrid.addWidget(QtWidgets.QLabel('Font Scale:'), 1, 0)
-                self.fontScaleSlider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-                self.fontScaleSlider.setMinimum(50)
-                self.fontScaleSlider.setMaximum(300)
-                self.fontScaleSlider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
-                self.fontScaleSlider.setTickInterval(25)
-                self.fontScaleSlider.valueChanged.connect(self.onFontScaleChanged)
-                scalingGrid.addWidget(self.fontScaleSlider, 1, 1)
-                self.fontScaleLabel = QtWidgets.QLabel('100%')
-                self.fontScaleLabel.setMinimumWidth(50)
-                scalingGrid.addWidget(self.fontScaleLabel, 1, 2)
-                
-                # Working indicator (row 2)
-                self.scalingWorkingLabel = QtWidgets.QLabel('')
-                scalingGrid.addWidget(self.scalingWorkingLabel, 2, 0, 1, 3)  # Span all columns
-
-                # Create the main layout
-                L = QtWidgets.QVBoxLayout()
-                L.addWidget(self.toolbarDockingLabel)
-                L.addWidget(self.toolbarCombinedRadio)
-                L.addWidget(self.toolbarSeparateRadio)
-                L.addSpacing(20)
-                L.addWidget(self.scalingLabel)
-                L.addLayout(scalingGrid)
-                L.addStretch(1)
-                self.setLayout(L)
-
-                # Set the current values
-                self.Reset()
-                
-                # Debounce timer for smooth slider updates (same as ScalingDialog)
-                self.scaling_timer = QtCore.QTimer(self)
-                self.scaling_timer.setSingleShot(True)
-                self.scaling_timer.timeout.connect(self.applyLivePreview)
-                self.debounce_delay = 700  # ms
-                
-                # Update slider states based on theme
-                self.updateSliderStates()
-
-            def onUIScaleChanged(self, value):
-                """Handle UI scale slider change"""
-                # Update label immediately for responsive feedback
-                self.uiScaleLabel.setText(f"{value}%")
-                # Show working indicator and restart debounce timer
-                self.scalingWorkingLabel.setText("⏳ Applying scaling...")
-                self.scaling_timer.stop()
-                self.scaling_timer.start(self.debounce_delay)
-                
-            def onFontScaleChanged(self, value):
-                """Handle font scale slider change"""
-                # Update label immediately for responsive feedback
-                self.fontScaleLabel.setText(f"{value}%")
-                # Show working indicator and restart debounce timer
-                self.scalingWorkingLabel.setText("⏳ Applying scaling...")
-                self.scaling_timer.stop()
-                self.scaling_timer.start(self.debounce_delay)
-            
-            def applyLivePreview(self):
-                """Apply scaling preview (debounced)"""
-                ui_scale = self.uiScaleSlider.value() / 100.0
-                font_scale = self.fontScaleSlider.value() / 100.0
-                globals_.scalingManager.setUIScale(ui_scale)
-                globals_.scalingManager.setFontScale(font_scale)
-                globals_.scalingManager.applyScaling()
-                # Clear working indicator
-                self.scalingWorkingLabel.setText("")
-            
-            def updateSliderStates(self):
-                """Update slider states - widget scaling now works for all themes"""
-                # Widget scaling is now enabled for all themes
-                # Classic theme uses minimal QSS (icons only)
-                # Styled themes use full QSS (padding, margins, etc.)
-                pass  # No need to disable anything
-
-            def Reset(self):
-                """
-                Read the preferences and set the radio buttons and sliders
-                """
-                # Get the current toolbar docking setting
-                # Default to combined (False) on Windows, separate (True) on other platforms
-                import sys
-                default_separate = sys.platform != 'win32'
-                toolbar_separate = setting('ToolbarSeparate')
-                if toolbar_separate is None:
-                    toolbar_separate = default_separate
-                
-                if toolbar_separate:
-                    self.toolbarSeparateRadio.setChecked(True)
-                else:
-                    self.toolbarCombinedRadio.setChecked(True)
-                
-                # Load UI scaling settings
-                ui_scale = setting('UIScale', 1.0)
-                font_scale = setting('FontScale', 1.0)
-                
-                # Block signals to prevent triggering applyScaling during initialization
-                self.uiScaleSlider.blockSignals(True)
-                self.fontScaleSlider.blockSignals(True)
-                
-                self.uiScaleSlider.setValue(int(ui_scale * 100))
-                self.fontScaleSlider.setValue(int(font_scale * 100))
-                
-                self.uiScaleLabel.setText(f"{int(ui_scale * 100)}%")
-                self.fontScaleLabel.setText(f"{int(font_scale * 100)}%")
-                
-                self.uiScaleSlider.blockSignals(False)
-                self.fontScaleSlider.blockSignals(False)
-
-        return InterfaceTab()
 
     @staticmethod
     def getThemesTab(parent):
@@ -2166,11 +1833,11 @@ class PreferencesDialog(QtWidgets.QDialog):
                 globals_.RealViewEnabled = False  # Disable so the zone looks 'plain'
 
                 # Sprite [38] at (11, 4)
-                sprite = globals_.mainWindow.CreateSprite(11 * 16, 4 * 16, 38, data = RawData.from_sprite_id(38), add_to_scene=False)
+                sprite = globals_.mainWindow.CreateSprite(11 * 16, 4 * 16, 38, data=bytes(8), add_to_scene=False)
                 scene.addItem(sprite)
 
                 # Sprite [53] at (1, 6)
-                sprite = globals_.mainWindow.CreateSprite(1 * 16, 6 * 16, 53, data = RawData.from_sprite_id(53), add_to_scene=False)
+                sprite = globals_.mainWindow.CreateSprite(1 * 16, 6 * 16, 53, data=bytes(8), add_to_scene=False)
                 scene.addItem(sprite)
 
                 # Entrance [0] at (13, 8)
@@ -2216,4 +1883,3 @@ class PreferencesDialog(QtWidgets.QDialog):
                 return px
 
         return ThemesTab
-

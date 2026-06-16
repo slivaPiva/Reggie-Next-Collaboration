@@ -1025,6 +1025,8 @@ class SpriteImage_LongSpikedStake(SLib.SpriteImage):  # 398, 400
             paint.drawTiledPixmap(0, 0, tilesize * tiles, width, mid)
             paint.drawPixmap(1980, 0, end)
 
+        paint.end()
+        del paint
         self.aux[1].image = pix
         self.aux[1].alpha = 0.9
 
@@ -1080,7 +1082,8 @@ class SpriteImage_MassiveSpikedStake(SLib.SpriteImage):  # 401, 404
             paint.drawTiledPixmap(0, 0, width, tilesize * tiles, mid)
             paint.drawPixmap(0, 2880, end)
 
-        paint = None
+        paint.end()
+        del paint
         self.aux[2].image = pix
         self.aux[2].alpha = 0.9
 
@@ -1274,7 +1277,7 @@ class SpriteImage_Spiny(SLib.SpriteImage_StaticMultiple):  # 25
         orient = self.parent.spritedata[5] & 15
         if orient == 1:
             self.image = ImageCache['SpinyBall']
-            self.yOffset = -2
+            self.yOffset = 8
         elif orient == 2:
             self.image = ImageCache['SpinyShell']
             self.yOffset = 1
@@ -1659,6 +1662,8 @@ class SpriteImage_UnusedRotPlatforms(SLib.SpriteImage):  # 52
         paint = QtGui.QPainter(img)
         paint.setOpacity(0.8)
         paint.drawPixmap(0, 0, platform)
+        paint.end()
+        del paint
         ImageCache['UnusedRotPlatform'] = img
 
 
@@ -3145,7 +3150,7 @@ class SpriteImage_4Spinner(SLib.SpriteImage_Static):  # 129
             parent,
             1.5,
             ImageCache['4Spinner'],
-            (-62, -48),
+            (-65.33, -48),
         )
 
     @staticmethod
@@ -3497,6 +3502,7 @@ class SpriteImage_Coin(SLib.SpriteImage_StaticMultiple):  # 147
         paint.drawPixmap(0, 0, SLib.GetImg('iceblock00.png'))
         paint.setOpacity(0.6)
         paint.drawPixmap(0, 0, ImageCache['Coin'])
+        paint.end()
         del paint
         ImageCache['CoinF'] = pix
 
@@ -3610,6 +3616,7 @@ class SpriteImage_BigBrick(SLib.SpriteImage_StaticMultiple):  # 157
             paint = QtGui.QPainter(pix)
             paint.drawPixmap(0, 0, ImageCache['BlockContents'][9])
             paint.drawPixmap(24, 0, ImageCache['BlockContents'][3])
+            paint.end()
             del paint
             ImageCache['YoshiFire'] = pix
 
@@ -3632,6 +3639,7 @@ class SpriteImage_BigBrick(SLib.SpriteImage_StaticMultiple):  # 157
             new = QtGui.QPixmap(ImageCache['BigBrick'])
             paint = QtGui.QPainter(new)
             paint.drawPixmap(x, y, overlay)
+            paint.end()
             del paint
             ImageCache['BigBrick%d' % power] = new
 
@@ -3822,6 +3830,7 @@ class SpriteImage_OneWayGate(SLib.SpriteImage_StaticMultiple):  # 174
                 p = QtGui.QPainter(dest)
                 p.rotate(rotValue)
                 p.drawPixmap(xpos, ypos, newgate)
+                p.end()
                 del p
 
                 ImageCache['1WayGate%d%d' % (flip, direction)] = dest
@@ -4284,6 +4293,7 @@ class SpriteImage_Clam(SLib.SpriteImage_StaticMultiple):  # 197
             painter = QtGui.QPainter(newPix)
             painter.setOpacity(0.6)
             painter.drawPixmap(x, y, overlayImage)
+            painter.end()
             del painter
             ImageCache['Clam' + clamName] = newPix
 
@@ -4293,6 +4303,7 @@ class SpriteImage_Clam(SLib.SpriteImage_StaticMultiple):  # 197
         painter.setOpacity(0.6)
         painter.drawPixmap(28, 42, ImageCache['Coin'])
         painter.drawPixmap(52, 42, ImageCache['Coin'])
+        painter.end()
         del painter
         ImageCache['Clam2Coin'] = newPix
 
@@ -5022,6 +5033,8 @@ class SpriteImage_PoltergeistItem(SLib.SpriteImage):  # 262
         standpainter.drawPixmap(18, 18, ImageCache['GhostHouseStand'])
         blockpainter.drawPixmap(18, 18, ImageCache['Blocks'][0])
 
+        standpainter.end()
+        blockpainter.end()
         del standpainter
         del blockpainter
 
@@ -5291,23 +5304,23 @@ class SpriteImage_GhostDoor(SpriteImage_Door):  # 276
     def __init__(self, parent):
         super().__init__(parent, 1.5)
         self.doorName = 'GhostDoor'
-        self.doorDimensions = (0, 0, 32, 48)
+        self.doorDimensions = (0, 0, 34, 48)
 
 
 class SpriteImage_TowerDoor(SpriteImage_Door):  # 277
     def __init__(self, parent):
         super().__init__(parent, 1.5)
         self.doorName = 'TowerDoor'
-        self.doorDimensions = (-2, -13, 53, 61)
-        self.entranceOffset = (15, 68)
+        self.doorDimensions = (-2, -12, 53, 61)
+        self.entranceOffset = (15, 66)
 
 
 class SpriteImage_CastleDoor(SpriteImage_Door):  # 278
     def __init__(self, parent):
         super().__init__(parent, 1.5)
         self.doorName = 'CastleDoor'
-        self.doorDimensions = (-2, -13, 53, 61)
-        self.entranceOffset = (15, 68)
+        self.doorDimensions = (-2, -12, 53, 61)
+        self.entranceOffset = (15, 66)
 
 
 class SpriteImage_GiantIceBlock(SLib.SpriteImage_StaticMultiple):  # 280
@@ -6129,7 +6142,8 @@ class SpriteImage_BooCircle(SLib.SpriteImage):  # 323
                 paint.drawPixmap(int(x + 512), int(y + 512), boo)
 
         # Finish it
-        paint = None
+        paint.end()
+        del paint
         self.aux[0].image = pix
 
 

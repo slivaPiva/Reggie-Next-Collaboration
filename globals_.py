@@ -18,7 +18,6 @@ DrawEntIndicators = False
 EditActions = None
 EnablePadding = False
 EntranceTypeNames = None
-EntranceImages = None
 EntrancesFrozen = False
 ErrMsg = ''
 FileActions = None
@@ -57,14 +56,13 @@ OVERRIDE_UNKNOWN = 0
 PaddingLength = 0
 PathsFrozen = False
 PathsShown = True
+PipeLinksShown = True
+EventLinksShown = False
 PlaceObjectsAtFullSize = True
 RealViewEnabled = False
 ReggieID = 'Reggie! Next Level Editor by Treeki, Tempus and RoadrunnerWMC'
 ReggieVersionFloat = 4.9
-# Version format: v[Major].[Minor].[Patch]-[MinorPatch]-[CommitID]
-# MinorPatch increments with each commit for proper sorting
-# Version is determined dynamically from git tags at runtime
-ReggieVersionShort = 'v4.9.1-22'  # Fallback if git is not available (update manually with each release)
+ReggieVersionShort = 'v4.9.0'
 ResetDataWhenHiding = False
 RestoredFromAutoSave = False
 SettingsActions = None
@@ -82,12 +80,18 @@ TilesetNames = None
 TilesetsAnimating = False
 ViewActions = None
 ZoneThemeValues = None
+CollabNickname = 'Player'
+CollabHighlightColor = '#ffff00'
+
+# Collaboration tileset overrides:
+# name -> absolute filepath to a host-provided .arc (uncompressed U8)
+CollabTilesetOverrides = {}
+CollabSuppressMissingTilesetWarnings = False
 
 app = None
 firstLoad = True
 gamedef = None
 mainWindow = None
-scalingManager = None
 settings = None
 theme = None
 trans = None

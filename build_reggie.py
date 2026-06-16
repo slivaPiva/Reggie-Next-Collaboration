@@ -20,8 +20,10 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 import json
+import glob
 import os, os.path
 import shutil
+import subprocess
 import sys
 
 import PyInstaller.__main__
@@ -38,14 +40,14 @@ import PyInstaller.__main__
 
 PROJECT_NAME = 'Reggie! Next'
 FULL_PROJECT_NAME = 'Reggie! Next Level Editor'
-PROJECT_VERSION = '4.9.1'
+PROJECT_VERSION = '4.9.0'
 
 WIN_ICON = os.path.join('reggiedata', 'win_icon.ico')
 MAC_ICON = os.path.join('reggiedata', 'reggie.icns')
 MAC_BUNDLE_IDENTIFIER = 'ca.chronometry.reggie'
 
 SCRIPT_FILE = 'reggie.py'
-DATA_FOLDERS = ['reggiedata', 'reggieextras', 'assets']
+DATA_FOLDERS = ['reggiedata', 'reggieextras']
 DATA_FILES = ['readme.md', 'license.txt']
 
 # macOS only
@@ -60,6 +62,9 @@ FINAL_APP_BUNDLE_NAME = FULL_PROJECT_NAME + '.app'
 DIR = os.path.join('distrib', 'reggie_next_v%s_win32' % PROJECT_VERSION)
 WORKPATH = 'build_temp'
 SPECFILE = SCRIPT_FILE[:-3] + '.spec'
+PUZZLE_BUILD_SCRIPT = os.path.join('Puzzle-Next-master', 'build_puzzle.py')
+PUZZLE_DIST_GLOB = os.path.join('Puzzle-Next-master', 'build', 'puzzle_next_v*_win32')
+PUZZLE_BUNDLE_DIR = 'Puzzle-Next'
 
 def print_emphasis(s):
     print('>>')
@@ -74,7 +79,7 @@ print('>> Destination directory: ' + DIR)
 
 if os.path.isdir(DIR): shutil.rmtree(DIR)
 if os.path.isdir(WORKPATH): shutil.rmtree(WORKPATH)
-if os.path.isdir(SPECFILE): os.remove(SPECFILE)
+if os.path.isfile(SPECFILE): os.remove(SPECFILE)
 
 def run_pyinstaller(args):
     print('>>')
@@ -88,6 +93,45 @@ def run_pyinstaller(args):
     print('>>')
 
     PyInstaller.__main__.run(args)
+
+
+def run_nested_python_script(script_path):
+    cmd = [sys.executable]
+    if sys.flags.optimize >= 2:
+        cmd.append('-OO')
+    elif sys.flags.optimize >= 1:
+        cmd.append('-O')
+    cmd.append(os.path.abspath(script_path))
+
+    print('>>')
+    print('>> Running nested build script: ' + ' '.join('"%s"' % c if ' ' in c else c for c in cmd))
+    print('>>')
+
+    subprocess.run(cmd, check=True, cwd=os.path.dirname(os.path.abspath(script_path)))
+
+
+def build_and_bundle_puzzle():
+    script_path = os.path.abspath(PUZZLE_BUILD_SCRIPT)
+    if not os.path.isfile(script_path):
+        print_emphasis('>> WARNING: Puzzle build script was not found, skipping bundled Puzzle build.')
+        return
+
+    print('>> Building bundled Puzzle...')
+    run_nested_python_script(script_path)
+
+    matches = sorted(
+        glob.glob(os.path.abspath(PUZZLE_DIST_GLOB)),
+        key=lambda p: os.path.getmtime(p),
+        reverse=True,
+    )
+    if not matches:
+        raise RuntimeError('Puzzle build finished, but no output directory matching %s was found.' % PUZZLE_DIST_GLOB)
+
+    puzzle_src = matches[0]
+    puzzle_dest = os.path.join(DIR, PUZZLE_BUNDLE_DIR)
+    if os.path.isdir(puzzle_dest):
+        shutil.rmtree(puzzle_dest)
+    shutil.copytree(puzzle_src, puzzle_dest)
 
 
 ########################################################################
@@ -141,7 +185,7 @@ print('>>')
 
 # Excludes
 excludes = ['doctest', 'pdb', 'unittest', 'difflib',
-            'os2emxpath', 'optpath', 'multiprocessing',
+            'os2emxpath', 'optpath', 'multiprocessing', 'ssl',
             'PyQt6.QtWebKit', 'PyQt6.QtNetwork']
 
 if sys.platform == 'nt':
@@ -151,22 +195,23 @@ if sys.platform == 'nt':
 
 unneededQtModules = ['Designer', 'Network', 'OpenGL', 'Qml', 'Script', 'Sql', 'Test', 'WebKit', 'Xml']
 neededQtModules = ['Core', 'Gui', 'Widgets']
+unusedQtBindings = ['PySide2', 'PyQt5']
 
-targetQt = 'PyQt' + str(5 if sys.version_info.major < 3 else 6)
+targetQt = 'PyQt6'
 print('>> Targeting ' + targetQt)
 
-for qt in ['PySide2', 'PyQt5', 'PyQt6']:
-    # Exclude all the stuff we don't use
+# Exclude unused modules from the Qt6 build we are targeting.
+for m in unneededQtModules:
+    excludes.append(targetQt + '.Qt' + m)
+
+# Exclude legacy Qt bindings entirely so PyInstaller does not bundle them.
+for qt in unusedQtBindings:
+    excludes.append(qt)
+
+    for m in neededQtModules:
+        excludes.append(qt + '.Qt' + m)
     for m in unneededQtModules:
         excludes.append(qt + '.Qt' + m)
-
-    if qt != targetQt:
-        # Since we're not using this copy of Qt, exclude it
-        excludes.append(qt)
-
-        # As well as its QtCore/QtGui/etc
-        for m in neededQtModules:
-            excludes.append(qt + '.Qt' + m)
 
 # Includes
 includes = ['pkgutil']
@@ -334,17 +379,7 @@ else:
 for f in DATA_FOLDERS:
     if os.path.isdir(os.path.join(dest_folder, f)):
         shutil.rmtree(os.path.join(dest_folder, f))
-    
-    # For assets folder, exclude mods and snapshots subfolders
-    if f == 'assets':
-        def ignore_large_folders(dir, files):
-            # Ignore mods and snapshots folders to keep build size down
-            if os.path.basename(dir) in ['mods', 'snapshots']:
-                return files  # Ignore all files in these folders
-            return []
-        shutil.copytree(f, os.path.join(dest_folder, f), ignore=ignore_large_folders)
-    else:
-        shutil.copytree(f, os.path.join(dest_folder, f))
+    shutil.copytree(f, os.path.join(dest_folder, f))
 
 for f in DATA_FILES:
     shutil.copy(f, dest_folder)
@@ -369,6 +404,8 @@ if sys.platform == 'darwin':
 # the app name shown in Finder
 if sys.platform == 'darwin':
     os.rename(os.path.join(DIR, AUTO_APP_BUNDLE_NAME), os.path.join(DIR, FINAL_APP_BUNDLE_NAME))
+
+build_and_bundle_puzzle()
 
 
 ########################################################################
