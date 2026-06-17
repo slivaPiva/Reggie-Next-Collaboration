@@ -1007,7 +1007,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._GetBackupsDir()
         self.collabManager = CollaborationManager(self)
         self.collabManager.set_room_info_provider(self._BuildCollabRoomInfo)
-        self.collabManager.set_peer_intro_validator(self._ValidateCollabPeerIntro)
+#       self.collabManager.set_peer_intro_validator(self._ValidateCollabPeerIntro)
         self.collabManager.statusChanged.connect(self.HandleCollaborationStatus)
         self.collabManager.snapshotReceived.connect(self.HandleRemoteSnapshot)
         self.collabManager.messageReceived.connect(self.HandleRemoteMessage)
@@ -4978,11 +4978,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if peer_game_id != host_game_id:
             return 'Connection rejected. Host game: %s.' % str(host_info.get('game_name') or 'Unknown game')
 
-        if bool(host_info.get('game_is_custom')):
-            host_hash = str(host_info.get('game_plugin_hash') or '')
-            peer_hash = str(payload.get('game_plugin_hash') or '')
-            if (not host_hash) or (peer_hash != host_hash):
-                return 'Connection rejected. Plugin checksum mismatch for game "%s".' % str(host_info.get('game_name') or 'Unknown game')
+#       if bool(host_info.get('game_is_custom')):
+#           host_hash = str(host_info.get('game_plugin_hash') or '')
+#           peer_hash = str(payload.get('game_plugin_hash') or '')
+#           if (not host_hash) or (peer_hash != host_hash):
+#               return 'Connection rejected. Plugin checksum mismatch for game "%s".' % str(host_info.get('game_name') or 'Unknown game')
 
         return None
 
@@ -5059,15 +5059,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
             )
             return False
 
-        #if host_is_custom:
-            #local_hash = str(local_info.get('game_plugin_hash') or '')
-            #if (not host_plugin_hash) or (local_hash != host_plugin_hash):
-                #QtWidgets.QMessageBox.warning(
-                    #self,
-                    #'Collaboration',
-                    #'Plugin checksum mismatch.\nHost game: %s' % host_game_name,
-                #)
-                #return False
+#       if host_is_custom:
+#           local_hash = str(local_info.get('game_plugin_hash') or '')
+#           if (not host_plugin_hash) or (local_hash != host_plugin_hash):
+#               QtWidgets.QMessageBox.warning(
+#                   self,
+#                   'Collaboration',
+#                   'Plugin checksum mismatch.\nHost game: %s' % host_game_name,
+#               )
+#               return False
 
         return True
 
