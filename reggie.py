@@ -962,6 +962,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.CurrentSelection = []
         self._pipeEntranceLinkItems = []
         self._pipeEntranceLinkSource = None
+        self._pipeEntranceLinkRefreshPending = False
 
         # set up the window
         QtWidgets.QMainWindow.__init__(self, None)
@@ -12897,6 +12898,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.view.setUpdatesEnabled(True)
             self.view.viewport().update()
             self.scene.update()
+            if getattr(globals_, 'PipeLinksShown', True):
+                self._SchedulePipeEntranceLinkRefresh(0)
             self._PumpUiDuringAreaLoad('')
 
     def CaptureTransientUiState(self):
@@ -14082,6 +14085,53 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         self.UpdateFlag = False
 
+    def _SchedulePipeEntranceLinkRefresh(self, delay=0):
+        if getattr(self, '_pipeEntranceLinkRefreshPending', False):
+            return
+
+        self._pipeEntranceLinkRefreshPending = True
+
+        def refresh():
+            self._pipeEntranceLinkRefreshPending = False
+            try:
+                self.UpdatePipeEntranceLinks()
+            except TypeError as exc:
+                err = str(exc)
+                if ('QPen' in err) and ('NoneType' in err):
+                    QtCore.QTimer.singleShot(50, lambda: self._SchedulePipeEntranceLinkRefresh(0))
+                    return
+                raise
+            except Exception:
+                pass
+
+        QtCore.QTimer.singleShot(delay, refresh)
+
+    def _CreateFallbackPipeEntranceLinkItem(self, ent, dest, is_pipe_link):
+        try:
+            start_rect = ent.sceneBoundingRect()
+            end_rect = dest.sceneBoundingRect()
+            start = start_rect.center()
+            end = end_rect.center()
+        except Exception:
+            start = QtCore.QPointF(float(getattr(ent, 'objx', 0)), float(getattr(ent, 'objy', 0)))
+            end = QtCore.QPointF(float(getattr(dest, 'objx', 0)), float(getattr(dest, 'objy', 0)))
+
+        line = QtWidgets.QGraphicsLineItem(QtCore.QLineF(start, end))
+        color = QtGui.QColor(0, 200, 255, 220) if is_pipe_link else QtGui.QColor(255, 170, 0, 220)
+        pen = QtGui.QPen(
+            color,
+            3,
+            QtCore.Qt.PenStyle.SolidLine,
+            QtCore.Qt.PenCapStyle.RoundCap,
+            QtCore.Qt.PenJoinStyle.RoundJoin,
+        )
+        line.setPen(pen)
+        try:
+            line.setZValue(-100000)
+        except Exception:
+            pass
+        return line
+
     def UpdatePipeEntranceLinks(self):
         try:
             items = getattr(self, '_pipeEntranceLinkItems', None)
@@ -14117,7 +14167,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if int(ent.destentrance) == 0:
                 continue
 
-            dest_area = int(ent.destarea)
+            # `Dest. area = 0` means "current area".
+            # So if area is not explicitly set, show the link inside the
+            # currently opened area.
+            dest_area = int(getattr(ent, 'destarea', 0) or 0)
             if dest_area == 0:
                 dest_area = current_area
             if dest_area != current_area:
@@ -14131,7 +14184,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if is_door_link and dest.enttype not in door_types:
                 continue
 
-            li = PipeEntranceLinkItem(ent, dest, ent.destentrance)
+            try:
+                li = PipeEntranceLinkItem(ent, dest, ent.destentrance)
+            except TypeError as exc:
+                err = str(exc)
+                if ('QPen' in err) and ('NoneType' in err):
+                    li = self._CreateFallbackPipeEntranceLinkItem(ent, dest, is_pipe_link)
+                else:
+                    raise
             self.scene.addItem(li)
             self._pipeEntranceLinkItems.append(li)
 
