@@ -1,9 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<plugins>
-  <!-- Connected Pipe Exit Direction -->
-  <plugin name="connected_pipe_exit" enabled="false" />
-  <!-- Custom Special Event Sprite ID -->
-  <plugin name="special_event_sprite" enabled="false">
-    <param name="sprite_name" value="Special Event" />
-  </plugin>
-</plugins>
