@@ -2,6 +2,11 @@ import globals_
 import base64
 import uuid
 import copy
+import inspect
+try:
+    from PyQt6 import QtCore
+except Exception:
+    QtCore = None
 
 class UndoStack:
     """
@@ -11,14 +16,113 @@ class UndoStack:
     def __init__(self):
         self.pastActions = []
         self.futureActions = []
+        self._macroDepth = 0
+        self._macroActions = []
+        self._macroSource = None
+        self._macroClearedFuture = False
+        self._qptMacroTimer = None
+        self._qptMacroDelayMs = 400
+
+    def _detectQuickPaintMacroSource(self):
+        try:
+            for f in inspect.stack():
+                fn = str(getattr(f, 'filename', '') or '').replace('\\', '/').lower()
+                func = str(getattr(f, 'function', '') or '')
+                if fn.endswith('/quickpaint/reggie_hook.py') and func == 'apply_fill':
+                    return 'qpt_fill'
+                if fn.endswith('/quickpaint/ui/reggie_integration.py') and func in {
+                    '_apply_deco_fill',
+                    '_clear_fill_area',
+                }:
+                    return 'qpt_fill'
+                if fn.endswith('/reggie.py') and func in {
+                    '_QuickPaintDeleteObject',
+                    '_QuickPaintEraseAtPosition',
+                }:
+                    return 'qpt_erase'
+        except Exception:
+            pass
+        return None
+
+    def _beginMacro(self, source=None):
+        self._macroDepth += 1
+        if self._macroDepth == 1:
+            self._macroActions = []
+            self._macroSource = str(source or '') or None
+            self._macroClearedFuture = False
+
+    def _endMacro(self):
+        if self._macroDepth <= 0:
+            return
+        self._macroDepth -= 1
+        if self._macroDepth > 0:
+            return
+
+        actions = list(self._macroActions or [])
+        self._macroActions = []
+        self._macroSource = None
+        self._macroClearedFuture = False
+
+        if not actions:
+            self.enableOrDisableMenuItems()
+            return
+
+        if len(actions) == 1:
+            grouped = actions[0]
+        else:
+            grouped = SimultaneousUndoAction(actions)
+
+        self.pastActions.append(grouped)
+        self.futureActions = []
+        self.enableOrDisableMenuItems()
+        self._collabHistoryAdded(grouped)
+
+    def _touchQuickPaintMacro(self):
+        if QtCore is None:
+            return
+        if self._qptMacroTimer is None:
+            try:
+                t = QtCore.QTimer()
+                t.setSingleShot(True)
+                t.timeout.connect(self._onQuickPaintMacroTimeout)
+                self._qptMacroTimer = t
+            except Exception:
+                self._qptMacroTimer = None
+                return
+        try:
+            self._qptMacroTimer.stop()
+            self._qptMacroTimer.start(int(self._qptMacroDelayMs))
+        except Exception:
+            pass
+
+    def _onQuickPaintMacroTimeout(self):
+        if self._macroDepth > 0 and self._macroSource in {'qpt_fill', 'qpt_erase'}:
+            self._endMacro()
+
+    def _maybeHandleQuickPaintMacroBoundary(self):
+        source = self._detectQuickPaintMacroSource()
+        if self._macroDepth > 0 and self._macroSource in {'qpt_fill', 'qpt_erase'} and source != self._macroSource:
+            self._endMacro()
+        if self._macroDepth == 0 and source in {'qpt_fill', 'qpt_erase'}:
+            self._beginMacro(source)
+        if self._macroDepth > 0 and self._macroSource in {'qpt_fill', 'qpt_erase'}:
+            self._touchQuickPaintMacro()
 
     def addAction(self, act):
         """
         Adds an action to the stack
         """
+        self._maybeHandleQuickPaintMacroBoundary()
+        if self._macroDepth > 0:
+            self._macroActions.append(act)
+            if not self._macroClearedFuture:
+                self.futureActions = []
+                self._macroClearedFuture = True
+            self.enableOrDisableMenuItems()
+            return
+
         self.pastActions.append(act)
         self.futureActions = []
-
         self.enableOrDisableMenuItems()
         self._collabHistoryAdded(act)
 
@@ -26,6 +130,18 @@ class UndoStack:
         """
         Adds an action to the stack, or extends the current one if applicable
         """
+        self._maybeHandleQuickPaintMacroBoundary()
+        if self._macroDepth > 0:
+            if self._macroActions and self._macroActions[-1].isExtentionOf(act):
+                self._macroActions[-1].extend(act)
+            else:
+                self._macroActions.append(act)
+            if not self._macroClearedFuture:
+                self.futureActions = []
+                self._macroClearedFuture = True
+            self.enableOrDisableMenuItems()
+            return
+
         if self.pastActions and self.pastActions[-1].isExtentionOf(act):
             self.pastActions[-1].extend(act)
             self.enableOrDisableMenuItems()
@@ -90,7 +206,8 @@ class UndoStack:
         """
         Enables or disables the menu items of mainWindow
         """
-        globals_.mainWindow.actions['undo'].setEnabled(bool(self.pastActions))
+        has_undo = bool(self.pastActions) or (self._macroDepth > 0 and bool(self._macroActions))
+        globals_.mainWindow.actions['undo'].setEnabled(has_undo)
         globals_.mainWindow.actions['redo'].setEnabled(bool(self.futureActions))
 
     def _collabHistoryAdded(self, act):

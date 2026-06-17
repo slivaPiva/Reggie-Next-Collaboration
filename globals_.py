@@ -92,6 +92,7 @@ app = None
 firstLoad = True
 gamedef = None
 mainWindow = None
+scalingManager = None
 settings = None
 theme = None
 trans = None

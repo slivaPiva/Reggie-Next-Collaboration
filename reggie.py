@@ -1146,6 +1146,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.creationTabs.addTab(self.qpt_palette, GetIcon('palette'), '')
                 self.creationTabs.setTabToolTip(self.creationTabs.count() - 1, 'Quick Paint')
                 QPT_INITIALIZED = True
+                try:
+                    self._InstallQuickPaintCollabSync()
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[QPT] Warning: Could not initialize Quick Paint Tool: {e}")
                 traceback.print_exc()
@@ -1586,6 +1590,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         )
 
         self.CreateAction(
+            'uiscaling', self.HandleUIScaling, None,
+            'UI Scaling...', 'Adjust UI and font scaling for better readability',
+            None,
+        )
+
+        self.CreateAction(
             'zoommax', self.HandleZoomMax, GetIcon('zoommax'),
             globals_.trans.stringOneLine('MenuItems', 62), globals_.trans.stringOneLine('MenuItems', 63),
             QtGui.QKeySequence('Ctrl+PgDown'),
@@ -1810,6 +1820,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         vmenu.addAction(self.actions['showeventlinks'])
         vmenu.addSeparator()
         vmenu.addAction(self.actions['grid'])
+        vmenu.addAction(self.actions['uiscaling'])
         vmenu.addSeparator()
         vmenu.addAction(self.actions['zoommax'])
         vmenu.addAction(self.actions['zoomin'])
@@ -3710,6 +3721,509 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.scene.update()
         except Exception:
             pass
+
+        self._RefreshQuickPaintTilesetState()
+
+    def _RefreshQuickPaintTilesetState(self, schedule_retry=True):
+        """
+        Refresh Quick Paint state after tileset changes without touching the
+        quickpaint package directly.
+        """
+        if not hasattr(self, 'qpt_palette') or self.qpt_palette is None:
+            return
+
+        try:
+            quick_paint_tab = self.qpt_palette.get_quick_paint_tab()
+        except Exception:
+            quick_paint_tab = None
+
+        if not quick_paint_tab:
+            return
+
+        try:
+            tileset_selector = getattr(quick_paint_tab, 'tileset_selector', None)
+            qpt_widget = getattr(quick_paint_tab, 'qpt_widget', None)
+            fill_paint_tab = None
+
+            try:
+                fill_paint_tab = self.qpt_palette.get_fill_paint_tab()
+            except Exception:
+                fill_paint_tab = None
+
+            self._RefreshQuickPaintTilesetSelector(tileset_selector)
+            if fill_paint_tab is not None:
+                self._RefreshQuickPaintTilesetSelector(getattr(fill_paint_tab, 'tileset_selector', None))
+
+            if qpt_widget is not None:
+                qpt_widget.initialize_with_current_tileset()
+        except Exception as e:
+            print(f"[QPT] Warning: Could not refresh QPT tilesets: {e}")
+
+        # Client tileset data can arrive slightly after the area metadata;
+        # retry once on the next event loop to catch late ObjectDefinitions.
+        if schedule_retry:
+            QtCore.QTimer.singleShot(200, self._RefreshQuickPaintTilesetStateDeferred)
+
+    def _RefreshQuickPaintTilesetStateDeferred(self):
+        if not hasattr(self, 'qpt_palette') or self.qpt_palette is None:
+            return
+
+        try:
+            quick_paint_tab = self.qpt_palette.get_quick_paint_tab()
+        except Exception:
+            quick_paint_tab = None
+
+        if not quick_paint_tab:
+            return
+
+        try:
+            tileset_selector = getattr(quick_paint_tab, 'tileset_selector', None)
+            fill_paint_tab = None
+            try:
+                fill_paint_tab = self.qpt_palette.get_fill_paint_tab()
+            except Exception:
+                fill_paint_tab = None
+
+            needs_retry = (
+                tileset_selector is not None and not getattr(tileset_selector, 'objects_loaded', False)
+            )
+            fill_selector = getattr(fill_paint_tab, 'tileset_selector', None) if fill_paint_tab is not None else None
+            needs_retry = needs_retry or (
+                fill_selector is not None and not getattr(fill_selector, 'objects_loaded', False)
+            )
+
+            if needs_retry:
+                self._RefreshQuickPaintTilesetState(schedule_retry=False)
+        except Exception:
+            pass
+
+    def _RefreshQuickPaintTilesetSelector(self, tileset_selector):
+        """Reload a Quick Paint tileset selector from current ObjectDefinitions."""
+        if tileset_selector is None:
+            return
+
+        try:
+            current_tileset = int(tileset_selector.tileset_combo.currentIndex())
+        except Exception:
+            current_tileset = int(getattr(tileset_selector, 'current_tileset', 0) or 0)
+
+        tileset_selector.objects_loaded = False
+        tileset_selector.tileset_objects.clear()
+        tileset_selector.load_objects_from_reggie()
+        tileset_selector.objects_loaded = bool(tileset_selector.tileset_objects)
+        tileset_selector.current_tileset = current_tileset
+
+        if hasattr(tileset_selector, 'tileset_combo'):
+            tileset_selector.tileset_combo.blockSignals(True)
+            tileset_selector.tileset_combo.setCurrentIndex(current_tileset)
+            tileset_selector.tileset_combo.blockSignals(False)
+
+        tileset_selector.update_object_list()
+
+    def _InstallQuickPaintCollabSync(self):
+        if getattr(self, '_qptCollabSyncInstalled', False):
+            return
+        if not hasattr(self, 'qpt_palette') or self.qpt_palette is None:
+            return
+
+        self._qptCollabSyncInstalled = True
+        self._qptCollabApplyingUiState = False
+        # Keep Quick Paint UI local to each participant. Only actual level edits
+        # are synchronized through collaboration/undo bridges.
+        self._InstallQuickPaintExternalBridge()
+
+    def _InstallQuickPaintExternalBridge(self):
+        if not hasattr(self, 'qpt_palette') or self.qpt_palette is None:
+            return
+        if getattr(self, '_qptExternalBridgeInstalled', False):
+            return
+
+        patched_any = False
+
+        try:
+            qpt_tab = self.qpt_palette.get_quick_paint_tab()
+        except Exception:
+            qpt_tab = None
+
+        if qpt_tab is not None and not getattr(qpt_tab, '_reggie_qpt_remove_patch', False):
+            try:
+                def _patched_remove_object(obj, *, _mw=self):
+                    return _mw._QuickPaintDeleteObject(obj)
+                qpt_tab._remove_object = _patched_remove_object
+                qpt_tab._reggie_qpt_remove_patch = True
+                patched_any = True
+            except Exception:
+                pass
+
+        hook = None
+        try:
+            getter = (_qpt_functions or {}).get('get_hook')
+            if callable(getter):
+                hook = getter()
+        except Exception:
+            hook = None
+
+        if hook is not None and not getattr(hook, '_reggie_qpt_erase_patch', False):
+            try:
+                def _patched_erase_at_position(x: int, y: int, layer: int, *, _mw=self):
+                    return _mw._QuickPaintEraseAtPosition(x, y, layer)
+                hook.erase_at_position = _patched_erase_at_position
+                hook._reggie_qpt_erase_patch = True
+                patched_any = True
+            except Exception:
+                pass
+
+        if patched_any:
+            self._qptExternalBridgeInstalled = True
+
+    def _QuickPaintDeleteObject(self, obj, update_overview=True):
+        if obj is None or globals_.Area is None:
+            return False
+
+        try:
+            from levelitems import ObjectItem
+            if not isinstance(obj, ObjectItem):
+                return False
+        except Exception:
+            return False
+
+        try:
+            self._CollabEnsureItemId(obj)
+        except Exception:
+            pass
+
+        if not self.UndoRedoInProgress and not self.collabApplyingRemote and not self.collabApplyingRemoteHistory and not getattr(self, 'collabSwitchingArea', False) and not globals_.DirtyOverride:
+            try:
+                from undo import CreateOrDeleteInstanceUndoAction
+                extra = {'z': obj.zValue()}
+                self.undoStack.addAction(CreateOrDeleteInstanceUndoAction('delete', obj.instanceDef(obj), collab_id=getattr(obj, '_collab_id', None), extra=extra))
+            except Exception:
+                pass
+
+        try:
+            obj.delete()
+        except Exception:
+            pass
+        try:
+            obj.setSelected(False)
+        except Exception:
+            pass
+        try:
+            self.scene.removeItem(obj)
+        except Exception:
+            pass
+        try:
+            SetDirty()
+        except Exception:
+            pass
+        if update_overview:
+            try:
+                self.levelOverview.update()
+            except Exception:
+                pass
+        return True
+
+    def _QuickPaintEraseAtPosition(self, x: int, y: int, layer: int):
+        if globals_.Area is None:
+            return
+
+        try:
+            layer = int(layer)
+            x = int(x)
+            y = int(y)
+        except Exception:
+            return
+
+        if layer < 0 or layer >= len(globals_.Area.layers):
+            return
+
+        try:
+            layer_obj = globals_.Area.layers[layer]
+        except Exception:
+            return
+
+        to_process = []
+        for obj in list(layer_obj):
+            try:
+                if obj.objx <= x < obj.objx + obj.width and obj.objy <= y < obj.objy + obj.height:
+                    to_process.append(obj)
+            except Exception:
+                continue
+
+        changed = False
+        for obj in to_process:
+            try:
+                obj_x = int(obj.objx)
+                obj_y = int(obj.objy)
+                obj_w = int(obj.width)
+                obj_h = int(obj.height)
+                obj_type = int(obj.type)
+                obj_tileset = int(obj.tileset)
+            except Exception:
+                continue
+
+            if not self._QuickPaintDeleteObject(obj, update_overview=False):
+                continue
+            changed = True
+
+            if obj_w == 1 and obj_h == 1:
+                continue
+
+            for dy in range(obj_h):
+                for dx in range(obj_w):
+                    tile_x = obj_x + dx
+                    tile_y = obj_y + dy
+                    if tile_x == x and tile_y == y:
+                        continue
+                    try:
+                        self.CreateObject(
+                            tileset=obj_tileset,
+                            object_num=obj_type,
+                            layer=layer,
+                            x=tile_x,
+                            y=tile_y,
+                            width=1,
+                            height=1,
+                        )
+                    except Exception:
+                        pass
+
+        if changed:
+            try:
+                self.levelOverview.update()
+            except Exception:
+                pass
+
+    def _BroadcastQuickPaintUiState(self, state: dict):
+        if self._qptCollabApplyingUiState:
+            return
+        if not hasattr(self, 'collabManager') or not self._CollabEnabled():
+            return
+        if globals_.Area is None:
+            return
+
+        payload = dict(state or {})
+        payload['area_num'] = int(getattr(globals_.Area, 'areanum', 0) or 0)
+        payload['level_name'] = self._CollabCurrentLevelName()
+        payload['ts'] = int(time.time() * 1000)
+
+        try:
+            self.collabManager.broadcast_message('qpt_ui', payload)
+        except Exception:
+            pass
+
+    def _NormalizeQuickPaintMode(self, mode):
+        try:
+            mode = str(mode or '')
+        except Exception:
+            mode = ''
+        if not mode:
+            return ''
+        m = mode.strip()
+        if ' (' in m:
+            try:
+                m = m.split(' (', 1)[0].strip()
+            except Exception:
+                pass
+        if m.lower() == 'singletile':
+            return 'Single Tile'
+        if m.lower() == 'shapecreator':
+            return 'Shape Creator'
+        return m
+
+    def _OnLocalQuickPaintModeChanged(self, mode: str):
+        mode = self._NormalizeQuickPaintMode(mode)
+        if not mode:
+            return
+        self._BroadcastQuickPaintUiState({'scope': 'qpt', 'mode': mode})
+
+    def _OnLocalQuickPaintTilesetChanged(self, tileset_idx: int):
+        try:
+            tileset_idx = int(tileset_idx)
+        except Exception:
+            return
+
+        mode = None
+        try:
+            qpt_tab = self.qpt_palette.get_quick_paint_tab()
+            mode = qpt_tab.qpt_widget.get_current_mode()
+        except Exception:
+            pass
+
+        msg = {'scope': 'qpt', 'tileset': tileset_idx}
+        mode_norm = self._NormalizeQuickPaintMode(mode)
+        if mode_norm:
+            msg['mode'] = mode_norm
+        self._BroadcastQuickPaintUiState(msg)
+
+    def _OnLocalQuickPaintObjectSelected(self, tileset: int, obj_type: int, obj_id: int):
+        try:
+            tileset = int(tileset)
+            obj_id = int(obj_id)
+        except Exception:
+            return
+
+        mode = None
+        try:
+            qpt_tab = self.qpt_palette.get_quick_paint_tab()
+            mode = qpt_tab.qpt_widget.get_current_mode()
+        except Exception:
+            pass
+
+        msg = {'scope': 'qpt', 'tileset': tileset, 'obj_id': obj_id}
+        mode_norm = self._NormalizeQuickPaintMode(mode)
+        if mode_norm:
+            msg['mode'] = mode_norm
+        self._BroadcastQuickPaintUiState(msg)
+
+    def _OnLocalFillPaintTilesetChanged(self, tileset_idx: int):
+        try:
+            tileset_idx = int(tileset_idx)
+        except Exception:
+            return
+        self._BroadcastQuickPaintUiState({'scope': 'fill', 'tileset': tileset_idx})
+
+    def _OnLocalFillPaintObjectSelected(self, tileset: int, obj_type: int, obj_id: int):
+        try:
+            tileset = int(tileset)
+            obj_id = int(obj_id)
+        except Exception:
+            return
+        self._BroadcastQuickPaintUiState({'scope': 'fill', 'tileset': tileset, 'obj_id': obj_id})
+
+    def _ApplyRemoteQuickPaintUiState(self, payload: dict, sender: str):
+        if not hasattr(self, 'qpt_palette') or self.qpt_palette is None:
+            return
+
+        scope = str((payload or {}).get('scope') or '')
+        if scope not in {'qpt', 'fill'}:
+            return
+
+        self._qptCollabApplyingUiState = True
+        try:
+            if scope == 'qpt':
+                try:
+                    qpt_tab = self.qpt_palette.get_quick_paint_tab()
+                except Exception:
+                    qpt_tab = None
+                if qpt_tab is None:
+                    return
+
+                mode = payload.get('mode')
+                mode = self._NormalizeQuickPaintMode(mode)
+                if mode and hasattr(qpt_tab, 'qpt_widget'):
+                    try:
+                        qpt_tab.qpt_widget.set_mode(str(mode))
+                    except Exception:
+                        pass
+
+                tileset_idx = payload.get('tileset')
+                if tileset_idx is not None and hasattr(qpt_tab, 'tileset_selector'):
+                    try:
+                        qpt_tab.tileset_selector.tileset_combo.setCurrentIndex(int(tileset_idx))
+                    except Exception:
+                        pass
+
+                obj_id = payload.get('obj_id')
+                if obj_id is not None and hasattr(qpt_tab, 'tileset_selector'):
+                    try:
+                        current_tileset = int(qpt_tab.tileset_selector.tileset_combo.currentIndex())
+                    except Exception:
+                        current_tileset = 0
+                    try:
+                        qpt_tab.tileset_selector.on_object_selected(current_tileset, 0, int(obj_id))
+                    except Exception:
+                        pass
+
+            elif scope == 'fill':
+                try:
+                    fill_tab = self.qpt_palette.get_fill_paint_tab()
+                except Exception:
+                    fill_tab = None
+                if fill_tab is None:
+                    return
+
+                tileset_idx = payload.get('tileset')
+                if tileset_idx is not None and hasattr(fill_tab, 'tileset_selector'):
+                    try:
+                        fill_tab.tileset_selector.tileset_combo.setCurrentIndex(int(tileset_idx))
+                    except Exception:
+                        pass
+
+                obj_id = payload.get('obj_id')
+                if obj_id is not None and hasattr(fill_tab, 'tileset_selector'):
+                    try:
+                        current_tileset = int(fill_tab.tileset_selector.tileset_combo.currentIndex())
+                    except Exception:
+                        current_tileset = 0
+                    try:
+                        fill_tab.tileset_selector.on_object_selected(current_tileset, 0, int(obj_id))
+                    except Exception:
+                        pass
+        finally:
+            self._qptCollabApplyingUiState = False
+
+    def _RestoreQuickPaintToolState(self):
+        """Restore the Quick Paint tool that is selected in the UI."""
+        try:
+            from quickpaint.core.tool_manager import get_tool_manager, ToolType
+            tool_manager = get_tool_manager()
+        except Exception:
+            return
+
+        if not hasattr(self, 'qpt_palette') or self.qpt_palette is None:
+            return
+
+        quick_paint_tab = None
+        fill_paint_tab = None
+        active_tab_index = 0
+
+        try:
+            quick_paint_tab = self.qpt_palette.get_quick_paint_tab()
+        except Exception:
+            pass
+        try:
+            fill_paint_tab = self.qpt_palette.get_fill_paint_tab()
+        except Exception:
+            pass
+        try:
+            active_tab_index = int(self.qpt_palette.tabs.currentIndex())
+        except Exception:
+            active_tab_index = 0
+
+        if active_tab_index == 1 and fill_paint_tab is not None:
+            active_deco = getattr(fill_paint_tab, '_active_deco_container', None)
+            if active_deco is not None and active_deco.is_selected():
+                try:
+                    fill_paint_tab._on_deco_container_selected(active_deco)
+                    return
+                except Exception:
+                    pass
+
+            fill_radio = getattr(fill_paint_tab, 'fill_radio', None)
+            if fill_radio is not None and fill_radio.isChecked():
+                try:
+                    fill_paint_tab._on_fill_radio_toggled(True)
+                    return
+                except Exception:
+                    pass
+
+        if active_tab_index == 2:
+            try:
+                tool_manager.activate_tool(ToolType.TILESET_OVERLAY)
+                return
+            except Exception:
+                pass
+
+        if quick_paint_tab is not None:
+            try:
+                current_mode = quick_paint_tab.qpt_widget.get_current_mode()
+                quick_paint_tab.on_mode_changed(current_mode)
+                return
+            except Exception:
+                pass
+
+        tool_manager.activate_tool(ToolType.QPT_SMART_PAINT)
 
     def _PackTilesetPayload(self, name, data, slots=None):
         if slots is None:
@@ -7861,6 +8375,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     self.TryApplyPendingRemoteSnapshot()
                 except Exception:
                     pass
+        elif msg_type == 'qpt_ui':
+            return
         elif msg_type == 'sel':
             self._ApplyRemoteSelection(payload, sender)
 
@@ -8522,6 +9038,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                             for layer in globals_.Area.layers:
                                 for obj in layer:
                                     obj.updateObjCache()
+                        except Exception:
+                            pass
+                        try:
+                            self._RefreshQuickPaintTilesetState()
                         except Exception:
                             pass
                 except Exception:
@@ -12161,6 +12681,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
         setSetting('GridType', globals_.GridType)
         self.scene.update()
 
+    def HandleUIScaling(self):
+        """
+        Handle opening the UI Scaling dialog
+        """
+        from ui_scaling import ScalingDialog
+
+        dlg = ScalingDialog(self)
+        dlg.exec()
+
     def HandleZoomIn(self, *, towardsCursor=False):
         """
         Handle zooming in
@@ -13121,9 +13650,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                         qpt_funcs['hide_overlay']()
                 else:
                     try:
-                        from quickpaint.core.tool_manager import get_tool_manager, ToolType
-                        tool_manager = get_tool_manager()
-                        tool_manager.activate_tool(ToolType.QPT_SMART_PAINT)
+                        self._RestoreQuickPaintToolState()
                     except Exception:
                         pass
 
@@ -14912,6 +15439,10 @@ def main():
     LoadTheme()
     LoadOverrides()
 
+    from ui_scaling import ScalingManager
+    globals_.scalingManager = ScalingManager()
+    globals_.scalingManager.loadSettings()
+
     # Initialise spritelib
     SLib.OutlineColor = globals_.theme.color('smi')
     SLib.main()
@@ -14928,6 +15459,7 @@ def main():
     LoadActionsLists()
     LoadNumberFont()
     SetAppStyle()
+    globals_.scalingManager.applyScaling()
 
     # Set the default window icon (used for random popups and stuff)
     globals_.app.setWindowIcon(GetIcon('reggie'))
