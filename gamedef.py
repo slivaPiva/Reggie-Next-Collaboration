@@ -15,6 +15,52 @@ import globals_
 import spritelib as SLib
 import sprites
 
+GAMEDEF_PATCH_ROOT = os.path.join('reggiedata', 'patches')
+GAMEDEF_ONLINE_PATCH_ROOT = os.path.join('reggiedata', 'patches_online')
+
+
+def _GetGameDefRootOrder(prefer_online=False, primary_root=None):
+    roots = []
+    if primary_root:
+        roots.append(primary_root)
+    if prefer_online:
+        roots.extend((GAMEDEF_ONLINE_PATCH_ROOT, GAMEDEF_PATCH_ROOT))
+    else:
+        roots.extend((GAMEDEF_PATCH_ROOT, GAMEDEF_ONLINE_PATCH_ROOT))
+
+    ordered = []
+    seen = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        ordered.append(root)
+    return ordered
+
+
+def ResolveGameDefDirectory(name, prefer_online=False, primary_root=None):
+    name = str(name or '').strip()
+    if not name:
+        return None
+
+    for root in _GetGameDefRootOrder(prefer_online=prefer_online, primary_root=primary_root):
+        folder = os.path.join(root, name)
+        if os.path.isfile(os.path.join(folder, 'main.xml')):
+            return folder
+    return None
+
+
+def ResolveGameDefXmlPath(name, prefer_online=False, primary_root=None):
+    folder = ResolveGameDefDirectory(name, prefer_online=prefer_online, primary_root=primary_root)
+    if folder is None:
+        return None, None
+    return os.path.join(folder, 'main.xml'), folder
+
+
+def ClearGameDefCache():
+    FindGameDef.cache_clear()
+
+
 class GameDefViewer(QtWidgets.QWidget):
     """
     Widget which displays basic info about the current game definition
@@ -211,10 +257,11 @@ class ReggieGameDefinition:
             self.path = path
             self.patch = patch
 
-    def __init__(self, name=None):
+    def __init__(self, name=None, prefer_online=False):
         """
         Initializes the ReggieGameDefinition
         """
+        self.prefer_online = bool(prefer_online)
         self.InitAsEmpty()
 
         # Try to init it from name if possible
@@ -236,7 +283,9 @@ class ReggieGameDefinition:
 
         self.custom = False
         self.base = None  # gamedef to use as a base
+        self.imported_defs = []
         self.gamepath = None
+        self.patch_root_path = GAMEDEF_PATCH_ROOT
         self.name = globals_.trans.string('Gamedefs', 13)  # 'New Super Mario Bros. Wii'
         self.description = globals_.trans.string('Gamedefs', 14)  # 'A new Mario adventure!<br>' and the date
         self.version = '2'
@@ -274,7 +323,10 @@ class ReggieGameDefinition:
         self.gamepath = name
 
         # Parse the file (errors are handled by __init__())
-        path = os.path.join("reggiedata", "patches", name, "main.xml")
+        path, folder = ResolveGameDefXmlPath(name, prefer_online=self.prefer_online)
+        if path is None:
+            raise FileNotFoundError('Game definition %r could not be found.' % name)
+        self.patch_root_path = os.path.dirname(folder)
         tree = etree.parse(path)
         root = tree.getroot()
 
@@ -297,18 +349,21 @@ class ReggieGameDefinition:
         if not self.custom:
             return
 
-        path = os.path.join("reggiedata", "patches", self.gamepath, "main.xml")
+        path, folder = ResolveGameDefXmlPath(self.gamepath, prefer_online=self.prefer_online, primary_root=self.patch_root_path)
+        if path is None:
+            raise FileNotFoundError('Game definition %r could not be found.' % self.gamepath)
         tree = etree.parse(path)
         root = tree.getroot()
 
         self.base = None
+        self.imported_defs = []
         if 'base' in root.attrib:
-            self.base = FindGameDef(root.attrib['base'], self.gamepath)
+            self.base = FindGameDef(root.attrib['base'], self.gamepath, prefer_online=self.prefer_online, primary_root=self.patch_root_path)
         else:
             self.base = ReggieGameDefinition()
 
         # Parse the nodes
-        addpath = os.path.join("reggiedata", "patches", self.gamepath)
+        addpath = folder
         for node in root:
             n = node.tag.lower()
             if n not in ('file', 'folder'):
@@ -322,8 +377,10 @@ class ReggieGameDefinition:
             elif game == globals_.trans.string('Gamedefs', 13):  # 'New Super Mario Bros. Wii'
                 path = os.path.join('reggiedata', node.get('path'))
             else:
-                def_ = FindGameDef(game, self.gamepath)
-                path = os.path.join('reggiedata', 'patches', def_.gamepath, node.get('path'))
+                def_ = FindGameDef(game, self.gamepath, prefer_online=self.prefer_online, primary_root=self.patch_root_path)
+                if def_ not in self.imported_defs:
+                    self.imported_defs.append(def_)
+                path = os.path.join(def_.patch_root_path, def_.gamepath, node.get('path'))
 
             dict_type = self.files if n == 'file' else self.folders  # self.files or self.folders
             dict_type[node.get('name')] = self.GameDefinitionFile(path, patch)
@@ -340,7 +397,7 @@ class ReggieGameDefinition:
             if filedata.find("PyQt5") != -1:
                 result = SpriteUpgradeDialog().exec()
                 if result == QtWidgets.QDialog.DialogCode.Accepted:
-                    UpgradeSpritesFile(self.files['sprites'].path, self.gamepath)
+                    UpgradeSpritesFile(self.files['sprites'].path, self.gamepath, self.patch_root_path)
 
                     # Reload the file since we just changed it
                     with open(self.files['sprites'].path, 'r', encoding='utf-8') as f:
@@ -570,17 +627,27 @@ class ReggieGameDefinition:
         return images
 
 
-def getAvailableGameDefs():
+def getAvailableGameDefs(include_online=False):
     game_defs = []
 
-    # Add them
-    folders = os.listdir(os.path.join('reggiedata', 'patches'))
-    for folder in folders:
-        if not os.path.isfile(os.path.join('reggiedata', 'patches', folder, 'main.xml')): continue
+    seen = set()
+    roots = [GAMEDEF_PATCH_ROOT]
+    if include_online:
+        roots.append(GAMEDEF_ONLINE_PATCH_ROOT)
 
-        def_ = ReggieGameDefinition(folder)
-        if def_.custom:
-            game_defs.append((def_.name, folder))
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for folder in os.listdir(root):
+            if folder in seen:
+                continue
+            if not os.path.isfile(os.path.join(root, folder, 'main.xml')):
+                continue
+
+            def_ = ReggieGameDefinition(folder, prefer_online=(root == GAMEDEF_ONLINE_PATCH_ROOT))
+            if def_.custom:
+                game_defs.append((def_.name, folder))
+                seen.add(folder)
 
     # Alphabetize them, and then add the default
     game_defs.sort()
@@ -588,7 +655,7 @@ def getAvailableGameDefs():
     return [None] + [folder for _, folder in game_defs]
 
 
-def loadNewGameDef(def_):
+def loadNewGameDef(def_, prefer_online=False):
     """
     Loads ReggieGameDefinition def_, and displays a progress dialog
     """
@@ -600,13 +667,13 @@ def loadNewGameDef(def_):
     dlg.show()
     dlg.setValue(0)
 
-    res = LoadGameDef(def_, dlg)
+    res = LoadGameDef(def_, dlg, prefer_online=prefer_online)
 
     dlg.setValue(100)
     return res
 
 # Game Definitions
-def LoadGameDef(name=None, dlg=None, prompt_for_stage_path=True):
+def LoadGameDef(name=None, dlg=None, prompt_for_stage_path=True, prefer_online=False):
     """
     Loads a game definition
     """
@@ -619,7 +686,7 @@ def LoadGameDef(name=None, dlg=None, prompt_for_stage_path=True):
         # Load the globals_.gamedef
         if dlg: dlg.setLabelText(globals_.trans.string('Gamedefs', 1))  # Loading game patch...
 
-        globals_.gamedef = ReggieGameDefinition(name)
+        globals_.gamedef = ReggieGameDefinition(name, prefer_online=prefer_online)
         globals_.gamedef.__init2__()
 
         if prompt_for_stage_path and globals_.gamedef.custom and (not globals_.settings.contains('StageGamePath_' + globals_.gamedef.name)):
@@ -782,27 +849,29 @@ def LoadGameDef(name=None, dlg=None, prompt_for_stage_path=True):
     return True
 
 @functools.lru_cache(maxsize=None)
-def FindGameDef(name, skip=None):
+def FindGameDef(name, skip=None, prefer_online=False, primary_root=None):
     """
     Helper function to find a game def with a specific name.
     Skip will be skipped
     """
-    patches_path = os.path.join('reggiedata', 'patches')
-
-    for folder in os.listdir(patches_path):
-        if folder == skip:
+    for patches_path in _GetGameDefRootOrder(prefer_online=prefer_online, primary_root=primary_root):
+        if not os.path.isdir(patches_path):
             continue
 
-        def_ = ReggieGameDefinition(folder)
+        for folder in os.listdir(patches_path):
+            if folder == skip:
+                continue
 
-        if def_.name != name:  # Not the one we're looking for, so stop loading.
-            continue
+            def_ = ReggieGameDefinition(folder, prefer_online=(patches_path == GAMEDEF_ONLINE_PATCH_ROOT))
 
-        def_.__init2__()
-        return def_
+            if def_.name != name:  # Not the one we're looking for, so stop loading.
+                continue
+
+            def_.__init2__()
+            return def_
 
 
-def UpgradeSpritesFile(filename, folderpath):
+def UpgradeSpritesFile(filename, folderpath, root_dir=GAMEDEF_PATCH_ROOT):
     try:
         with open(filename, "r", encoding="utf-8") as f:
             orig_data = f.read()
@@ -828,7 +897,7 @@ def UpgradeSpritesFile(filename, folderpath):
             fileOut.write(new_data)
 
         # Now backup the old file
-        with open(os.path.join("reggiedata", "patches", folderpath, "sprites_old.py"), 'w') as fileOrig:
+        with open(os.path.join(root_dir, folderpath, "sprites_old.py"), 'w') as fileOrig:
             fileOrig.write(orig_data)
 
     except Exception as error:
