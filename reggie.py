@@ -1354,6 +1354,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.view.XScrollBar.valueChanged.connect(self.XScrollChange)
         self.view.YScrollBar.valueChanged.connect(self.YScrollChange)
         self.view.FrameSize.connect(self.HandleWindowSizeChange)
+        # Collaboration: track rubber-band selection (drag select) so we can
+        # broadcast and render it with per-player colors.
+        try:
+            self.view.rubberBandChanged.connect(self._HandleCollabRubberBandChanged)
+        except Exception:
+            pass
 
         # done creating the window!
         self.setCentralWidget(self.view)
@@ -1484,6 +1490,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabCursorKeepAliveSeconds = 0.45
         self.collabLastBroadcastCursorAt = 0.0
         self.collabLastBroadcastCursorPos = None
+        # Rubber-band selection state (drag-selection rectangle).
+        self.collabLocalRubberBand = None  # {'active': bool, 'x1': float, 'y1': float, 'x2': float, 'y2': float}
+        self.collabRemoteRubberBands = {}  # sid -> dict
+        self.collabRubberBandStaleSeconds = 1.2
+        self._collabLastBroadcastRubberBandAt = 0.0
+        self._collabLastBroadcastRubberBand = None  # tuple(active, x1, y1, x2, y2)
         self._collabCursorAnimLastTick = time.monotonic()
         self._collabCursorAnimTimer = QtCore.QTimer(self)
         self._collabCursorAnimTimer.setInterval(1000 // 60)
@@ -3394,6 +3406,237 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.view.viewport().update()
         except Exception:
             pass
+
+    def _HandleCollabRubberBandChanged(self, viewport_rect, from_scene_point, to_scene_point):
+        """
+        Triggered by QGraphicsView rubberBandChanged while the user is drag-selecting.
+        We store it locally for rendering and broadcast it to peers.
+        """
+        if not self._CollabEnabled() or self._CollabHistoryBlocked():
+            return
+        if globals_.Area is None or globals_.Level is None:
+            return
+        try:
+            active = bool(viewport_rect is not None) and viewport_rect.isValid() and not viewport_rect.isNull() and viewport_rect.width() > 0 and viewport_rect.height() > 0
+        except Exception:
+            active = False
+
+        rb = {'active': bool(active)}
+        if active:
+            try:
+                x1 = float(from_scene_point.x())
+                y1 = float(from_scene_point.y())
+                x2 = float(to_scene_point.x())
+                y2 = float(to_scene_point.y())
+            except Exception:
+                x1 = y1 = x2 = y2 = 0.0
+            rb.update({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+        self.collabLocalRubberBand = rb
+        self._MaybeBroadcastCollabRubberBandState(rb, force=(not active))
+        try:
+            if hasattr(self, 'view') and self.view is not None:
+                self.view.viewport().update()
+        except Exception:
+            pass
+
+    def _MaybeBroadcastCollabRubberBandState(self, rb, force=False):
+        if not self._CollabEnabled() or self._CollabHistoryBlocked():
+            return
+        if globals_.Area is None or globals_.Level is None:
+            return
+        if not isinstance(rb, dict):
+            return
+
+        active = bool(rb.get('active'))
+        if active:
+            try:
+                x1 = float(rb.get('x1', 0.0) or 0.0)
+                y1 = float(rb.get('y1', 0.0) or 0.0)
+                x2 = float(rb.get('x2', 0.0) or 0.0)
+                y2 = float(rb.get('y2', 0.0) or 0.0)
+            except Exception:
+                x1 = y1 = x2 = y2 = 0.0
+        else:
+            x1 = y1 = x2 = y2 = 0.0
+
+        state_tuple = (active, x1, y1, x2, y2)
+        now = time.monotonic()
+        elapsed = now - float(getattr(self, '_collabLastBroadcastRubberBandAt', 0.0) or 0.0)
+
+        if not force and state_tuple == getattr(self, '_collabLastBroadcastRubberBand', None) and elapsed < 0.35:
+            return
+        if not force and elapsed < 0.05:
+            return
+
+        self._collabLastBroadcastRubberBandAt = now
+        self._collabLastBroadcastRubberBand = state_tuple
+
+        payload = {
+            'nick': str(getattr(self, 'collabSelfNick', getattr(globals_, 'CollabNickname', 'Player')) or 'Player'),
+            'color': getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR),
+            'active': bool(active),
+            'x1': float(x1),
+            'y1': float(y1),
+            'x2': float(x2),
+            'y2': float(y2),
+            'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0),
+            'level_name': self._CollabCurrentLevelName(),
+        }
+        try:
+            self.collabManager.broadcast_message('rubber_band', payload)
+        except Exception:
+            pass
+
+    def _UpdateRemoteRubberBandState(self, sender, payload):
+        if globals_.Area is None:
+            return
+        if not isinstance(payload, dict):
+            return
+        sid = str(sender or '')
+        if not sid:
+            return
+
+        try:
+            area_num = int(payload.get('area_num', 0) or 0)
+        except Exception:
+            area_num = 0
+        level_name = str(payload.get('level_name') or '')
+        now = time.monotonic()
+
+        rb = self.collabRemoteRubberBands.get(sid)
+        if rb is None:
+            rb = {}
+            self.collabRemoteRubberBands[sid] = rb
+
+        nick = str(payload.get('nick') or '').strip()
+        if nick:
+            self._CollabSetPeerNick(sid, nick)
+        self._CollabSetPeerColor(sid, payload.get('color'))
+
+        rb['area_num'] = area_num
+        rb['level_name'] = level_name
+        rb['nick'] = nick if nick else self._CollabPeerDisplayName(sid)
+        rb['color'] = normalize_collab_color(payload.get('color') or self._CollabPeerColor(sid))
+        rb['active'] = bool(payload.get('active'))
+        rb['last_seen'] = now
+        try:
+            rb['x1'] = float(payload.get('x1', 0.0) or 0.0)
+            rb['y1'] = float(payload.get('y1', 0.0) or 0.0)
+            rb['x2'] = float(payload.get('x2', 0.0) or 0.0)
+            rb['y2'] = float(payload.get('y2', 0.0) or 0.0)
+        except Exception:
+            rb['x1'] = rb['y1'] = rb['x2'] = rb['y2'] = 0.0
+
+        try:
+            if hasattr(self, 'view') and self.view is not None:
+                self.view.viewport().update()
+        except Exception:
+            pass
+
+    def _CollabRubberBandMatchesCurrentContext(self, rb):
+        if globals_.Area is None:
+            return False
+        try:
+            area_num = int(rb.get('area_num', 0) or 0)
+        except Exception:
+            area_num = 0
+        if area_num and area_num != int(getattr(globals_.Area, 'areanum', 0) or 0):
+            return False
+        level_name = str(rb.get('level_name') or '')
+        return self._CollabMatchesLevelName(level_name)
+
+    def _DrawCollabCornerHandle(self, painter, rect, color, size=4.8):
+        if painter is None or rect is None:
+            return
+        handle_color = collab_qcolor(color, 235)
+        try:
+            x = float(rect.left())
+            y = float(rect.top())
+            size = max(1.0, float(size))
+        except Exception:
+            return
+        painter.save()
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(handle_color)
+        painter.fillRect(QtCore.QRectF(x, y, size, size), handle_color)
+        painter.restore()
+
+    def DrawCollabRubberBands(self, view, painter):
+        """
+        Draw local + remote drag-selection rectangles in the correct player colors.
+        Drawn in viewport coords so the pen width stays consistent across zoom levels.
+        """
+        if not self._CollabEnabled():
+            return
+        viewport_rect = view.viewport().rect()
+        if viewport_rect.width() <= 0 or viewport_rect.height() <= 0:
+            return
+
+        now = time.monotonic()
+        stale_after = float(getattr(self, 'collabRubberBandStaleSeconds', 1.2) or 1.2)
+
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing, True)
+
+        # Local rubber-band (overlay on top of Qt's default rubber band).
+        local = getattr(self, 'collabLocalRubberBand', None)
+        if isinstance(local, dict) and local.get('active'):
+            try:
+                p1 = QtCore.QPointF(view.mapFromScene(QtCore.QPointF(float(local.get('x1', 0.0)), float(local.get('y1', 0.0)))))
+                p2 = QtCore.QPointF(view.mapFromScene(QtCore.QPointF(float(local.get('x2', 0.0)), float(local.get('y2', 0.0)))))
+                rect = QtCore.QRectF(p1, p2).normalized()
+                pen = QtGui.QPen(collab_qcolor(getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR), 235), 2)
+                pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawRect(rect)
+                self._DrawCollabCornerHandle(painter, rect, getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
+            except Exception:
+                pass
+
+        # Remote rubber-bands.
+        for sid, rb in list(getattr(self, 'collabRemoteRubberBands', {}).items()):
+            try:
+                if not self._CollabRubberBandMatchesCurrentContext(rb):
+                    continue
+                if (now - float(rb.get('last_seen', 0.0) or 0.0)) > stale_after:
+                    self.collabRemoteRubberBands.pop(sid, None)
+                    continue
+                if not rb.get('active'):
+                    continue
+            except Exception:
+                continue
+
+            try:
+                p1 = QtCore.QPointF(view.mapFromScene(QtCore.QPointF(float(rb.get('x1', 0.0)), float(rb.get('y1', 0.0)))))
+                p2 = QtCore.QPointF(view.mapFromScene(QtCore.QPointF(float(rb.get('x2', 0.0)), float(rb.get('y2', 0.0)))))
+                rect = QtCore.QRectF(p1, p2).normalized()
+            except Exception:
+                continue
+
+            color = collab_qcolor(rb.get('color'), 235)
+            pen = QtGui.QPen(color, 2)
+            pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawRect(rect)
+            self._DrawCollabCornerHandle(painter, rect, rb.get('color'))
+
+            # Label (optional, only if it fits on screen).
+            nick = str(rb.get('nick') or self._CollabPeerDisplayName(sid))
+            try:
+                text_rect = QtCore.QRectF(rect.left(), rect.top() - 22.0, min(200.0, rect.width()), 18.0)
+                if text_rect.width() >= 60.0:
+                    painter.setPen(QtGui.QColor(0, 0, 0, 170))
+                    painter.drawText(text_rect.translated(1, 1), QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, nick)
+                    painter.setPen(color)
+                    painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, nick)
+            except Exception:
+                pass
+
+        painter.restore()
 
     def _AdvanceCollabRemoteCursors(self):
         now = time.monotonic()
@@ -6314,9 +6557,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabPeerColors = {}
             self.collabPeerEditorState = {}
             self.collabRemoteCursors = {}
+            self.collabRemoteRubberBands = {}
+            self.collabLocalRubberBand = None
             self.collabCursorPKeyHeld = False
             self.collabLastBroadcastCursorAt = 0.0
             self.collabLastBroadcastCursorPos = None
+            self._collabLastBroadcastRubberBandAt = 0.0
+            self._collabLastBroadcastRubberBand = None
             self._collabLastBroadcastEditorState = None
             self._collabLastBroadcastEditorStateAt = 0.0
             self._CollabSetPeerNick(getattr(self.collabManager, 'session_id', ''), getattr(self, 'collabSelfNick', 'Player'))
@@ -7089,9 +7336,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self.collabRemoteCursors = {}
+        self.collabRemoteRubberBands = {}
+        self.collabLocalRubberBand = None
         self.collabCursorPKeyHeld = False
         self.collabLastBroadcastCursorAt = 0.0
         self.collabLastBroadcastCursorPos = None
+        self._collabLastBroadcastRubberBandAt = 0.0
+        self._collabLastBroadcastRubberBand = None
         self.UpdateSaveActionsForCollabMode()
         self._RefreshCollabUi()
 
@@ -10720,6 +10971,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._ChatAddLine('%s: %s' % (display, text))
         elif msg_type == 'cursor_state':
             self._UpdateRemoteCursorState(sender, payload)
+        elif msg_type == 'rubber_band':
+            self._UpdateRemoteRubberBandState(sender, payload)
         elif msg_type == 'ping':
             if self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS)) == COLLAB_CURSOR_DISPLAY_NEVER:
                 return
