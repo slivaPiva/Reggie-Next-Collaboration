@@ -42,6 +42,7 @@ if sys.version_info < minimum:
 
 # Stdlib imports
 import argparse
+import html
 import os.path
 import random
 import time
@@ -1125,6 +1126,113 @@ class CollaborationSaveAllDialog(QtWidgets.QDialog):
                 pass
 
 
+class ResizableCollabStatusLabel(QtWidgets.QLabel):
+    """
+    Small label that can be resized horizontally by dragging its left or right
+    edge.
+    """
+    def __init__(self, text='', parent=None):
+        super().__init__(text, parent)
+        self._resize_margin = 8
+        self._minimum_drag_width = 240
+        self._maximum_drag_width = 900
+        self._left_anchor = None
+        self._right_anchor = None
+        self._anchor_gap = 6
+        self._drag_edge = None
+        self._drag_start_global_x = 0
+        self._drag_start_width = 0
+        self.setMouseTracking(True)
+
+    def setResizeAnchors(self, left_anchor=None, right_anchor=None, gap=6):
+        self._left_anchor = left_anchor
+        self._right_anchor = right_anchor
+        try:
+            self._anchor_gap = int(gap)
+        except Exception:
+            self._anchor_gap = 6
+
+    def _MaxWidthFromAnchors(self):
+        """
+        Returns a dynamic maximum width based on the current layout geometry.
+        If the right-side widgets stop moving (window too small), this will stop
+        growing, preventing further expansion into them.
+        """
+        anchor = self._right_anchor
+        if anchor is None or anchor.parent() is None:
+            return int(self._maximum_drag_width)
+        try:
+            # Both widgets share the same parent in the top bar.
+            right_x = int(anchor.x())
+            my_x = int(self.x())
+            gap = int(self._anchor_gap)
+            max_w = max(0, right_x - my_x - gap)
+            if max_w <= 0:
+                return int(self._maximum_drag_width)
+            return max_w
+        except Exception:
+            return int(self._maximum_drag_width)
+
+    def _ResizeEdgeAt(self, pos):
+        if pos is None:
+            return None
+        if pos.x() <= self._resize_margin:
+            return 'left'
+        if pos.x() >= (self.width() - self._resize_margin):
+            return 'right'
+        return None
+
+    def _UpdateResizeCursor(self, pos=None):
+        if self._drag_edge is not None:
+            self.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
+            return
+        if self._ResizeEdgeAt(pos) is not None:
+            self.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
+        else:
+            self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            edge = self._ResizeEdgeAt(event.position())
+            if edge is not None:
+                self._drag_edge = edge
+                self._drag_start_global_x = int(event.globalPosition().x())
+                self._drag_start_width = int(self.width())
+                self._UpdateResizeCursor(event.position())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_edge is not None:
+            delta = int(event.globalPosition().x()) - int(self._drag_start_global_x)
+            if self._drag_edge == 'left':
+                delta = -delta
+            dynamic_max = self._MaxWidthFromAnchors()
+            new_width = max(
+                int(self._minimum_drag_width),
+                min(int(self._drag_start_width + delta), int(min(self._maximum_drag_width, dynamic_max)))
+            )
+            self.setFixedWidth(new_width)
+            event.accept()
+            return
+        self._UpdateResizeCursor(event.position())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and self._drag_edge is not None:
+            self._drag_edge = None
+            self._UpdateResizeCursor(event.position())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        if self._drag_edge is None:
+            self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
+
+
 class ReggieWindow(QtWidgets.QMainWindow):
     """
     Reggie main level editor window
@@ -1308,6 +1416,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabPendingHistoryLastId = None  # last pending action_id
         self.collabPeerNicks = {}
         self.collabPeerColors = {}
+        self.collabPeerEditorState = {}
+        self._collabLastBroadcastEditorState = None  # (level_name, area_num)
+        self._collabLastBroadcastEditorStateAt = 0.0
         self.collabSelfNick = str(getattr(globals_, 'CollabNickname', 'Player') or 'Player')
         self.collabSelfHighlightColor = normalize_collab_color(getattr(globals_, 'CollabHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
         self.collabCursorDisplayMode = self._NormalizeCollabCursorDisplayMode(getattr(globals_, 'CollabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS))
@@ -2188,12 +2299,43 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabMonitorButton = QtWidgets.QToolButton(self.collabTopBarWidget)
         self.collabMonitorButton.setDefaultAction(self.actions['collab_monitor'])
         self.collabMonitorButton.setVisible(False)
-        top_layout.addWidget(self.collabMonitorButton)
-
+ 
         self.collabChatButton = QtWidgets.QToolButton(self.collabTopBarWidget)
         self.collabChatButton.setDefaultAction(self.actions['collab_chat'])
         self.collabChatButton.setVisible(False)
+
+        self.collabEditorStatusLabel = ResizableCollabStatusLabel('', self.collabTopBarWidget)
+        self.collabEditorStatusLabel.setVisible(False)
+        self.collabEditorStatusLabel.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.collabEditorStatusLabel.setWordWrap(False)
+        self.collabEditorStatusLabel.setMinimumWidth(220)
+        self.collabEditorStatusLabel.setFixedWidth(260)
+        self.collabEditorStatusLabel.setStyleSheet(
+            'padding: 2px 6px;'
+            'border: 1px solid palette(mid);'
+            'border-radius: 4px;'
+            'font-size: 11px;'
+        )
+        self.collabEditorStatusLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        # Order: viewer, then monitor + chat buttons adjacent.
+        top_layout.addWidget(self.collabEditorStatusLabel)
+        top_layout.addWidget(self.collabMonitorButton)
         top_layout.addWidget(self.collabChatButton)
+
+        try:
+            button_height = max(
+                int(self.collabMonitorButton.sizeHint().height()),
+                int(self.collabChatButton.sizeHint().height()),
+            )
+            self.collabEditorStatusLabel.setFixedHeight(button_height)
+        except Exception:
+            pass
+        try:
+            # Limit resizing so it can never overlap the monitor/chat buttons.
+            self.collabEditorStatusLabel.setResizeAnchors(left_anchor=None, right_anchor=self.collabMonitorButton, gap=6)
+        except Exception:
+            pass
 
         self.collabOnlineLabel = QtWidgets.QLabel('Online: 0', self.collabTopBarWidget)
         self.collabOnlineLabel.setVisible(False)
@@ -2541,6 +2683,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 pass
         self._CollabSetPeerColor(getattr(self.collabManager, 'session_id', ''), color)
         try:
+            self._RefreshCollabEditorStatusLabel()
+        except Exception:
+            pass
+        try:
             if hasattr(self, 'view') and self.view is not None:
                 self.view.viewport().update()
         except Exception:
@@ -2603,6 +2749,228 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if nick:
             return nick
         return sid[:8]
+
+    def _CollabSetPeerEditorState(self, session_id, level_name=None, area_num=None):
+        sid = str(session_id or '')
+        if not sid:
+            return
+        try:
+            area_num = int(area_num or 0)
+        except Exception:
+            area_num = 0
+        level_name = str(level_name or '')
+        if not hasattr(self, 'collabPeerEditorState') or self.collabPeerEditorState is None:
+            self.collabPeerEditorState = {}
+        self.collabPeerEditorState[sid] = {
+            'level_name': level_name,
+            'area_num': area_num,
+        }
+        self._RefreshCollabEditorStatusLabel()
+
+    def _CollabPeerEditorStateInfo(self, session_id):
+        sid = str(session_id or '')
+        if not sid:
+            return {}
+        try:
+            return dict((getattr(self, 'collabPeerEditorState', {}) or {}).get(sid) or {})
+        except Exception:
+            return {}
+
+    def _CollabCurrentEditorStateInfo(self):
+        level_name = self._CollabCurrentLevelName() or ''
+        try:
+            area_num = int(getattr(globals_.Area, 'areanum', 0) or 0)
+        except Exception:
+            area_num = 0
+        return {
+            'level_name': str(level_name or ''),
+            'area_num': int(area_num or 0),
+        }
+
+    def _CollabNormalizeLevelNameLookupKey(self, level_name):
+        level_name = str(level_name or '').strip().replace('\\', '/')
+        if not level_name:
+            return ''
+        level_name = level_name.split('/')[-1]
+        lower = level_name.lower()
+        for suffix in ('.arc.lz', '.arc.lh', '.arc', '.rgl'):
+            if lower.endswith(suffix):
+                return level_name[:-len(suffix)]
+        return os.path.splitext(level_name)[0]
+
+    def _CollabFindLevelDisplayNameInTree(self, items, lookup_key):
+        if not items or not lookup_key:
+            return None
+        for item in items:
+            try:
+                item_name, item_value = item
+            except Exception:
+                continue
+            if isinstance(item_value, str):
+                if self._CollabNormalizeLevelNameLookupKey(item_value) == lookup_key:
+                    return str(item_name or '')
+            else:
+                found = self._CollabFindLevelDisplayNameInTree(item_value, lookup_key)
+                if found:
+                    return found
+        return None
+
+    def _CollabDisplayLevelName(self, level_name):
+        level_name = str(level_name or '').strip()
+        if not level_name:
+            return 'Untitled'
+
+        lookup_key = self._CollabNormalizeLevelNameLookupKey(level_name)
+        try:
+            if getattr(globals_, 'LevelNames', None) is None:
+                LoadLevelNames()
+        except Exception:
+            pass
+
+        try:
+            found = self._CollabFindLevelDisplayNameInTree(getattr(globals_, 'LevelNames', None), lookup_key)
+        except Exception:
+            found = None
+        if found:
+            return found
+        return level_name
+
+    def _BuildCollabEditorStatusHtml(self, max_lines=1):
+        local_sid = self._CollabLocalSessionId()
+        participants = list(getattr(self, 'collabParticipants', []) or [])
+        entries = []
+        seen = set()
+        for part in participants:
+            if not isinstance(part, dict):
+                continue
+            sid = str(part.get('session_id') or '')
+            if not sid:
+                continue
+            if sid in seen:
+                continue
+            seen.add(sid)
+            entries.append(part)
+
+        # If roster isn't populated yet, still show local status.
+        if local_sid and local_sid not in seen:
+            entries.insert(0, {
+                'session_id': local_sid,
+                'nickname': getattr(self, 'collabSelfNick', 'Player'),
+                'highlight_color': getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR),
+                'is_host': bool(getattr(self.collabManager, 'mode', None) == 'host'),
+            })
+
+        def sort_key(p):
+            is_host = bool(p.get('is_host'))
+            nick = str(p.get('nickname') or self._CollabPeerDisplayName(p.get('session_id')) or '')
+            return (0 if is_host else 1, nick.lower(), nick)
+
+        entries.sort(key=sort_key)
+
+        lines = []
+        for part in entries:
+            sid = str(part.get('session_id') or '')
+            if not sid:
+                continue
+
+            nick = str(part.get('nickname') or self._CollabPeerDisplayName(sid) or 'Player')
+            color = normalize_collab_color(part.get('highlight_color') or self._CollabPeerColor(sid))
+
+            if sid == local_sid:
+                state = self._CollabCurrentEditorStateInfo()
+            else:
+                state = self._CollabPeerEditorStateInfo(sid)
+
+            level_name = self._CollabDisplayLevelName(state.get('level_name'))
+            try:
+                area_num = int(state.get('area_num', 0) or 0)
+            except Exception:
+                area_num = 0
+
+            if area_num:
+                body = 'Currently editing %s in Area %d' % (level_name, area_num)
+            else:
+                body = 'Currently editing %s' % (level_name,)
+
+            lines.append(
+                '<span style="color:%s"><b>%s</b>: %s</span>' % (
+                    html.escape(color),
+                    html.escape(nick),
+                    html.escape(body),
+                )
+            )
+
+        if not lines:
+            return ''
+
+        max_lines = int(max_lines or 1)
+        if max_lines <= 1:
+            if len(lines) > 1:
+                extra = len(lines) - 1
+                lines = lines[:1]
+                lines.append(html.escape('… (+%d)' % extra))
+            # single-line compact mode
+            return ' &nbsp;|&nbsp; '.join(lines)
+
+        if len(lines) > max_lines:
+            extra = len(lines) - max_lines
+            lines = lines[:max_lines]
+            lines.append(html.escape('… (+%d)' % extra))
+
+        return '<br/>'.join(lines)
+
+    def _RefreshCollabEditorStatusLabel(self):
+        if not hasattr(self, 'collabEditorStatusLabel') or self.collabEditorStatusLabel is None:
+            return
+        collab_active = hasattr(self, 'collabManager') and getattr(self.collabManager, 'mode', None) is not None
+        if not collab_active:
+            try:
+                self.collabEditorStatusLabel.setText('')
+            except Exception:
+                pass
+            return
+        text = self._BuildCollabEditorStatusHtml(max_lines=1)
+        if not text:
+            text = 'Waiting for editor status...'
+        try:
+            self.collabEditorStatusLabel.setText(text)
+        except Exception:
+            pass
+
+    def _MaybeBroadcastCollabEditorState(self, force=False):
+        if not self._CollabEnabled():
+            return
+        if globals_.Level is None or globals_.Area is None:
+            return
+
+        current = self._CollabCurrentEditorStateInfo()
+        state_key = (str(current.get('level_name') or ''), int(current.get('area_num', 0) or 0))
+
+        now = time.monotonic()
+        last_key = getattr(self, '_collabLastBroadcastEditorState', None)
+        last_at = float(getattr(self, '_collabLastBroadcastEditorStateAt', 0.0) or 0.0)
+        if not force:
+            # Only send when changed, and rate-limit.
+            if state_key == last_key:
+                return
+            if (now - last_at) < 0.20:
+                return
+
+        self._collabLastBroadcastEditorState = state_key
+        self._collabLastBroadcastEditorStateAt = now
+        try:
+            self._CollabSetPeerEditorState(self._CollabLocalSessionId(), current.get('level_name'), current.get('area_num'))
+        except Exception:
+            pass
+        try:
+            self.collabManager.broadcast_message('editor_state', {
+                'nick': getattr(self, 'collabSelfNick', 'Player'),
+                'color': getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR),
+                'level_name': current.get('level_name'),
+                'area_num': current.get('area_num'),
+            })
+        except Exception:
+            pass
 
     def _NormalizeCollabCursorDisplayMode(self, mode):
         mode = str(mode or '').strip().lower()
@@ -2675,6 +3043,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabMonitorButton.setVisible(collab_active)
         if hasattr(self, 'collabChatButton'):
             self.collabChatButton.setVisible(collab_active)
+        if hasattr(self, 'collabEditorStatusLabel'):
+            self.collabEditorStatusLabel.setVisible(collab_active)
+            try:
+                self._RefreshCollabEditorStatusLabel()
+            except Exception:
+                pass
         self._RefreshCollabColorButton()
         self.UpdateCollaborationMenuTitle()
         self._UpdateChatOverlayText()
@@ -3316,6 +3690,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             pass
         try:
             self.collabPeerColors = {sid: color for sid, color in getattr(self, 'collabPeerColors', {}).items() if sid in alive}
+        except Exception:
+            pass
+        try:
+            self.collabPeerEditorState = {sid: state for sid, state in getattr(self, 'collabPeerEditorState', {}).items() if sid in alive}
         except Exception:
             pass
         try:
@@ -5730,6 +6108,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.collabWindow.setExpanded(False)
             except Exception:
                 pass
+            try:
+                self._MaybeBroadcastCollabEditorState(force=True)
+            except Exception:
+                pass
             if message.startswith('Connected to') and self.IsCollabClientMode():
                 self._MaybeScheduleCollabTilesetSync(250)
         if message.startswith('Peer connected'):
@@ -5738,6 +6120,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 host_payload.update(self._BuildCollabRoomInfo())
                 self.collabManager.broadcast_message('host_hello', host_payload)
                 self._BroadcastCollabNick()
+                try:
+                    self._MaybeBroadcastCollabEditorState(force=True)
+                except Exception:
+                    pass
             self.BroadcastFullLevelSnapshot()
             self.BroadcastFullSceneState()
             self.BroadcastFullMetaState()
@@ -5750,10 +6136,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if message.startswith('Disconnected from host') or message.startswith('Collaboration stopped'):
             self.collabPeerNicks = {}
             self.collabPeerColors = {}
+            self.collabPeerEditorState = {}
             self.collabRemoteCursors = {}
             self.collabCursorPKeyHeld = False
             self.collabLastBroadcastCursorAt = 0.0
             self.collabLastBroadcastCursorPos = None
+            self._collabLastBroadcastEditorState = None
+            self._collabLastBroadcastEditorStateAt = 0.0
             self._CollabSetPeerNick(getattr(self.collabManager, 'session_id', ''), getattr(self, 'collabSelfNick', 'Player'))
             self._CollabSetPeerColor(getattr(self.collabManager, 'session_id', ''), getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
         self._UpdateChatEnabled()
@@ -6544,6 +6933,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._MaybeBroadcastCollabCursorState()
 
         self.collabLastLevelName = self._CollabNormalizeLevelName()
+        self._MaybeBroadcastCollabEditorState()
 
     def BroadcastFullLevelSnapshot(self):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != "host":
@@ -10119,6 +10509,21 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if nick:
                 self._CollabSetPeerNick(sender, nick)
             self._CollabSetPeerColor(sender, payload.get('color'))
+            try:
+                self._RefreshCollabEditorStatusLabel()
+            except Exception:
+                pass
+        elif msg_type == 'editor_state':
+            nick = str(payload.get('nick') or '').strip()
+            if nick:
+                self._CollabSetPeerNick(sender, nick)
+            self._CollabSetPeerColor(sender, payload.get('color'))
+            try:
+                area_num = int(payload.get('area_num', 0) or 0)
+            except Exception:
+                area_num = 0
+            level_name = str(payload.get('level_name') or '')
+            self._CollabSetPeerEditorState(sender, level_name, area_num)
         elif msg_type == 'chat':
             nick = str(payload.get('nick') or '').strip()
             if nick:
@@ -14599,6 +15004,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
             self.collabLastSceneSig = hash(repr(self.BuildCollabSceneState()))
             self.collabLastLevelName = self._CollabNormalizeLevelName()
+            try:
+                self._MaybeBroadcastCollabEditorState(force=True)
+            except Exception:
+                pass
 
     def HandleUpdateLayer0(self, checked):
         """

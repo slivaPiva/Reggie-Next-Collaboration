@@ -7,7 +7,7 @@ from xml.etree import ElementTree as etree
 from PyQt6 import QtWidgets, QtCore, QtGui
 
 from ui import GetIcon, createVertLine
-from misc import LoadSpriteData, LoadSpriteListData, LoadSpriteCategories, LoadBgANames, LoadBgBNames, LoadObjDescriptions, LoadTilesetNames, LoadTilesetInfo, LoadEntranceNames, LoadMusicInfo, LoadZoneThemes
+from misc import LoadSpriteData, LoadSpriteListData, LoadSpriteCategories, LoadBgANames, LoadBgBNames, LoadObjDescriptions, LoadTilesetNames, LoadTilesetInfo, LoadEntranceNames, LoadMusicInfo, LoadZoneThemes, LoadLevelNames
 from dirty import setting, setSetting
 from dialogs import SpriteUpgradeDialog
 
@@ -756,6 +756,7 @@ def LoadGameDef(name=None, dlg=None, prompt_for_stage_path=True, prefer_online=F
         LoadBgBNames(True)
         LoadZoneThemes(True)
         LoadMusicInfo(True)  # reloads the music names
+        LoadLevelNames(True)  # reloads the patch level list
 
         if dlg: dlg.setValue(3)
 
@@ -763,10 +764,10 @@ def LoadGameDef(name=None, dlg=None, prompt_for_stage_path=True, prefer_online=F
         if dlg: dlg.setLabelText(globals_.trans.string('Gamedefs', 10))  # Reloading tilesets...
 
         LoadObjDescriptions(True)  # reloads ts1_descriptions
-        if globals_.mainWindow is not None:
-            globals_.mainWindow.ReloadTilesets(True)
         LoadTilesetNames(True)  # reloads tileset names
         LoadTilesetInfo(True)  # reloads tileset info
+        if globals_.mainWindow is not None:
+            globals_.mainWindow.ReloadTilesets(True)
 
         if dlg: dlg.setValue(4)
 

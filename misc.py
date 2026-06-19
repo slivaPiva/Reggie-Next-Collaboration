@@ -157,10 +157,13 @@ def getResourcePaths(res_name):
     return filter(lambda x: x is not None, itertools.chain.from_iterable(zip(gamedef_files, trans_files)))
 
 
-def LoadLevelNames():
+def LoadLevelNames(reload_=False):
     """
     Ensures that the level name info is loaded
     """
+    if (globals_.LevelNames is not None) and (not reload_):
+        return
+
     for path in getResourcePaths('levelnames'):
         tree = ElementTree.parse(path)
         root = tree.getroot()
