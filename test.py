@@ -88,8 +88,8 @@ def _ensure_patch_available(reggie_root, patch_path):
         return patch_id
 
 
-def _configure_reggie_settings(reggie_root, patch_id=None, stage_path=None):
-    settings_path = os.path.join(reggie_root, "settings.ini")
+def _configure_reggie_settings_for_path(settings_path, patch_id=None, stage_path=None):
+    settings_path = os.path.abspath(settings_path)
     settings = QtCore.QSettings(settings_path, QtCore.QSettings.Format.IniFormat)
     if patch_id:
         settings.setValue("LastGameDef", patch_id)
@@ -105,10 +105,44 @@ def _configure_reggie_settings(reggie_root, patch_id=None, stage_path=None):
     settings.sync()
 
 
+def _create_temp_settings_copy(reggie_root, suffix):
+    reggie_root = os.path.abspath(reggie_root)
+    source_path = os.path.join(reggie_root, "settings.ini")
+    temp_name = "settings_test_%s.ini" % str(suffix or "session")
+    temp_path = os.path.join(reggie_root, temp_name)
+
+    if os.path.exists(temp_path):
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+    if os.path.isfile(source_path):
+        shutil.copy2(source_path, temp_path)
+    else:
+        with open(temp_path, "w", encoding="utf-8"):
+            pass
+
+    return temp_path
+
+
+def _delete_temp_settings_file(path_value):
+    path_value = str(path_value or "").strip()
+    if not path_value:
+        return
+    try:
+        if os.path.isfile(path_value):
+            os.remove(path_value)
+    except OSError:
+        pass
+
+
 def _build_host_command(config):
     command = [
         sys.executable,
         config["host_reggie_py"],
+        "--settings-file",
+        config["host_settings_path"],
         "--level",
         config["host_level_path"],
         "--collab-host",
@@ -139,6 +173,8 @@ def _build_client_command(config):
     command = [
         sys.executable,
         config["client_reggie_py"],
+        "--settings-file",
+        config["client_settings_path"],
         "--collab-join-host",
         "127.0.0.1",
         "--collab-join-port",
@@ -192,6 +228,8 @@ class TestRunner(QtCore.QObject):
         self.config = dict(config)
         self.host_process = None
         self.client_process = None
+        self.host_settings_path = None
+        self.client_settings_path = None
         self._stop_requested = False
 
     def stop(self):
@@ -248,6 +286,10 @@ class TestRunner(QtCore.QObject):
         _terminate_process(self.host_process)
         self.client_process = None
         self.host_process = None
+        _delete_temp_settings_file(self.client_settings_path)
+        _delete_temp_settings_file(self.host_settings_path)
+        self.client_settings_path = None
+        self.host_settings_path = None
 
     def _validate_and_prepare(self):
         host_reggie_py = _require_file(self.config.get("host_reggie_py"), "Host reggie.py")
@@ -278,8 +320,10 @@ class TestRunner(QtCore.QObject):
         if client_patch_path:
             client_patch_id = _ensure_patch_available(client_root, client_patch_path)
 
-        _configure_reggie_settings(host_root, host_patch_id, host_stage_path)
-        _configure_reggie_settings(client_root, client_patch_id, client_stage_path)
+        self.host_settings_path = _create_temp_settings_copy(host_root, "host")
+        self.client_settings_path = _create_temp_settings_copy(client_root, "client")
+        _configure_reggie_settings_for_path(self.host_settings_path, host_patch_id, host_stage_path)
+        _configure_reggie_settings_for_path(self.client_settings_path, client_patch_id, client_stage_path)
 
         self.config["host_reggie_py"] = host_reggie_py
         self.config["client_reggie_py"] = client_reggie_py
@@ -291,6 +335,8 @@ class TestRunner(QtCore.QObject):
         self.config["client_level_path"] = client_level_path
         self.config["host_root"] = host_root
         self.config["client_root"] = client_root
+        self.config["host_settings_path"] = self.host_settings_path
+        self.config["client_settings_path"] = self.client_settings_path
         self.config["room_mode"] = room_mode
         self.config["host_port"] = int(self.config.get("host_port") or 35000)
         self.config["host_start_timeout_seconds"] = float(self.config.get("host_start_timeout_seconds") or 30.0)

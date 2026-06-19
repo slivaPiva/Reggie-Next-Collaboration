@@ -152,6 +152,7 @@ def _parse_startup_cli_options(argv=None):
     parser.add_argument('--collab-color', default=None, help='Local collaboration highlight color.')
     parser.add_argument('--collab-join-host', default=None, help='Join a collaboration host directly by IP or hostname.')
     parser.add_argument('--collab-join-port', type=int, default=None, help='Port for direct collaboration join.')
+    parser.add_argument('--settings-file', dest='settings_file', default=None, help='Use an alternate settings .ini file for this session.')
 
     args, _unknown = parser.parse_known_args(argv)
 
@@ -171,6 +172,9 @@ def _parse_startup_cli_options(argv=None):
     host_port = int(args.collab_port)
     room_mode = 'public' if args.collab_mode == 'online' else 'lan'
     default_room_name = "%s's room" % (collab_nick or getattr(globals_, 'CollabNickname', 'Player') or 'Player')
+    settings_file = str(args.settings_file or '').strip() or None
+    if settings_file is not None:
+        settings_file = os.path.abspath(os.path.expanduser(settings_file))
 
     return {
         'auto_open_level': auto_level_path is not None,
@@ -186,6 +190,7 @@ def _parse_startup_cli_options(argv=None):
         'collab_color': collab_color,
         'collab_join_host': join_host,
         'collab_join_port': join_port,
+        'settings_file': settings_file,
     }
 
 
@@ -993,6 +998,56 @@ class CollaborationMonitorDialog(QtWidgets.QDialog):
             self._ban_list_callback()
 
 
+class CollaborationLiveActivityDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Live collaboration activity')
+        self.resize(520, 360)
+        self.setStyleSheet(
+            'QDialog { background: rgba(8, 8, 8, 225); color: white; }'
+            'QPushButton { color: white; background: rgba(255,255,255,25); border: 1px solid rgba(255,255,255,90); padding: 6px 10px; }'
+            'QLabel { color: white; }'
+            'QTextBrowser { background: transparent; color: white; border: 1px solid rgba(255,255,255,80); padding: 8px; }'
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.infoLabel = QtWidgets.QLabel('')
+        self.infoLabel.setWordWrap(True)
+        layout.addWidget(self.infoLabel)
+
+        self.viewer = QtWidgets.QTextBrowser(self)
+        self.viewer.setOpenExternalLinks(False)
+        self.viewer.setReadOnly(True)
+        layout.addWidget(self.viewer, 1)
+
+        bottom_row = QtWidgets.QHBoxLayout()
+        bottom_row.addStretch(1)
+        close_button = QtWidgets.QPushButton('Close')
+        close_button.clicked.connect(self.close)
+        bottom_row.addWidget(close_button)
+        layout.addLayout(bottom_row)
+
+    def setStatusHtml(self, html_text, participant_count=0):
+        try:
+            participant_count = int(participant_count or 0)
+        except Exception:
+            participant_count = 0
+
+        if participant_count > 0:
+            noun = 'participant' if participant_count == 1 else 'participants'
+            self.infoLabel.setText('Live editor activity for %d %s in this collaboration.' % (participant_count, noun))
+        else:
+            self.infoLabel.setText('Waiting for live collaboration activity...')
+
+        html_text = str(html_text or '').strip()
+        if not html_text:
+            html_text = '<span style="color:#d0d0d0">Waiting for editor status...</span>'
+
+        self.viewer.setHtml(
+            '<div style="font-size:12px; line-height:1.6;">%s</div>' % html_text
+        )
+
+
 class HostedLevelSelectionDialog(QtWidgets.QDialog):
     """
     Simple picker for levels exposed by the collaboration host.
@@ -1436,6 +1491,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabParticipants = []
         self.collabWindow = None
         self.collabMonitorDialog = None
+        self.collabLiveActivityDialog = None
         self.collabBanListDialog = None
         self.collabLastMouseScenePos = None
         self.collabPings = []
@@ -2304,36 +2360,23 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabChatButton.setDefaultAction(self.actions['collab_chat'])
         self.collabChatButton.setVisible(False)
 
-        self.collabEditorStatusLabel = ResizableCollabStatusLabel('', self.collabTopBarWidget)
-        self.collabEditorStatusLabel.setVisible(False)
-        self.collabEditorStatusLabel.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self.collabEditorStatusLabel.setWordWrap(False)
-        self.collabEditorStatusLabel.setMinimumWidth(220)
-        self.collabEditorStatusLabel.setFixedWidth(260)
-        self.collabEditorStatusLabel.setStyleSheet(
-            'padding: 2px 6px;'
-            'border: 1px solid palette(mid);'
-            'border-radius: 4px;'
-            'font-size: 11px;'
-        )
-        self.collabEditorStatusLabel.setAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.collabEditorStatusButton = QtWidgets.QPushButton('Live activity', self.collabTopBarWidget)
+        self.collabEditorStatusButton.setVisible(False)
+        self.collabEditorStatusButton.setToolTip('Show what everyone is editing right now')
+        self.collabEditorStatusButton.clicked.connect(self.HandleOpenCollabLiveActivity)
 
-        # Order: viewer, then monitor + chat buttons adjacent.
-        top_layout.addWidget(self.collabEditorStatusLabel)
+        # Order: live activity, then monitor + chat buttons adjacent.
+        top_layout.addWidget(self.collabEditorStatusButton)
         top_layout.addWidget(self.collabMonitorButton)
         top_layout.addWidget(self.collabChatButton)
 
         try:
             button_height = max(
+                int(self.collabEditorStatusButton.sizeHint().height()),
                 int(self.collabMonitorButton.sizeHint().height()),
                 int(self.collabChatButton.sizeHint().height()),
             )
-            self.collabEditorStatusLabel.setFixedHeight(button_height)
-        except Exception:
-            pass
-        try:
-            # Limit resizing so it can never overlap the monitor/chat buttons.
-            self.collabEditorStatusLabel.setResizeAnchors(left_anchor=None, right_anchor=self.collabMonitorButton, gap=6)
+            self.collabEditorStatusButton.setFixedHeight(button_height)
         except Exception:
             pass
 
@@ -2920,20 +2963,45 @@ class ReggieWindow(QtWidgets.QMainWindow):
         return '<br/>'.join(lines)
 
     def _RefreshCollabEditorStatusLabel(self):
-        if not hasattr(self, 'collabEditorStatusLabel') or self.collabEditorStatusLabel is None:
-            return
         collab_active = hasattr(self, 'collabManager') and getattr(self.collabManager, 'mode', None) is not None
-        if not collab_active:
+        count = len(getattr(self, 'collabParticipants', []) or [])
+
+        if hasattr(self, 'collabEditorStatusButton') and self.collabEditorStatusButton is not None:
+            button_text = 'Live activity'
+            if collab_active and count > 0:
+                button_text = 'Live activity (%d)' % count
             try:
-                self.collabEditorStatusLabel.setText('')
+                self.collabEditorStatusButton.setText(button_text)
             except Exception:
                 pass
-            return
-        text = self._BuildCollabEditorStatusHtml(max_lines=1)
-        if not text:
-            text = 'Waiting for editor status...'
+            tooltip_html = self._BuildCollabEditorStatusHtml(max_lines=6) if collab_active else ''
+            if tooltip_html:
+                tooltip_html = '<qt>%s</qt>' % tooltip_html
+            else:
+                tooltip_html = 'Show what everyone is editing right now'
+            try:
+                self.collabEditorStatusButton.setToolTip(tooltip_html)
+            except Exception:
+                pass
+
+        full_text = self._BuildCollabEditorStatusHtml(max_lines=max(8, count + 2)) if collab_active else ''
+        if hasattr(self, 'collabLiveActivityDialog') and self.collabLiveActivityDialog is not None:
+            try:
+                self.collabLiveActivityDialog.setStatusHtml(full_text, count)
+            except Exception:
+                pass
+
+    def HandleOpenCollabLiveActivity(self):
+        if self.collabLiveActivityDialog is None:
+            self.collabLiveActivityDialog = CollaborationLiveActivityDialog(self)
+        self.collabLiveActivityDialog.setStatusHtml(
+            self._BuildCollabEditorStatusHtml(max_lines=max(8, len(getattr(self, 'collabParticipants', []) or []) + 2)),
+            len(getattr(self, 'collabParticipants', []) or []),
+        )
         try:
-            self.collabEditorStatusLabel.setText(text)
+            self.collabLiveActivityDialog.show()
+            self.collabLiveActivityDialog.raise_()
+            self.collabLiveActivityDialog.activateWindow()
         except Exception:
             pass
 
@@ -3043,8 +3111,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabMonitorButton.setVisible(collab_active)
         if hasattr(self, 'collabChatButton'):
             self.collabChatButton.setVisible(collab_active)
-        if hasattr(self, 'collabEditorStatusLabel'):
-            self.collabEditorStatusLabel.setVisible(collab_active)
+        if hasattr(self, 'collabEditorStatusButton'):
+            self.collabEditorStatusButton.setVisible(collab_active)
             try:
                 self._RefreshCollabEditorStatusLabel()
             except Exception:
@@ -5770,6 +5838,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         form.addRow('Nickname:', nick_row)
         layout.addLayout(form)
 
+        select_files_btn = QtWidgets.QPushButton('Select your NSMBW files')
+        select_files_btn.setMinimumHeight(42)
+        select_files_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        layout.addWidget(select_files_btn)
+
         choice = {'value': 'exit', 'path': None}
         last_level = str(setting('LastLevel', '') or '').strip()
         has_recent_files = any(os.path.isfile(path) for path in getattr(self.RecentMenu, 'FileList', []))
@@ -5807,6 +5880,34 @@ class ReggieWindow(QtWidgets.QMainWindow):
             last_btn.setText('Open Last File (unavailable)')
         layout.addWidget(last_btn)
 
+        last_level_available = bool(last_level)
+
+        def update_startup_buttons():
+            has_game_paths = self._HasConfiguredGamePaths()
+            select_files_btn.setText('Change your NSMBW files' if has_game_paths else 'Select your NSMBW files')
+            open_btn.setEnabled(has_game_paths)
+            join_btn.setEnabled(has_game_paths)
+            recent_btn.setEnabled(has_game_paths and has_recent_files)
+            backups_btn.setEnabled(has_game_paths and has_backups)
+            last_btn.setEnabled(has_game_paths and last_level_available)
+            if has_game_paths:
+                select_files_btn.setDefault(False)
+                select_files_btn.setAutoDefault(False)
+                last_btn.setDefault(last_level_available)
+                last_btn.setAutoDefault(last_level_available)
+                if last_level_available:
+                    last_btn.setFocus()
+                else:
+                    open_btn.setFocus()
+            else:
+                select_files_btn.setDefault(True)
+                select_files_btn.setAutoDefault(True)
+                select_files_btn.setFocus()
+
+        def select_game_files():
+            if self.HandleChangeGamePath(True):
+                update_startup_buttons()
+
         def finish(result, path=None):
             self.SetCollabNickname(nick_edit.text(), broadcast=False)
             self.SetCollabHighlightColor(color_value['value'], broadcast=False)
@@ -5827,12 +5928,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         open_btn.clicked.connect(lambda: finish('open'))
         join_btn.clicked.connect(lambda: finish('join'))
         exit_btn.clicked.connect(lambda: finish('exit'))
+        select_files_btn.clicked.connect(select_game_files)
         recent_btn.clicked.connect(pick_recent)
         backups_btn.clicked.connect(pick_backup)
         last_btn.clicked.connect(lambda: finish('last'))
-        last_btn.setDefault(True)
-        last_btn.setAutoDefault(True)
-        last_btn.setFocus()
+        update_startup_buttons()
+        dlg.setFixedSize(dlg.sizeHint())
         dlg.exec()
         return choice['value'], choice['path']
 
@@ -18261,10 +18362,18 @@ def main():
     if path is not None:
         os.chdir(path)
 
+    settings_path = str((STARTUP_CLI_OPTIONS or {}).get('settings_file') or 'settings.ini')
+    settings_dir = os.path.dirname(os.path.abspath(settings_path))
+    if settings_dir:
+        try:
+            os.makedirs(settings_dir, exist_ok=True)
+        except Exception:
+            pass
+
     # Create backup of settings
-    if os.path.isfile('settings.ini'):
+    if os.path.abspath(settings_path) == os.path.abspath('settings.ini') and os.path.isfile(settings_path):
         from shutil import copy2
-        copy2('settings.ini', 'settings.ini.bak')
+        copy2(settings_path, 'settings.ini.bak')
         del copy2
 
     # Try to get the last commit id - if it failed, we're in a build.
@@ -18279,7 +18388,7 @@ def main():
     del subprocess
 
     # Load the settings
-    globals_.settings = QtCore.QSettings('settings.ini', QtCore.QSettings.Format.IniFormat)
+    globals_.settings = QtCore.QSettings(settings_path, QtCore.QSettings.Format.IniFormat)
 
     # Check the version and set the UI style to Fusion by default
     if setting("ReggieVersion") is None:
