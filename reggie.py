@@ -5971,6 +5971,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabLastLevelName = current_level_name
 
     def BroadcastFullLevelSnapshot(self):
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != "host":
+            return
         if globals_.Level is None or globals_.Area is None:
             return
         try:
@@ -10484,6 +10486,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
     def HandleRemoteSnapshot(self, level_data, area_num, sender):
         if globals_.Area is None or globals_.Level is None:
+            return
+        if hasattr(self, 'collabManager') and getattr(self.collabManager, 'mode', None) == "host":
+            # Full snapshots are host-authoritative; clients synchronize edits
+            # through ops/history and may transiently reload local state during
+            # patch sync or tileset refresh.
+            return
+        if self.IsCollabClientMode() and self.collabHostSessionId is not None and sender != self.collabHostSessionId:
             return
         if self._CollabPatchSyncInProgress():
             self.collabPendingSnapshot = (level_data, area_num, sender)
@@ -16351,6 +16360,73 @@ class ReggieWindow(QtWidgets.QMainWindow):
         SetDirty()
 
 
+def _RecoverMissingStartupGameDef(missing_game_def):
+    missing_game_def = str(missing_game_def or '').strip()
+    default_name = ReggieGameDefinition().name
+
+    QtWidgets.QMessageBox.warning(
+        None,
+        'Missing game patch',
+        'The previously selected game patch could not be found.\n\n'
+        'Missing patch: %s\n\n'
+        'It may have been removed from "Patches online". Please choose another game patch.'
+        % (missing_game_def or default_name),
+    )
+
+    choices = []
+    choice_to_game_id = {}
+    seen_ids = set()
+    for game_id in getAvailableGameDefs(include_online=True):
+        normalized_id = None if game_id in (None, 'None', 0, '', True, False) else str(game_id)
+        if normalized_id in seen_ids:
+            continue
+        seen_ids.add(normalized_id)
+
+        try:
+            game_name = ReggieGameDefinition(normalized_id).name
+        except Exception:
+            game_name = default_name if normalized_id is None else str(normalized_id)
+
+        label = game_name if normalized_id is None else '%s (%s)' % (game_name, normalized_id)
+        if label in choice_to_game_id:
+            label = '%s [%s]' % (label, normalized_id if normalized_id is not None else 'default')
+
+        choices.append(label)
+        choice_to_game_id[label] = normalized_id
+
+    setSetting('LastGameDef', None)
+
+    if not choices:
+        return LoadGameDef(None, prompt_for_stage_path=False)
+
+    while True:
+        selected_label, ok = QtWidgets.QInputDialog.getItem(
+            None,
+            'Select game patch',
+            'Choose another game patch:',
+            choices,
+            0,
+            False,
+        )
+
+        selected_game_id = None if not ok else choice_to_game_id.get(selected_label)
+        if LoadGameDef(selected_game_id, prompt_for_stage_path=False):
+            setSetting('LastGameDef', selected_game_id)
+            if not ok:
+                QtWidgets.QMessageBox.information(
+                    None,
+                    'Game patch reset',
+                    'The missing game patch was cleared. Reggie loaded the default game definition.',
+                )
+            return True
+
+        QtWidgets.QMessageBox.warning(
+            None,
+            'Unable to load game patch',
+            'The selected game patch could not be loaded. Please choose another one.',
+        )
+
+
 def main():
     """
     Main startup function for Reggie
@@ -16471,7 +16547,12 @@ def main():
     sprites.LoadBasics()
 
     # Load the gamedef (including sprite image path, for which we need spritelib)
-    LoadGameDef(setting('LastGameDef'), prompt_for_stage_path=False)
+    last_gamedef = setting('LastGameDef')
+    try:
+        LoadGameDef(last_gamedef, prompt_for_stage_path=False)
+    except FileNotFoundError:
+        if not _RecoverMissingStartupGameDef(last_gamedef):
+            sys.exit(1)
 
     qpt_tilesets = _register_quickpaint_tileset_overrides()
     if qpt_tilesets:
