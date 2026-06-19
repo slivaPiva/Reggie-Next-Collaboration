@@ -22,58 +22,6 @@ def collab_selection_qcolor(item=None, alpha=None):
         color.setAlpha(max(0, min(255, int(alpha))))
     return color
 
-
-def draw_collab_corner_handle(painter, rect, color, corner_size=4.8):
-    """
-    Draw a small solid corner square using the same visual language as selection grabbers.
-    """
-    if painter is None or rect is None:
-        return
-    brush_color = QtGui.QColor(color)
-    if not brush_color.isValid():
-        return
-    try:
-        corner = max(1.0, float(corner_size))
-        x = float(rect.left())
-        y = float(rect.top())
-    except Exception:
-        return
-
-    painter.save()
-    painter.setPen(QtCore.Qt.PenStyle.NoPen)
-    painter.setBrush(brush_color)
-    painter.fillRect(QtCore.QRectF(x, y, corner, corner), brush_color)
-    painter.restore()
-
-
-def draw_collab_tile_corner_markers(painter, rect, tile_width, tile_height, color, tile_size=24.0, corner_size=4.8):
-    """
-    Draw a small selection-style corner square for each tile cell inside a selected object.
-    """
-    if painter is None or rect is None:
-        return
-    try:
-        tile_width = max(0, int(tile_width))
-        tile_height = max(0, int(tile_height))
-    except Exception:
-        return
-    if tile_width <= 0 or tile_height <= 0:
-        return
-
-    brush_color = QtGui.QColor(color)
-    if not brush_color.isValid():
-        return
-
-    left = float(rect.left())
-    top = float(rect.top())
-    cell = float(tile_size)
-
-    for ty in range(tile_height):
-        y = top + (ty * cell)
-        for tx in range(tile_width):
-            x = left + (tx * cell)
-            draw_collab_corner_handle(painter, QtCore.QRectF(x, y, cell, cell), brush_color, corner_size=corner_size)
-
 class InstanceDefinition:
     """
     ABC for a definition of an instance of a LevelEditorItem class, used for persistence and comparisons
@@ -927,90 +875,58 @@ class ObjectItem(LevelEditorItem):
         Paints the object
         """
         remote_selected_by = str(getattr(self, '_collab_selected_by', '') or '')
-        marker_color = None
-        selection_line_color = None
         if remote_selected_by and not self.isSelected():
             remote_pen = QtGui.QPen(collab_selection_qcolor(self), 2, QtCore.Qt.PenStyle.DashLine)
             painter.setPen(remote_pen)
             painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
             painter.drawRect(self.SelectionRect)
-            marker_color = collab_selection_qcolor(self, alpha=220)
-            try:
-                draw_collab_corner_handle(painter, self.SelectionRect, marker_color)
-            except Exception:
-                pass
-        elif self.isSelected():
-            mw = getattr(globals_, 'mainWindow', None)
-            if mw is not None and hasattr(mw, '_CollabEnabled') and mw._CollabEnabled():
-                try:
-                    marker_color = QtGui.QColor(str(getattr(mw, 'collabSelfHighlightColor', getattr(globals_, 'CollabHighlightColor', '#ffff00')) or ''))
-                    if marker_color.isValid():
-                        marker_color.setAlpha(220)
-                        selection_line_color = QtGui.QColor(marker_color)
-                except Exception:
-                    marker_color = None
-                    selection_line_color = None
-        if marker_color is not None:
-            try:
-                draw_collab_tile_corner_markers(
-                    painter,
-                    self.SelectionRect,
-                    self.width,
-                    self.height,
-                    marker_color,
-                )
-            except Exception:
-                pass
 
         if not self.isSelected():
             return
 
-        if selection_line_color is None:
-            selection_line_color = globals_.theme.color('object_lines_s')
-        painter.setPen(QtGui.QPen(selection_line_color, 1, QtCore.Qt.PenStyle.DashLine))
+        painter.setPen(QtGui.QPen(globals_.theme.color('object_lines_s'), 1, QtCore.Qt.PenStyle.DashLine))
         painter.drawRect(self.SelectionRect)
         painter.fillRect(self.SelectionRect, globals_.theme.color('object_fill_s'))
 
-        default_grabber_color = selection_line_color if selection_line_color is not None else globals_.theme.color('object_lines_s')
         if self.TLGrabbed:
             painter.fillRect(self.GrabberRectTL, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectTL, default_grabber_color)
+            painter.fillRect(self.GrabberRectTL, globals_.theme.color('object_lines_s'))
 
         if self.TRGrabbed:
             painter.fillRect(self.GrabberRectTR, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectTR, default_grabber_color)
+            painter.fillRect(self.GrabberRectTR, globals_.theme.color('object_lines_s'))
 
         if self.BLGrabbed:
             painter.fillRect(self.GrabberRectBL, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectBL, default_grabber_color)
+            painter.fillRect(self.GrabberRectBL, globals_.theme.color('object_lines_s'))
 
         if self.BRGrabbed:
             painter.fillRect(self.GrabberRectBR, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectBR, default_grabber_color)
+            painter.fillRect(self.GrabberRectBR, globals_.theme.color('object_lines_s'))
 
         if self.MTGrabbed:
             painter.fillRect(self.GrabberRectMT, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectMT, default_grabber_color)
+            painter.fillRect(self.GrabberRectMT, globals_.theme.color('object_lines_s'))
 
         if self.MLGrabbed:
             painter.fillRect(self.GrabberRectML, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectML, default_grabber_color)
+            painter.fillRect(self.GrabberRectML, globals_.theme.color('object_lines_s'))
 
         if self.MBGrabbed:
             painter.fillRect(self.GrabberRectMB, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectMB, default_grabber_color)
+            painter.fillRect(self.GrabberRectMB, globals_.theme.color('object_lines_s'))
 
         if self.MRGrabbed:
             painter.fillRect(self.GrabberRectMR, globals_.theme.color('object_lines_r'))
         else:
-            painter.fillRect(self.GrabberRectMR, default_grabber_color)
+            painter.fillRect(self.GrabberRectMR, globals_.theme.color('object_lines_s'))
 
     def mousePressEvent(self, event):
         """

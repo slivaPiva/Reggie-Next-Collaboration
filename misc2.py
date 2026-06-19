@@ -1225,10 +1225,6 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         # Draws a foreground grid
         if globals_.GridType is None:
             try:
-                globals_.mainWindow.DrawCollabRubberBands(self, painter)
-            except Exception:
-                pass
-            try:
                 globals_.mainWindow.DrawCollabRemoteCursors(self, painter)
             except Exception:
                 pass
@@ -1338,10 +1334,6 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
 
             painter.drawTiledPixmap(rect, board)
 
-        try:
-            globals_.mainWindow.DrawCollabRubberBands(self, painter)
-        except Exception:
-            pass
         try:
             globals_.mainWindow.DrawCollabRemoteCursors(self, painter)
         except Exception:
