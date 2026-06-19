@@ -5299,6 +5299,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if entry is None:
                 entry = {'name': name, 'slots': []}
                 grouped[name] = entry
+            if slot is None or str(slot).strip() == '':
+                continue
             try:
                 slot = int(slot)
             except Exception:
@@ -5324,6 +5326,72 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 'sha1': self._TilesetBytesSha1(data),
             })
         return entries
+
+    def _EnumerateAllHostTilesetSlotMap(self):
+        """
+        Returns a superset of tilesets available from the host game files.
+
+        The current area's 4 slots are included first, then every discoverable
+        tileset name from the configured texture paths is appended with an empty
+        slot mapping. Empty slots are allowed for transfer-only entries.
+        """
+        ordered_names = collections.OrderedDict()
+
+        for slot in range(4):
+            try:
+                name = str(self._GetTilesetNameForSlot(slot) or '').strip()
+            except Exception:
+                name = ''
+            if not name:
+                continue
+            ordered_names.setdefault(name, [])
+            if slot not in ordered_names[name]:
+                ordered_names[name].append(int(slot))
+
+        texture_paths = []
+        try:
+            texture_paths = list(getattr(globals_.gamedef, 'GetTexturePaths', lambda: [])() or [])
+        except Exception:
+            texture_paths = []
+        try:
+            final_dir = self._GetTilesetFinalDir()
+        except Exception:
+            final_dir = None
+        if final_dir:
+            normalized_final = os.path.normpath(str(final_dir))
+            if all(os.path.normpath(str(path or '')) != normalized_final for path in texture_paths):
+                texture_paths.insert(0, final_dir)
+
+        for base_path in texture_paths:
+            base_path = str(base_path or '').strip()
+            if not base_path or not os.path.isdir(base_path):
+                continue
+            try:
+                filenames = sorted(os.listdir(base_path))
+            except Exception:
+                continue
+            for filename in filenames:
+                lower_name = filename.lower()
+                tileset_name = ''
+                if lower_name.endswith('.arc.lh'):
+                    tileset_name = filename[:-7]
+                elif lower_name.endswith('.arc'):
+                    tileset_name = filename[:-4]
+                if not tileset_name:
+                    continue
+                full_path = os.path.join(base_path, filename)
+                if not os.path.isfile(full_path):
+                    continue
+                ordered_names.setdefault(str(tileset_name), [])
+
+        slot_map = []
+        for name, slots in ordered_names.items():
+            if slots:
+                for slot in slots:
+                    slot_map.append((int(slot), name))
+            else:
+                slot_map.append((None, name))
+        return slot_map
 
     def _BuildCollabTilesetManifestPayload(self, entries):
         return {
@@ -5619,25 +5687,26 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if self._NeedsCollabTilesetSync(names=names):
             self._ScheduleCollabTilesetSync(delay_ms)
 
-    def _RequestHostTilesetsNow(self):
+    def _RequestHostTilesetsNow(self, include_all_game_tilesets=False, force=False):
         if not self.IsCollabClientMode():
             return
         if not self._CollabEnabled():
             return
         if globals_.Area is None:
             return
-        if not self._NeedsCollabTilesetSync():
+        if not force and not self._NeedsCollabTilesetSync():
             return
         self._StartCollabTilesetSyncProgress()
         try:
             self.collabManager.broadcast_message('tileset_sync_request', {
                 'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0),
                 'level_name': self._CollabCurrentLevelName(),
+                'include_all_game_tilesets': bool(include_all_game_tilesets),
             })
         except Exception:
             pass
 
-    def _HostSendTilesetsToPeer(self, peer_session_id, area_num=None):
+    def _HostSendTilesetsToPeer(self, peer_session_id, area_num=None, include_all_game_tilesets=False):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
             return
         if globals_.Area is None:
@@ -5660,6 +5729,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         if not slot_map:
             slot_map = [(slot, self._GetTilesetNameForSlot(slot)) for slot in range(4)]
+        if include_all_game_tilesets:
+            extra_slot_map = self._EnumerateAllHostTilesetSlotMap()
+        else:
+            extra_slot_map = []
+        if extra_slot_map:
+            slot_map.extend(extra_slot_map)
         entries = self._BuildCollabTilesetTransferEntries(slot_map)
         manifest = self._BuildCollabTilesetManifestPayload(entries)
         try:
@@ -6641,7 +6716,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._ResetCollabPatchSyncState(cleanup_staging=True)
         if hasattr(self, 'hoverLabel'):
             self.hoverLabel.setText('Downloaded host patch: %s' % str(host_info.get('game_name') or game_id))
-        self._MaybeScheduleCollabTilesetSync(50)
+        try:
+            self._RequestHostTilesetsNow(include_all_game_tilesets=True, force=True)
+        except Exception:
+            self._MaybeScheduleCollabTilesetSync(50)
         if self._CollabHistoryEnabled() and self.IsCollabClientMode():
             try:
                 self._CollabRequestHistorySync()
@@ -7930,13 +8008,17 @@ class ReggieWindow(QtWidgets.QMainWindow):
         the first incoming remote level name so transient messages like ping and
         selection are not discarded.
         """
-        remote_level_name = str(remote_level_name or '')
+        remote_level_name = self._CollabNormalizeLevelName(remote_level_name)
         if not remote_level_name:
             return True
 
-        local_level_name = str(self._CollabCurrentLevelName() or '')
+        local_level_name = self._CollabNormalizeLevelName(self._CollabCurrentLevelName())
         if local_level_name:
-            return remote_level_name == local_level_name
+            if remote_level_name == local_level_name:
+                return True
+            remote_lookup = str(self._CollabNormalizeLevelNameLookupKey(remote_level_name) or '').strip().lower()
+            local_lookup = str(self._CollabNormalizeLevelNameLookupKey(local_level_name) or '').strip().lower()
+            return bool(remote_lookup and local_lookup and remote_lookup == local_lookup)
 
         try:
             self.collabLastLevelName = remote_level_name
@@ -10598,7 +10680,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._BroadcastCollabNick()
             if self.IsCollabClientMode() and self._StartCollabPatchSync(payload):
                 return
-            self._MaybeScheduleCollabTilesetSync(50)
+            try:
+                self._RequestHostTilesetsNow(include_all_game_tilesets=True, force=True)
+            except Exception:
+                self._MaybeScheduleCollabTilesetSync(50)
             # Request authoritative undo/redo history state from the host.
             if self._CollabHistoryEnabled() and self.IsCollabClientMode():
                 try:
@@ -10754,7 +10839,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         elif msg_type == 'tileset_sync_request':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 area_num = payload.get('area_num')
-                self._HostSendTilesetsToPeer(sender, area_num=area_num)
+                self._HostSendTilesetsToPeer(
+                    sender,
+                    area_num=area_num,
+                    include_all_game_tilesets=bool(payload.get('include_all_game_tilesets')),
+                )
         elif msg_type == 'patch_sync_request':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 self._HostSendPatchFilesToPeer(sender, payload.get('game_id'))
