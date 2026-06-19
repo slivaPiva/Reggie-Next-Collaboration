@@ -992,6 +992,139 @@ class CollaborationMonitorDialog(QtWidgets.QDialog):
             self._ban_list_callback()
 
 
+class HostedLevelSelectionDialog(QtWidgets.QDialog):
+    """
+    Simple picker for levels exposed by the collaboration host.
+    """
+
+    def __init__(self, title, levels, parent=None):
+        QtWidgets.QDialog.__init__(self, parent)
+        self.setWindowTitle(str(title or 'Choose hosted level'))
+        self.setWindowIcon(GetIcon('open'))
+        self.selected_level = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.infoLabel = QtWidgets.QLabel('Choose a level from the host Stage folder.')
+        self.infoLabel.setWordWrap(True)
+        layout.addWidget(self.infoLabel)
+
+        self.listWidget = QtWidgets.QListWidget()
+        self.listWidget.itemDoubleClicked.connect(self._HandleItemActivated)
+        self.listWidget.currentItemChanged.connect(self._HandleSelectionChanged)
+        layout.addWidget(self.listWidget, 1)
+
+        for level_name in levels or ():
+            if not level_name:
+                continue
+            item = QtWidgets.QListWidgetItem(str(level_name))
+            item.setData(Qt.ItemDataRole.UserRole, str(level_name))
+            self.listWidget.addItem(item)
+
+        self.buttonBox = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttonBox.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+        self.buttonBox.accepted.connect(self.accept)
+        self.buttonBox.rejected.connect(self.reject)
+        layout.addWidget(self.buttonBox)
+
+        self.resize(420, 420)
+
+    def _HandleSelectionChanged(self, current, previous):
+        del previous
+        self.selected_level = None
+        if current is not None:
+            self.selected_level = str(current.data(Qt.ItemDataRole.UserRole) or '')
+        self.buttonBox.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setEnabled(bool(self.selected_level))
+
+    def _HandleItemActivated(self, item):
+        if item is None:
+            return
+        self.selected_level = str(item.data(Qt.ItemDataRole.UserRole) or '')
+        if self.selected_level:
+            self.accept()
+
+
+class CollaborationSaveAllDialog(QtWidgets.QDialog):
+    """
+    Lets the host review modified collaboration levels before saving all.
+    """
+
+    def __init__(self, entries, open_callback, parent=None):
+        QtWidgets.QDialog.__init__(self, parent)
+        self._open_callback = open_callback
+        self._entries_by_name = {}
+        self._selected_level = None
+
+        self.setWindowTitle('Save all collaboration levels')
+        self.setWindowIcon(GetIcon('save'))
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.infoLabel = QtWidgets.QLabel(
+            'Levels changed during this collaboration session. Double-click a level or use "Open selected" to review it before saving.'
+        )
+        self.infoLabel.setWordWrap(True)
+        layout.addWidget(self.infoLabel)
+
+        self.listWidget = QtWidgets.QListWidget()
+        self.listWidget.itemDoubleClicked.connect(self._HandleOpenSelected)
+        self.listWidget.currentItemChanged.connect(self._HandleSelectionChanged)
+        layout.addWidget(self.listWidget, 1)
+
+        for entry in entries or ():
+            if not isinstance(entry, dict):
+                continue
+            level_name = str(entry.get('level_name') or '').strip()
+            if not level_name:
+                continue
+            modified_text = str(entry.get('modified_text') or 'Changed in this session')
+            text = '%s  |  %s' % (level_name, modified_text)
+            item = QtWidgets.QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, level_name)
+            self.listWidget.addItem(item)
+            self._entries_by_name[level_name] = dict(entry)
+
+        button_row = QtWidgets.QHBoxLayout()
+        self.openButton = QtWidgets.QPushButton('Open selected')
+        self.openButton.setEnabled(False)
+        self.openButton.clicked.connect(self._HandleOpenSelected)
+        button_row.addWidget(self.openButton)
+        button_row.addStretch(1)
+        self.buttonBox = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttonBox.accepted.connect(self.accept)
+        self.buttonBox.rejected.connect(self.reject)
+        save_button = self.buttonBox.button(QtWidgets.QDialogButtonBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setText('Save all')
+        button_row.addWidget(self.buttonBox)
+        layout.addLayout(button_row)
+
+        self.resize(520, 420)
+
+    def selectedLevelName(self):
+        return str(self._selected_level or '')
+
+    def _HandleSelectionChanged(self, current, previous):
+        del previous
+        self._selected_level = None
+        if current is not None:
+            self._selected_level = str(current.data(Qt.ItemDataRole.UserRole) or '')
+        self.openButton.setEnabled(bool(self._selected_level))
+
+    def _HandleOpenSelected(self, item=None):
+        if item is not None:
+            self._selected_level = str(item.data(Qt.ItemDataRole.UserRole) or '')
+        if not self._selected_level:
+            return
+        if callable(self._open_callback):
+            try:
+                self._open_callback(self._selected_level)
+            except Exception:
+                pass
+
+
 class ReggieWindow(QtWidgets.QMainWindow):
     """
     Reggie main level editor window
@@ -1103,10 +1236,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabPeerLastRev = {}
         self.collabPeerLastState = {}
         self.collabAreaState = {}
+        self.collabLevelAreaState = {}
         self.collabMetaRev = 0
         self.collabPeerLastMetaRev = {}
         self.collabPeerLastMetaState = {}
         self.collabAreaMetaState = {}
+        self.collabLevelAreaMetaState = {}
         self.collabSwitchingArea = False
         self.collabApplyingRemote = False
         self.collabApplyingRemoteHistory = False
@@ -1114,6 +1249,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabPendingSnapshot = None
         self.collabPendingMessages = collections.deque()
         self.collabHostSessionId = None
+        self.collabKnownHostedStageFiles = []
+        self.collabModifiedLevels = collections.OrderedDict()
         self._collabPatchSyncState = None
         self._collabPatchProgressDialog = None
         self._collabTilesetSyncState = None
@@ -1511,6 +1648,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.CreateAction(
             'savecopyas', self.HandleSaveCopyAs, GetIcon('savecopyas'),
             globals_.trans.stringOneLine('MenuItems', 128), globals_.trans.stringOneLine('MenuItems', 129),
+            None,
+        )
+        self.CreateAction(
+            'collab_saveall', self.HandleCollabSaveAll, GetIcon('save'),
+            'Save all collaboration levels', 'Review and save all levels changed during this collaboration session',
             None,
         )
 
@@ -1943,6 +2085,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         fmenu.addAction(self.actions['save'])
         fmenu.addAction(self.actions['saveas'])
         fmenu.addAction(self.actions['savecopyas'])
+        fmenu.addAction(self.actions['collab_saveall'])
         fmenu.addAction(self.actions['metainfo'])
         fmenu.addSeparator()
         fmenu.addAction(self.actions['changegamedef'])
@@ -3221,6 +3364,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 'save',
                 'saveas',
                 'savecopyas',
+                'collab_saveall',
                 'metainfo',
                 'screenshot',
                 'changegamepath',
@@ -3822,6 +3966,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
             action = self.actions.get(action_name)
             if action is not None:
                 action.setEnabled(not client_mode)
+        save_all_action = self.actions.get('collab_saveall')
+        if save_all_action is not None:
+            save_all_action.setEnabled(bool(self._CollabEnabled()) and getattr(self.collabManager, 'mode', None) == 'host')
 
         if client_mode:
             globals_.Dirty = False
@@ -4948,7 +5095,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         raw_sha1 = self._TilesetBytesSha1(raw)
         if raw_sha1 and raw_sha1 == str(self._collabTilesetSha1ByName.get(name) or ''):
-            self._ReloadTilesetNameEverywhere(name)
+            # Exact same tileset bytes already applied locally: do not reload
+            # caches or repopulate the picker again when users revisit the same
+            # area/level. Real reloads should only happen after an actual edit.
             return
 
         override_path = self._GetTilesetOverridePath(name)
@@ -4995,12 +5144,43 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         self._collabTilesetSyncTimer.start(int(delay_ms))
 
+    def _CurrentAreaTilesetNames(self):
+        names = []
+        if globals_.Area is None:
+            return names
+        for slot in range(4):
+            try:
+                name = str(self._GetTilesetNameForSlot(slot) or '').strip()
+            except Exception:
+                name = ''
+            if name:
+                names.append(name)
+        return names
+
+    def _NeedsCollabTilesetSync(self, names=None):
+        if not self.IsCollabClientMode():
+            return False
+        if not self._CollabEnabled():
+            return False
+        if names is None:
+            names = self._CurrentAreaTilesetNames()
+        for name in names or ():
+            if not self._HasCollabTilesetAvailable(name):
+                return True
+        return False
+
+    def _MaybeScheduleCollabTilesetSync(self, delay_ms=250, names=None):
+        if self._NeedsCollabTilesetSync(names=names):
+            self._ScheduleCollabTilesetSync(delay_ms)
+
     def _RequestHostTilesetsNow(self):
         if not self.IsCollabClientMode():
             return
         if not self._CollabEnabled():
             return
         if globals_.Area is None:
+            return
+        if not self._NeedsCollabTilesetSync():
             return
         self._StartCollabTilesetSyncProgress()
         try:
@@ -5551,8 +5731,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             if message.startswith('Connected to') and self.IsCollabClientMode():
-                # Request tilesets early; client game files may differ from host.
-                self._ScheduleCollabTilesetSync(250)
+                self._MaybeScheduleCollabTilesetSync(250)
         if message.startswith('Peer connected'):
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 host_payload = {'host': self.collabManager.session_id}
@@ -5972,7 +6151,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._ResetCollabPatchSyncState(cleanup_staging=True)
         if hasattr(self, 'hoverLabel'):
             self.hoverLabel.setText('Downloaded host patch: %s' % str(host_info.get('game_name') or game_id))
-        self._ScheduleCollabTilesetSync(50)
+        self._MaybeScheduleCollabTilesetSync(50)
         if self._CollabHistoryEnabled() and self.IsCollabClientMode():
             try:
                 self._CollabRequestHistorySync()
@@ -6074,6 +6253,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'game_is_custom': bool(game_id),
             'game_patch_file_count': int(summary.get('file_count', 0) or 0),
             'game_patch_total_bytes': int(summary.get('total_bytes', 0) or 0),
+            'stage_files': self._CollabListHostStageFiles(),
+            'current_level_name': self._CollabCurrentLevelName(),
         }
 
     def _HasUsableCollabHostGameInfo(self, host_info):
@@ -6362,15 +6543,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         self._MaybeBroadcastCollabCursorState()
 
-        current_level_name = os.path.basename(self.fileSavePath) if self.fileSavePath else None
-        if self.collabManager.mode == "host" and self.collabLastLevelName is not None and current_level_name != self.collabLastLevelName:
-            self.collabManager.broadcast_message('level_switch', {
-                'level_name': current_level_name,
-                'area_num': globals_.Area.areanum,
-            })
-            self.BroadcastFullLevelSnapshot()
-            self.BroadcastFullSceneState()
-        self.collabLastLevelName = current_level_name
+        self.collabLastLevelName = self._CollabNormalizeLevelName()
 
     def BroadcastFullLevelSnapshot(self):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != "host":
@@ -6384,7 +6557,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabLastHash = hash(level_data)
         self.collabLastSentHash = self.collabLastHash
         self.collabLastSceneSig = hash(repr(self.BuildCollabSceneState()))
-        self.collabLastLevelName = os.path.basename(self.fileSavePath) if self.fileSavePath else None
+        try:
+            self.collabLastLevelName = self._CollabNormalizeLevelName(self.fileSavePath) if self.fileSavePath else None
+        except Exception:
+            self.collabLastLevelName = os.path.basename(self.fileSavePath) if self.fileSavePath else None
         self.collabManager.broadcast_snapshot(level_data, globals_.Area.areanum)
 
     def _CollabEnabled(self):
@@ -6905,9 +7081,355 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._ArmHostAuthoritativeTimer()
 
     def _CollabCurrentLevelName(self):
-        if self.fileSavePath:
-            return os.path.basename(self.fileSavePath)
+        """
+        Returns the current collaboration "level key".
+
+        For Stage-hosted levels we keep a relative path (preserving subfolders),
+        e.g. "World1/01-01.arc". For non-Stage files we fall back to basename
+        to avoid leaking local absolute paths across peers.
+        """
+        try:
+            path = str(self.fileSavePath or '').strip()
+        except Exception:
+            path = ''
+
+        if path:
+            stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+            if stage_dir:
+                try:
+                    stage_abs = os.path.abspath(stage_dir)
+                    path_abs = os.path.abspath(path)
+                    stage_norm = stage_abs.replace('\\', '/').rstrip('/')
+                    path_norm = path_abs.replace('\\', '/')
+                    if path_norm.startswith(stage_norm + '/'):
+                        rel = path_norm[len(stage_norm) + 1:]
+                        rel = rel.replace('\\', '/').lstrip('/')
+                        return rel
+                except Exception:
+                    pass
+
+            # Not under Stage (or Stage unknown) - keep legacy behaviour.
+            try:
+                return os.path.basename(path.replace('\\', '/'))
+            except Exception:
+                return str(path).replace('\\', '/').split('/')[-1]
+
         return str(getattr(self, 'collabLastLevelName', '') or '') or None
+
+    def _CollabNormalizeLevelName(self, level_name=None):
+        if level_name is None:
+            level_name = self._CollabCurrentLevelName()
+        level_name = str(level_name or '').strip().replace('\\', '/')
+        if not level_name:
+            return ''
+
+        stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+        if stage_dir:
+            try:
+                stage_abs = os.path.abspath(stage_dir).replace('\\', '/').rstrip('/')
+                candidate_abs = os.path.abspath(level_name).replace('\\', '/')
+                if candidate_abs.startswith(stage_abs + '/'):
+                    level_name = candidate_abs[len(stage_abs) + 1:]
+            except Exception:
+                pass
+
+        # Sanitize: treat it as a relative path key (supports subfolders).
+        level_name = level_name.lstrip('/')
+        parts = []
+        for part in level_name.split('/'):
+            if not part or part == '.':
+                continue
+            if part == '..':
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        sanitized = '/'.join(parts)
+        if not sanitized:
+            return ''
+
+        # If the key still looks like an absolute path (rare), fall back.
+        if ':' in sanitized.split('/')[0]:
+            return os.path.basename(sanitized)
+        return sanitized
+
+    def _CollabSceneCacheForLevel(self, level_name=None, create=False):
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return self.collabAreaState
+        store = getattr(self, 'collabLevelAreaState', None)
+        if store is None:
+            self.collabLevelAreaState = {}
+            store = self.collabLevelAreaState
+        cache = store.get(level_name)
+        if cache is None and create:
+            cache = {}
+            store[level_name] = cache
+        if cache is None:
+            return {}
+        current_level_name = self._CollabNormalizeLevelName()
+        if current_level_name and current_level_name == level_name:
+            self.collabAreaState = cache
+        return cache
+
+    def _CollabMetaCacheForLevel(self, level_name=None, create=False):
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return self.collabAreaMetaState
+        store = getattr(self, 'collabLevelAreaMetaState', None)
+        if store is None:
+            self.collabLevelAreaMetaState = {}
+            store = self.collabLevelAreaMetaState
+        cache = store.get(level_name)
+        if cache is None and create:
+            cache = {}
+            store[level_name] = cache
+        if cache is None:
+            return {}
+        current_level_name = self._CollabNormalizeLevelName()
+        if current_level_name and current_level_name == level_name:
+            self.collabAreaMetaState = cache
+        return cache
+
+    def _CollabStateKey(self, sender, area_num, level_name=None):
+        return (str(sender or ''), self._CollabNormalizeLevelName(level_name), int(area_num))
+
+    def _CollabSyncCurrentLevelCaches(self):
+        current_level_name = self._CollabNormalizeLevelName()
+        if not current_level_name:
+            self.collabAreaState = {}
+            self.collabAreaMetaState = {}
+            return
+        self.collabAreaState = self._CollabSceneCacheForLevel(current_level_name, create=True)
+        self.collabAreaMetaState = self._CollabMetaCacheForLevel(current_level_name, create=True)
+
+    def _CollabHostedStageFilePath(self, level_name):
+        stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not stage_dir or not level_name:
+            return ''
+        # level_name is a sanitized relative path (may include subfolders).
+        return os.path.join(stage_dir, *level_name.split('/'))
+
+    def _CollabListHostStageFiles(self):
+        stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+        if not stage_dir or not os.path.isdir(stage_dir):
+            return []
+        files = []
+        stage_abs = None
+        try:
+            stage_abs = os.path.abspath(stage_dir)
+        except Exception:
+            stage_abs = None
+
+        try:
+            for root, _dirs, filenames in os.walk(stage_dir):
+                for filename in filenames:
+                    if not filename:
+                        continue
+                    lower_name = filename.lower()
+                    if not (lower_name.endswith('.arc') or lower_name.endswith('.arc.lz') or lower_name.endswith('.arc.lh')):
+                        continue
+                    full_path = os.path.join(root, filename)
+                    if not os.path.isfile(full_path):
+                        continue
+                    try:
+                        rel = os.path.relpath(full_path, stage_dir)
+                    except Exception:
+                        rel = filename
+                    rel = rel.replace('\\', '/')
+                    # extra safety: ignore anything escaping Stage
+                    if rel.startswith('../') or rel.startswith('..\\'):
+                        continue
+                    rel = self._CollabNormalizeLevelName(rel)
+                    if rel:
+                        files.append(rel)
+        except Exception:
+            return []
+        files = sorted(set(files), key=lambda name: name.lower())
+        return files
+
+    def _CollabResolveHostedLevelName(self, level_name):
+        """
+        Resolves a client-provided level reference to a concrete relative Stage
+        path known by the host.
+
+        Supports:
+        - exact relative Stage paths like `World1/01-01.arc`
+        - legacy "open by name" values like `01-01` without extension
+        - basename-only matches when they are unambiguous
+        """
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return ''
+
+        stage_files = list(self._CollabListHostStageFiles() or [])
+        if not stage_files:
+            return level_name
+
+        known_lower = {name.lower(): name for name in stage_files}
+        direct = known_lower.get(level_name.lower())
+        if direct:
+            return direct
+
+        if not re.search(r'\.arc(?:\.(?:lz|lh))?$', level_name, re.IGNORECASE):
+            for ext in getattr(globals_, 'FileExtentions', ('.arc', '.arc.LH', '.arc.LZ')) or ('.arc', '.arc.LH', '.arc.LZ'):
+                candidate = self._CollabNormalizeLevelName(level_name + ext)
+                direct = known_lower.get(candidate.lower())
+                if direct:
+                    return direct
+
+        requested_base = os.path.basename(level_name).lower()
+        requested_stem = re.sub(r'(\.arc(?:\.(?:lz|lh))?)$', '', requested_base, flags=re.IGNORECASE)
+        matches = []
+        for candidate in stage_files:
+            candidate_base = os.path.basename(candidate).lower()
+            candidate_stem = re.sub(r'(\.arc(?:\.(?:lz|lh))?)$', '', candidate_base, flags=re.IGNORECASE)
+            if candidate_base == requested_base or candidate_stem == requested_stem:
+                matches.append(candidate)
+
+        if len(matches) == 1:
+            return matches[0]
+        return ''
+
+    def _CollabPrimeLevelCachesFromSource(self, level_name, area_nums=None):
+        """
+        Ensure cached scene/meta state exists for the requested hosted level.
+
+        This is critical for parallel collaboration on levels that are not
+        currently open on the host: incoming ops must be applied against the
+        correct base level data from Stage, not against whatever level the host
+        happens to have open in the UI.
+        """
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return False
+
+        resolved_level_name = self._CollabResolveHostedLevelName(level_name) or level_name
+        scene_cache = self._CollabSceneCacheForLevel(resolved_level_name, create=True)
+        meta_cache = self._CollabMetaCacheForLevel(resolved_level_name, create=True)
+
+        requested_areas = None
+        if area_nums is not None:
+            requested_areas = set()
+            for value in area_nums:
+                try:
+                    area_num = int(value)
+                except Exception:
+                    continue
+                if area_num > 0:
+                    requested_areas.add(area_num)
+            if not requested_areas:
+                return True
+            if all(isinstance(scene_cache.get(area_num), dict) and isinstance(meta_cache.get(area_num), dict) for area_num in requested_areas):
+                return True
+
+        target_path = self._CollabHostedStageFilePath(resolved_level_name)
+        source_level_data = self._CollabReadLevelBytesFromPath(target_path)
+        if source_level_data is None:
+            return False
+
+        original_bytes = None
+        original_area = 1
+        original_path = self.fileSavePath
+        original_title = getattr(self, 'fileTitle', '')
+        original_level_name = self.collabLastLevelName
+        try:
+            if globals_.Level is not None:
+                original_bytes = globals_.Level.save()
+                original_area = int(getattr(globals_.Area, 'areanum', 1) or 1)
+        except Exception:
+            original_bytes = None
+
+        try:
+            temp_level = Level_NSMBW()
+            if not temp_level.load(bytes(source_level_data), 1):
+                return False
+            max_area_count = len(temp_level.areas)
+        except Exception:
+            return False
+
+        if requested_areas is None:
+            target_areas = list(range(1, max_area_count + 1))
+        else:
+            target_areas = sorted(area_num for area_num in requested_areas if area_num <= max_area_count)
+            if not target_areas:
+                return False
+
+        self.collabApplyingRemote = True
+        self.collabSwitchingArea = True
+        try:
+            self.fileSavePath = target_path
+            self.fileTitle = os.path.basename(target_path) if target_path else resolved_level_name
+            self.collabLastLevelName = resolved_level_name
+            self._CollabSyncCurrentLevelCaches()
+            for area_num in target_areas:
+                self.LoadLevelFromNetwork(bytes(source_level_data), int(area_num))
+                try:
+                    scene_cache[int(area_num)] = self.BuildCollabSceneState()
+                except Exception:
+                    pass
+                try:
+                    meta_cache[int(area_num)] = self.BuildCollabMetaState()
+                except Exception:
+                    pass
+            return True
+        finally:
+            try:
+                self.fileSavePath = original_path
+                self.fileTitle = original_title
+                self.collabLastLevelName = original_level_name
+                if original_bytes is not None:
+                    self._CollabSyncCurrentLevelCaches()
+                    self.LoadLevelFromNetwork(original_bytes, int(original_area))
+            except Exception:
+                pass
+            self.collabSwitchingArea = False
+            self.collabApplyingRemote = False
+            self._CollabSyncCurrentLevelCaches()
+
+    def _CollabMarkLevelModified(self, level_name=None, source_path=None):
+        if not hasattr(self, 'collabModifiedLevels'):
+            self.collabModifiedLevels = collections.OrderedDict()
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return
+        if not source_path:
+            source_path = self._CollabHostedStageFilePath(level_name) or self.fileSavePath or ''
+        self.collabModifiedLevels[level_name] = {
+            'level_name': level_name,
+            'path': str(source_path or ''),
+            'modified_at': float(time.time()),
+        }
+
+    def _CollabClearModifiedLevel(self, level_name=None):
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return
+        try:
+            self.collabModifiedLevels.pop(level_name, None)
+        except Exception:
+            pass
+
+    def _CollabModifiedLevelEntries(self):
+        entries = []
+        for level_name, entry in (getattr(self, 'collabModifiedLevels', {}) or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            modified_at = entry.get('modified_at')
+            if modified_at:
+                modified_text = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(modified_at)))
+            else:
+                modified_text = 'Changed in this session'
+            current = self._CollabNormalizeLevelName() == self._CollabNormalizeLevelName(level_name)
+            entries.append({
+                'level_name': str(level_name),
+                'path': str(entry.get('path') or ''),
+                'modified_at': modified_at,
+                'modified_text': modified_text,
+                'is_current': current,
+            })
+        return entries
 
     def _CollabMatchesLevelName(self, remote_level_name):
         """
@@ -7074,9 +7596,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
             area_num = 1
         try:
             if hasattr(self, 'collabManager') and self.collabManager.mode != "host":
-                self.collabManager.broadcast_message('request_full_sync', {'area_num': area_num})
+                self.collabManager.broadcast_message('request_full_sync', {
+                    'area_num': area_num,
+                    'level_name': self._CollabCurrentLevelName(),
+                })
             else:
-                self.BroadcastFullStateForArea(area_num)
+                self.BroadcastFullStateForArea(area_num, level_name=self._CollabCurrentLevelName())
         except Exception:
             pass
 
@@ -7652,16 +8177,16 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if duplicate_objects or duplicate_sprites:
             self._CollabRebuildIndexes()
 
-    def BroadcastFullSceneState(self):
+    def BroadcastFullSceneState(self, level_name=None):
         if not self._CollabEnabled() or self.collabManager.mode != "host":
             return
         if globals_.Level is None or globals_.Area is None:
             return
-        current_level_name = self._CollabCurrentLevelName()
+        current_level_name = self._CollabNormalizeLevelName(level_name)
         self.CollabEnsureCurrentAreaIds()
         scene_state = self.BuildCollabSceneState()
         try:
-            self.collabAreaState[int(globals_.Area.areanum)] = scene_state
+            self._CollabSceneCacheForLevel(current_level_name, create=True)[int(globals_.Area.areanum)] = scene_state
         except Exception:
             pass
         self.collabSceneRev += 1
@@ -8068,6 +8593,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'level_name': self._CollabCurrentLevelName(),
             'ops': result,
         }
+        if getattr(self.collabManager, 'mode', None) == 'host':
+            self._CollabMarkLevelModified(self._CollabCurrentLevelName())
         self.collabManager.broadcast_message('ops', payload)
 
     def CollabQueueMetaUpdate(self):
@@ -8091,32 +8618,34 @@ class ReggieWindow(QtWidgets.QMainWindow):
             area_num = 0
         if area_num < 1:
             return
+        current_level_name = self._CollabNormalizeLevelName()
 
         if include_scene:
             try:
-                self.collabAreaState[area_num] = self.BuildCollabSceneState()
+                self._CollabSceneCacheForLevel(current_level_name, create=True)[area_num] = self.BuildCollabSceneState()
             except Exception:
                 pass
         if include_meta:
             try:
-                self.collabAreaMetaState[area_num] = self.BuildCollabMetaState()
+                self._CollabMetaCacheForLevel(current_level_name, create=True)[area_num] = self.BuildCollabMetaState()
             except Exception:
                 pass
 
-    def BroadcastFullMetaState(self):
+    def BroadcastFullMetaState(self, level_name=None):
         if not self._CollabEnabled() or self.collabManager.mode != "host":
             return
         if globals_.Level is None or globals_.Area is None:
             return
+        current_level_name = self._CollabNormalizeLevelName(level_name)
         self.collabMetaRev += 1
         state = self.BuildCollabMetaState()
         try:
-            self.collabAreaMetaState[int(globals_.Area.areanum)] = state
+            self._CollabMetaCacheForLevel(current_level_name, create=True)[int(globals_.Area.areanum)] = state
         except Exception:
             pass
         self.collabManager.broadcast_message('meta_state', {
             'area_num': globals_.Area.areanum,
-            'level_name': self._CollabCurrentLevelName(),
+            'level_name': current_level_name,
             'rev': self.collabMetaRev,
             'state': state,
         })
@@ -8134,9 +8663,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabMetaRev += 1
         state = self.BuildCollabMetaState()
         try:
-            self.collabAreaMetaState[int(globals_.Area.areanum)] = state
+            self._CollabMetaCacheForLevel(self._CollabCurrentLevelName(), create=True)[int(globals_.Area.areanum)] = state
         except Exception:
             pass
+        if getattr(self.collabManager, 'mode', None) == 'host':
+            self._CollabMarkLevelModified(self._CollabCurrentLevelName())
         self.collabManager.broadcast_message('meta_state', {
             'area_num': globals_.Area.areanum,
             'level_name': self._CollabCurrentLevelName(),
@@ -8144,7 +8675,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'state': state,
         })
 
-    def BroadcastFullStateForArea(self, area_num):
+    def BroadcastFullStateForArea(self, area_num, level_name=None):
         if not self._CollabEnabled() or self.collabManager.mode != "host":
             return
         if globals_.Level is None or globals_.Area is None:
@@ -8155,28 +8686,31 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         if area_num < 1:
             return
+        current_level_name = self._CollabResolveHostedLevelName(level_name) or self._CollabNormalizeLevelName(level_name)
+        scene_cache = self._CollabSceneCacheForLevel(current_level_name, create=True)
+        meta_cache = self._CollabMetaCacheForLevel(current_level_name, create=True)
 
-        if area_num == getattr(globals_.Area, 'areanum', None):
+        if current_level_name == self._CollabNormalizeLevelName() and area_num == getattr(globals_.Area, 'areanum', None):
             self.CollabEnsureCurrentAreaIds()
-            self.BroadcastFullSceneState()
-            self.BroadcastFullMetaState()
+            self.BroadcastFullSceneState(level_name=current_level_name)
+            self.BroadcastFullMetaState(level_name=current_level_name)
             try:
-                self.collabAreaState[int(area_num)] = self.BuildCollabSceneState()
+                scene_cache[int(area_num)] = self.BuildCollabSceneState()
             except Exception:
                 pass
             try:
-                self.collabAreaMetaState[int(area_num)] = self.BuildCollabMetaState()
+                meta_cache[int(area_num)] = self.BuildCollabMetaState()
             except Exception:
                 pass
             return
 
-        cached_scene = self.collabAreaState.get(int(area_num)) if hasattr(self, 'collabAreaState') else None
-        cached_meta = self.collabAreaMetaState.get(int(area_num)) if hasattr(self, 'collabAreaMetaState') else None
+        cached_scene = scene_cache.get(int(area_num)) if isinstance(scene_cache, dict) else None
+        cached_meta = meta_cache.get(int(area_num)) if isinstance(meta_cache, dict) else None
         if isinstance(cached_scene, dict):
             self.collabSceneRev += 1
             self.collabManager.broadcast_message('scene_patch', {
                 'area_num': int(area_num),
-                'level_name': self._CollabCurrentLevelName(),
+                'level_name': current_level_name,
                 'rev': self.collabSceneRev,
                 'state': cached_scene,
             })
@@ -8184,59 +8718,53 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.collabMetaRev += 1
                 self.collabManager.broadcast_message('meta_state', {
                     'area_num': int(area_num),
-                    'level_name': self._CollabCurrentLevelName(),
+                    'level_name': current_level_name,
                     'rev': self.collabMetaRev,
                     'state': cached_meta,
                 })
             return
 
-        try:
-            level_bytes = globals_.Level.save()
-        except Exception:
+        if not self._CollabPrimeLevelCachesFromSource(current_level_name, area_nums=[area_num]):
             return
 
-        old_area = getattr(globals_.Area, 'areanum', None)
-        self.collabApplyingRemote = True
-        self.collabSwitchingArea = True
-        try:
-            try:
-                self.LoadLevelFromNetwork(level_bytes, area_num)
-            except Exception:
-                return
-            self.CollabEnsureCurrentAreaIds()
-            self.BroadcastFullSceneState()
-            self.BroadcastFullMetaState()
-            try:
-                self.collabAreaState[int(area_num)] = self.BuildCollabSceneState()
-            except Exception:
-                pass
-            try:
-                self.collabAreaMetaState[int(area_num)] = self.BuildCollabMetaState()
-            except Exception:
-                pass
-        finally:
-            try:
-                if old_area:
-                    self.LoadLevelFromNetwork(level_bytes, int(old_area))
-            except Exception:
-                pass
-            self.collabSwitchingArea = False
-            self.collabApplyingRemote = False
+        cached_scene = scene_cache.get(int(area_num)) if isinstance(scene_cache, dict) else None
+        cached_meta = meta_cache.get(int(area_num)) if isinstance(meta_cache, dict) else None
+        if isinstance(cached_scene, dict):
+            self.collabSceneRev += 1
+            self.collabManager.broadcast_message('scene_patch', {
+                'area_num': int(area_num),
+                'level_name': current_level_name,
+                'rev': self.collabSceneRev,
+                'state': cached_scene,
+            })
+        if isinstance(cached_meta, dict):
+            self.collabMetaRev += 1
+            self.collabManager.broadcast_message('meta_state', {
+                'area_num': int(area_num),
+                'level_name': current_level_name,
+                'rev': self.collabMetaRev,
+                'state': cached_meta,
+            })
 
     def ApplyRemoteOps(self, payload, sender):
         try:
             area_num = int(payload.get('area_num', 0))
         except Exception:
             area_num = 0
+        level_name = self._CollabResolveHostedLevelName(payload.get('level_name')) or self._CollabNormalizeLevelName(payload.get('level_name'))
         ops = payload.get('ops')
         if not isinstance(ops, list) or not ops:
             return
 
-        self._ApplyRemoteOpsToCache(area_num, ops)
+        self._ApplyRemoteOpsToCache(area_num, ops, level_name=level_name)
         try:
-            self._ApplyRemoteMetaOpsToCache(area_num, ops)
+            self._ApplyRemoteMetaOpsToCache(area_num, ops, level_name=level_name)
         except Exception:
             pass
+        if getattr(self.collabManager, 'mode', None) == 'host':
+            self._CollabMarkLevelModified(level_name)
+        if level_name and level_name != self._CollabNormalizeLevelName():
+            return
         if area_num != getattr(globals_.Area, 'areanum', None):
             return
 
@@ -8313,7 +8841,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 pass
             self.collabApplyingRemote = False
 
-    def _ApplyRemoteOpsToCache(self, area_num, ops):
+    def _ApplyRemoteOpsToCache(self, area_num, ops, level_name=None):
         if not hasattr(self, 'collabAreaState'):
             return
         try:
@@ -8323,11 +8851,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if area_num < 1:
             return
 
-        state = self.collabAreaState.get(area_num)
+        level_name = self._CollabResolveHostedLevelName(level_name) or self._CollabNormalizeLevelName(level_name)
+        state_cache = self._CollabSceneCacheForLevel(level_name, create=True)
+        state = state_cache.get(area_num)
         if not isinstance(state, dict):
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
-                self.BroadcastFullStateForArea(area_num)
-                state = self.collabAreaState.get(area_num)
+                self._CollabPrimeLevelCachesFromSource(level_name, area_nums=[area_num])
+                state = state_cache.get(area_num)
         if not isinstance(state, dict):
             return
 
@@ -8416,7 +8946,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 else:
                     sprites.append((ent_id, spr_type, x, y, data if data is not None else default_sprite_data))
 
-    def _ApplyRemoteMetaOpsToCache(self, area_num, ops):
+    def _ApplyRemoteMetaOpsToCache(self, area_num, ops, level_name=None):
         if not hasattr(self, 'collabAreaMetaState'):
             return
         try:
@@ -8428,10 +8958,16 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not isinstance(ops, list) or not ops:
             return
 
-        state = self.collabAreaMetaState.get(area_num)
+        level_name = self._CollabResolveHostedLevelName(level_name) or self._CollabNormalizeLevelName(level_name)
+        meta_cache = self._CollabMetaCacheForLevel(level_name, create=True)
+        state = meta_cache.get(area_num)
+        if not isinstance(state, dict):
+            if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
+                self._CollabPrimeLevelCachesFromSource(level_name, area_nums=[area_num])
+                state = meta_cache.get(area_num)
         if not isinstance(state, dict):
             state = {'zones': [], 'options': {}, 'event_notes': '', 'paths': [], 'entrances': [], 'locations': [], 'comments': []}
-            self.collabAreaMetaState[area_num] = state
+            meta_cache[area_num] = state
 
         entrances = state.setdefault('entrances', [])
         locations = state.setdefault('locations', [])
@@ -9557,10 +10093,20 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.collabHostSessionId = str(host)
             else:
                 self.collabHostSessionId = str(sender)
+            current_level_name = self._CollabNormalizeLevelName(payload.get('current_level_name'))
+            if current_level_name and not self._CollabNormalizeLevelName():
+                self.collabLastLevelName = current_level_name
+            stage_files = payload.get('stage_files')
+            if isinstance(stage_files, list):
+                self.collabKnownHostedStageFiles = [
+                    self._CollabNormalizeLevelName(name)
+                    for name in stage_files
+                    if self._CollabNormalizeLevelName(name)
+                ]
             self._BroadcastCollabNick()
             if self.IsCollabClientMode() and self._StartCollabPatchSync(payload):
                 return
-            self._ScheduleCollabTilesetSync(50)
+            self._MaybeScheduleCollabTilesetSync(50)
             # Request authoritative undo/redo history state from the host.
             if self._CollabHistoryEnabled() and self.IsCollabClientMode():
                 try:
@@ -9629,7 +10175,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.ApplyRemoteMetaState(payload, sender)
             # Tilesets are not part of the meta payload; request them separately.
             if self.collabHostSessionId is None or sender == self.collabHostSessionId:
-                self._ScheduleCollabTilesetSync(150)
+                desired_tilesets = [
+                    str((payload.get('state') or {}).get('options', {}).get(key) or '').strip()
+                    for key in ('tileset0', 'tileset1', 'tileset2', 'tileset3')
+                ]
+                self._MaybeScheduleCollabTilesetSync(150, names=[name for name in desired_tilesets if name])
         elif msg_type == 'hist_sync_req':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 self._CollabHostSendHistoryStateToPeer(sender)
@@ -9681,13 +10231,19 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if self.collabHostSessionId is not None and sender != self.collabHostSessionId:
                 return
             self.ApplyRemoteLevelSwitch(payload)
+        elif msg_type == 'open_hosted_level_request':
+            if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
+                self._CollabHostHandleOpenHostedLevelRequest(payload, sender)
+        elif msg_type == 'open_hosted_level_data':
+            if self.IsCollabClientMode():
+                self._CollabClientHandleHostedLevelData(payload, sender)
         elif msg_type == 'request_full_sync':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 try:
                     target_area = int(payload.get('area_num', getattr(globals_.Area, 'areanum', 1)))
                 except Exception:
                     target_area = getattr(globals_.Area, 'areanum', 1)
-                self.BroadcastFullStateForArea(target_area)
+                self.BroadcastFullStateForArea(target_area, level_name=payload.get('level_name'))
         elif msg_type == 'tileset_sync_request':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 area_num = payload.get('area_num')
@@ -9849,6 +10405,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         area_num = int(payload.get('area_num', 0))
         if area_num < 1:
             return
+        level_name = self._CollabResolveHostedLevelName(payload.get('level_name')) or self._CollabNormalizeLevelName(payload.get('level_name'))
 
         remote_state = payload.get('state')
         if not isinstance(remote_state, dict):
@@ -9859,7 +10416,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             remote_rev = 0
 
         area_num = int(area_num)
-        state_key = (sender, area_num)
+        state_key = self._CollabStateKey(sender, area_num, level_name)
         last_rev = self.collabPeerLastRev.get(state_key, 0)
         if remote_rev and remote_rev <= last_rev:
             return
@@ -9870,8 +10427,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabPeerLastState[state_key] = remote_state
         if remote_rev:
             self.collabPeerLastRev[state_key] = remote_rev
-        self.collabAreaState[area_num] = remote_state
+        self._CollabSceneCacheForLevel(level_name, create=True)[area_num] = remote_state
+        if getattr(self.collabManager, 'mode', None) == 'host':
+            self._CollabMarkLevelModified(level_name)
 
+        if level_name and level_name != self._CollabNormalizeLevelName():
+            return
         if area_num != globals_.Area.areanum:
             return
 
@@ -10423,6 +10984,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             area_num = 0
         if area_num < 1:
             return
+        level_name = self._CollabResolveHostedLevelName(payload.get('level_name')) or self._CollabNormalizeLevelName(payload.get('level_name'))
 
         meta_state = payload.get('state')
         if not isinstance(meta_state, dict):
@@ -10432,15 +10994,19 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             remote_rev = 0
 
-        state_key = (sender, area_num)
+        state_key = self._CollabStateKey(sender, area_num, level_name)
         last_rev = self.collabPeerLastMetaRev.get(state_key, 0)
         if remote_rev and remote_rev <= last_rev:
             return
         if remote_rev:
             self.collabPeerLastMetaRev[state_key] = remote_rev
         self.collabPeerLastMetaState[state_key] = meta_state
-        self.collabAreaMetaState[area_num] = meta_state
+        self._CollabMetaCacheForLevel(level_name, create=True)[area_num] = meta_state
+        if getattr(self.collabManager, 'mode', None) == 'host':
+            self._CollabMarkLevelModified(level_name)
 
+        if level_name and level_name != self._CollabNormalizeLevelName():
+            return
         if area_num != getattr(globals_.Area, 'areanum', None):
             return
         self._ApplyMetaStateToCurrentArea(meta_state)
@@ -10903,23 +11469,23 @@ class ReggieWindow(QtWidgets.QMainWindow):
             path_obj._line_item.update_path()
 
     def ApplyRemoteLevelSwitch(self, payload):
-        level_name = payload.get('level_name')
+        level_name = self._CollabNormalizeLevelName(payload.get('level_name'))
         if not level_name:
             return
 
-        area_num = int(payload.get('area_num', 1))
-        if self.fileSavePath:
-            target_path = os.path.join(os.path.dirname(self.fileSavePath), level_name)
-        else:
-            target_path = os.path.join(globals_.gamedef.GetStageGamePath(), level_name)
+        try:
+            area_num = int(payload.get('area_num', 1))
+        except Exception:
+            area_num = 1
 
-        if not os.path.isfile(target_path):
+        target_path = self._CollabHostedStageFilePath(level_name)
+        if not target_path or not os.path.isfile(target_path):
             return
 
         self.collabApplyingRemote = True
         try:
             if self.LoadLevel(target_path, True, max(1, min(4, area_num))):
-                self.collabLastLevelName = os.path.basename(target_path)
+                self.collabLastLevelName = self._CollabNormalizeLevelName(level_name)
                 self.collabLastSceneSig = hash(repr(self.BuildCollabSceneState()))
         finally:
             self.collabApplyingRemote = False
@@ -10950,7 +11516,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             missing_tilesets = self._GetMissingTilesetsForLevelData(level_data, area_num)
             if missing_tilesets:
                 self.collabPendingSnapshot = (level_data, area_num, sender)
-                self._ScheduleCollabTilesetSync(50)
+                self._MaybeScheduleCollabTilesetSync(50)
                 if hasattr(self, 'hoverLabel'):
                     self.hoverLabel.setText('Waiting for host tilesets: %s' % ', '.join(missing_tilesets))
                 return
@@ -10993,7 +11559,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 pass
             try:
                 if self.IsCollabClientMode():
-                    self._ScheduleCollabTilesetSync(200)
+                    self._MaybeScheduleCollabTilesetSync(200)
             except Exception:
                 pass
 
@@ -13255,7 +13821,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         LoadLevelNames()
         dlg = ChooseLevelNameDialog()
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            self.LoadLevel(dlg.currentlevel, False, 1)
+            level_name = str(dlg.currentlevel or '')
+            if self.IsCollabClientMode():
+                self._CollabRequestHostedLevelOpen(level_name, 1)
+            else:
+                self.LoadLevel(level_name, False, 1)
 
     def _IsReggieRawLevelPath(self, path):
         return bool(path) and str(path).lower().endswith('.rgl')
@@ -13411,6 +13981,20 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if self.CheckDirty(): return
         if not self._EnsureGamePathsForLevelOpen(): return
 
+        if self.IsCollabClientMode():
+            levels = list(getattr(self, 'collabKnownHostedStageFiles', []) or [])
+            if not levels:
+                levels = self._CollabListHostStageFiles()
+                if levels:
+                    self.collabKnownHostedStageFiles = list(levels)
+            if not levels:
+                QtWidgets.QMessageBox.information(self, 'Collaboration', 'The host did not expose any Stage .arc files yet.')
+                return
+            dlg = HostedLevelSelectionDialog('Open hosted level file', levels, self)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and dlg.selected_level:
+                self._CollabRequestHostedLevelOpen(dlg.selected_level, 1)
+            return
+
         filetypes = ''
         filetypes += globals_.trans.string('FileDlgs', 9) + ' (*.arc *.arc.LH *.arc.LZ *.rgl);;'   # *.arc, *arc.LH, *.arc.LZ, *.rgl
         filetypes += globals_.trans.string('FileDlgs', 1) + ' (*.arc);;'            # *.arc
@@ -13421,6 +14005,292 @@ class ReggieWindow(QtWidgets.QMainWindow):
         fn = QtWidgets.QFileDialog.getOpenFileName(self, globals_.trans.string('FileDlgs', 0), '', filetypes)[0]
         if fn == '': return
         self.LoadLevel(str(fn), True, 1)
+
+    def _CollabRequestHostedLevelOpen(self, level_name, area_num=1):
+        if not self.IsCollabClientMode() or not self._CollabEnabled():
+            return False
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return False
+        try:
+            area_num = max(1, min(4, int(area_num)))
+        except Exception:
+            area_num = 1
+        self.collabManager.broadcast_message('open_hosted_level_request', {
+            'level_name': level_name,
+            'area_num': area_num,
+        })
+        if hasattr(self, 'hoverLabel'):
+            self.hoverLabel.setText('Requested hosted level: %s' % level_name)
+        return True
+
+    def _CollabLoadHostedLevelBytes(self, level_name, level_bytes, area_num=1, host_path=''):
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name or not isinstance(level_bytes, (bytes, bytearray)):
+            return False
+        try:
+            area_num = max(1, min(4, int(area_num)))
+        except Exception:
+            area_num = 1
+
+        self.collabApplyingRemote = True
+        try:
+            # Never store the host absolute path locally. Use our local Stage path
+            # if available so code that relies on `fileSavePath` still works.
+            stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+            if stage_dir:
+                self.fileSavePath = os.path.join(stage_dir, *level_name.split('/'))
+            else:
+                self.fileSavePath = str(level_name)
+            self.fileTitle = level_name
+            self.collabLastLevelName = level_name
+            self._CollabSyncCurrentLevelCaches()
+            self.LoadLevelFromNetwork(bytes(level_bytes), area_num)
+            self._CacheCurrentAreaCollabState(include_scene=True, include_meta=True)
+            self.collabLastSceneSig = hash(repr(self.BuildCollabSceneState()))
+            return True
+        finally:
+            self.collabApplyingRemote = False
+
+    def _CollabReadLevelBytesFromPath(self, path):
+        path = str(path or '').strip()
+        if not path or not os.path.isfile(path):
+            return None
+        if self._IsReggieRawLevelPath(path):
+            return self._LoadReggieRawLevel(path)
+        try:
+            with open(path, 'rb') as fileobj:
+                level_data = fileobj.read()
+        except Exception:
+            return None
+        if not level_data:
+            return level_data
+        if (level_data[0] & 0xF0) == 0x40:
+            try:
+                return lh.UncompressLH(level_data)
+            except Exception:
+                return None
+        if level_data.startswith(b"U\xAA8-"):
+            return level_data
+        try:
+            return lz77.UncompressLZ77(level_data)
+        except Exception:
+            return level_data
+
+    def _CollabHostMaterializeLevelBytes(self, level_name):
+        level_name = self._CollabResolveHostedLevelName(level_name) or self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return None
+        current_level_name = self._CollabNormalizeLevelName()
+        if current_level_name == level_name and globals_.Level is not None:
+            try:
+                return globals_.Level.save()
+            except Exception:
+                pass
+
+        target_path = self._CollabHostedStageFilePath(level_name)
+        base_level_data = self._CollabReadLevelBytesFromPath(target_path)
+        if base_level_data is None:
+            return None
+
+        scene_cache = self._CollabSceneCacheForLevel(level_name, create=True)
+        meta_cache = self._CollabMetaCacheForLevel(level_name, create=True)
+        if not scene_cache and not meta_cache:
+            return base_level_data
+
+        original_bytes = None
+        original_area = 1
+        original_path = self.fileSavePath
+        original_title = getattr(self, 'fileTitle', '')
+        original_level_name = self.collabLastLevelName
+        try:
+            if globals_.Level is not None:
+                original_bytes = globals_.Level.save()
+                original_area = int(getattr(globals_.Area, 'areanum', 1) or 1)
+        except Exception:
+            original_bytes = None
+
+        self.collabApplyingRemote = True
+        self.collabSwitchingArea = True
+        try:
+            self.fileSavePath = target_path
+            self.fileTitle = level_name
+            self.collabLastLevelName = level_name
+            self._CollabSyncCurrentLevelCaches()
+            current_bytes = bytes(base_level_data)
+            temp_level = Level_NSMBW()
+            if not temp_level.load(current_bytes, 1):
+                return None
+            area_count = len(temp_level.areas)
+            for area_num in range(1, area_count + 1):
+                self.LoadLevelFromNetwork(current_bytes, area_num)
+                cached_scene = scene_cache.get(area_num)
+                if isinstance(cached_scene, dict):
+                    self.ReplaceAreaObjectsFromState(cached_scene)
+                    self.ReplaceAreaSpritesFromState(cached_scene)
+                    self._CollabPruneDuplicateIdsCurrentArea()
+                cached_meta = meta_cache.get(area_num)
+                if isinstance(cached_meta, dict):
+                    self._ApplyMetaStateToCurrentArea(cached_meta)
+                current_bytes = globals_.Level.save()
+            return current_bytes
+        finally:
+            try:
+                self.fileSavePath = original_path
+                self.fileTitle = original_title
+                self.collabLastLevelName = original_level_name
+                if original_bytes is not None:
+                    self._CollabSyncCurrentLevelCaches()
+                    self.LoadLevelFromNetwork(original_bytes, original_area)
+            except Exception:
+                pass
+            self.collabSwitchingArea = False
+            self.collabApplyingRemote = False
+            self._CollabSyncCurrentLevelCaches()
+
+    def _CollabClientHandleHostedLevelData(self, payload, sender):
+        if self.collabHostSessionId is not None and sender != self.collabHostSessionId:
+            return
+        level_name = self._CollabResolveHostedLevelName(payload.get('level_name')) or self._CollabNormalizeLevelName(payload.get('level_name'))
+        if not level_name:
+            return
+        try:
+            level_bytes = base64.b64decode(payload.get('payload') or '')
+        except Exception:
+            QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to decode the hosted level sent by the host.')
+            return
+        try:
+            area_num = int(payload.get('area_num', 1) or 1)
+        except Exception:
+            area_num = 1
+        host_path = str(payload.get('host_path') or '')
+        if self._CollabLoadHostedLevelBytes(level_name, level_bytes, area_num=area_num, host_path=host_path):
+            if hasattr(self, 'hoverLabel'):
+                self.hoverLabel.setText('Opened hosted level: %s' % level_name)
+
+    def _CollabHostHandleOpenHostedLevelRequest(self, payload, sender):
+        requested_level_name = self._CollabNormalizeLevelName(payload.get('level_name'))
+        level_name = self._CollabResolveHostedLevelName(requested_level_name) or requested_level_name
+        if not level_name:
+            return
+        try:
+            area_num = max(1, min(4, int(payload.get('area_num', 1) or 1)))
+        except Exception:
+            area_num = 1
+        level_bytes = self._CollabHostMaterializeLevelBytes(level_name)
+        if level_bytes is None:
+            self.collabManager.send_message_to(sender, 'chat', {'text': 'Unable to open host level: %s' % requested_level_name})
+            return
+        self.collabManager.send_message_to(sender, 'open_hosted_level_data', {
+            'level_name': level_name,
+            'area_num': area_num,
+            # Keep a stable relative key; clients reconstruct a local path.
+            'host_path': level_name,
+            'payload': base64.b64encode(level_bytes).decode('ascii'),
+        })
+
+    def _CollabWriteLevelBytesToPath(self, target_path, u8_data):
+        target_path = str(target_path or '').strip()
+        if not target_path:
+            return False
+        data = bytes(u8_data or b'')
+        if self._IsReggieRawLevelPath(target_path):
+            if not self._ConfirmIfNullSaveData(data, target_path):
+                return False
+            ok = self._SaveReggieRawLevel(target_path, data)
+            if ok:
+                self._WarnIfFileLooksNull(target_path)
+            return ok
+
+        if target_path.endswith(".arc.LZ"):
+            compressed = lz77.CompressLZ77(data)
+            if compressed is None:
+                QtWidgets.QMessageBox.warning(
+                    None,
+                    globals_.trans.string('Err_Save', 0),
+                    globals_.trans.string('Err_Save', 3, '[file-size]', len(data))
+                )
+                return False
+            data = compressed
+
+        if globals_.EnablePadding:
+            pad_length = globals_.PaddingLength - len(data)
+            if pad_length < 0:
+                QtWidgets.QMessageBox.warning(
+                    None,
+                    globals_.trans.string('Err_Save', 0),
+                    globals_.trans.string('Err_Save', 2, '[orig-len]', len(data), '[pad-len]', globals_.PaddingLength)
+                )
+                return False
+            data += bytes(pad_length)
+
+        if not self._ConfirmIfNullSaveData(data, target_path):
+            return False
+        try:
+            with open(target_path, 'wb') as f:
+                f.write(data)
+        except IOError as e:
+            QtWidgets.QMessageBox.warning(
+                None,
+                globals_.trans.string('Err_Save', 0),
+                globals_.trans.string('Err_Save', 1, '[err1]', e.args[0], '[err2]', e.args[1])
+            )
+            return False
+        self._WarnIfFileLooksNull(target_path)
+        return True
+
+    def _CollabHostOpenModifiedLevel(self, level_name):
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return False
+        target_path = self._CollabHostedStageFilePath(level_name)
+        level_bytes = self._CollabHostMaterializeLevelBytes(level_name)
+        if level_bytes is None:
+            return False
+        return self._CollabLoadHostedLevelBytes(level_name, level_bytes, area_num=1, host_path=target_path)
+
+    def HandleCollabSaveAll(self):
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
+            return False
+        entries = self._CollabModifiedLevelEntries()
+        if not entries:
+            QtWidgets.QMessageBox.information(self, 'Collaboration', 'No collaboration levels were modified in this session.')
+            return False
+
+        dlg = CollaborationSaveAllDialog(entries, self._CollabHostOpenModifiedLevel, self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return False
+
+        failed = []
+        saved = []
+        for entry in entries:
+            level_name = self._CollabNormalizeLevelName(entry.get('level_name'))
+            if not level_name:
+                continue
+            target_path = self._CollabHostedStageFilePath(level_name)
+            level_bytes = self._CollabHostMaterializeLevelBytes(level_name)
+            if level_bytes is None or not target_path or not self._CollabWriteLevelBytesToPath(target_path, level_bytes):
+                failed.append(level_name)
+                continue
+            saved.append(level_name)
+            self._CollabClearModifiedLevel(level_name)
+
+        globals_.Dirty = False
+        globals_.AutoSaveDirty = False
+        self.UpdateTitle()
+        if failed:
+            QtWidgets.QMessageBox.warning(
+                self,
+                'Collaboration',
+                'Saved %d level(s), but failed to save:\n%s' % (len(saved), '\n'.join(failed))
+            )
+            return False
+        QtWidgets.QMessageBox.information(
+            self,
+            'Collaboration',
+            'Saved %d collaboration level(s).' % len(saved)
+        )
+        return True
 
     def HandleSave(self):
         """
@@ -13447,6 +14317,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             setSetting('AutoSaveFilePath', self.fileSavePath)
             setSetting('AutoSaveFileData', 'x')
             self._RememberLastOpenedLevel(self.fileSavePath)
+            self._CollabClearModifiedLevel(self._CollabCurrentLevelName())
             return True
 
         # maybe need to compress the data
@@ -13496,6 +14367,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         setSetting('AutoSaveFilePath', self.fileSavePath)
         setSetting('AutoSaveFileData', 'x')
         self._RememberLastOpenedLevel(self.fileSavePath)
+        self._CollabClearModifiedLevel(self._CollabCurrentLevelName())
         return True
 
     def HandleSaveAs(self, copy = False):
@@ -13539,6 +14411,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.UpdateTitle()
                 self.RecentMenu.AddToList(self.fileSavePath)
                 self._RememberLastOpenedLevel(self.fileSavePath)
+                self._CollabClearModifiedLevel(self._CollabCurrentLevelName())
             return True
 
         # maybe need to compress the data
@@ -13582,6 +14455,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.UpdateTitle()
             self.RecentMenu.AddToList(self.fileSavePath)
             self._RememberLastOpenedLevel(self.fileSavePath)
+            self._CollabClearModifiedLevel(self._CollabCurrentLevelName())
 
         return True
 
@@ -13663,7 +14537,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 pass
 
             # Apply cached state for this area immediately (if we have it).
-            cached = self.collabAreaState.get(target_area)
+            current_level_name = self._CollabCurrentLevelName()
+            cached = self._CollabSceneCacheForLevel(current_level_name, create=True).get(target_area)
             if isinstance(cached, dict):
                 try:
                     self.collabApplyingRemote = True
@@ -13686,7 +14561,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                         pass
                     self.collabApplyingRemote = False
 
-            cached_meta = self.collabAreaMetaState.get(target_area)
+            cached_meta = self._CollabMetaCacheForLevel(current_level_name, create=True).get(target_area)
             if isinstance(cached_meta, dict):
                 try:
                     self._ApplyMetaStateToCurrentArea(cached_meta)
@@ -13699,27 +14574,30 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     self.CollabEnsureCurrentAreaIds()
                 except Exception:
                     pass
-                self.BroadcastFullSceneState()
-                self.BroadcastFullMetaState()
+                self.BroadcastFullSceneState(level_name=current_level_name)
+                self.BroadcastFullMetaState(level_name=current_level_name)
                 try:
-                    self.collabAreaState[int(target_area)] = self.BuildCollabSceneState()
+                    self._CollabSceneCacheForLevel(current_level_name, create=True)[int(target_area)] = self.BuildCollabSceneState()
                 except Exception:
                     pass
                 try:
-                    self.collabAreaMetaState[int(target_area)] = self.BuildCollabMetaState()
+                    self._CollabMetaCacheForLevel(current_level_name, create=True)[int(target_area)] = self.BuildCollabMetaState()
                 except Exception:
                     pass
             else:
                 if self.collabHostSessionId is not None:
                     try:
-                        self.collabPeerLastState[(str(self.collabHostSessionId), target_area)] = self.BuildCollabSceneState()
+                        self.collabPeerLastState[self._CollabStateKey(str(self.collabHostSessionId), target_area, current_level_name)] = self.BuildCollabSceneState()
                     except Exception:
                         pass
-                self.collabManager.broadcast_message('request_full_sync', {'area_num': target_area})
-                self._ScheduleCollabTilesetSync(50)
+                self.collabManager.broadcast_message('request_full_sync', {
+                    'area_num': target_area,
+                    'level_name': current_level_name,
+                })
+                self._MaybeScheduleCollabTilesetSync(50)
 
             self.collabLastSceneSig = hash(repr(self.BuildCollabSceneState()))
-            self.collabLastLevelName = os.path.basename(self.fileSavePath) if self.fileSavePath else None
+            self.collabLastLevelName = self._CollabNormalizeLevelName()
 
     def HandleUpdateLayer0(self, checked):
         """
@@ -14226,6 +15104,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.actions['deletearea'].setEnabled(len(globals_.Level.areas) > 1)
             self.actions['backgrounds'].setEnabled(len(globals_.Area.zones) > 0)
 
+            self.collabLastLevelName = self._CollabNormalizeLevelName()
+            self._CollabSyncCurrentLevelCaches()
             self.UpdateTitle()
             self.levelOverview.Reset()
             self.levelOverview.update()
@@ -14511,6 +15391,39 @@ class ReggieWindow(QtWidgets.QMainWindow):
             # Turn the dirty flag off
             globals_.DirtyOverride -= 1
             dirty_override_set = False
+            self.collabLastLevelName = self._CollabNormalizeLevelName()
+            self._CollabSyncCurrentLevelCaches()
+
+            if hasattr(self, 'collabManager') and self.collabManager.mode is not None and not self.collabApplyingRemote:
+                current_level_name = self._CollabCurrentLevelName()
+                current_area = int(getattr(globals_.Area, 'areanum', areaNum) or areaNum)
+
+                cached_scene = self._CollabSceneCacheForLevel(current_level_name, create=True).get(current_area)
+                if isinstance(cached_scene, dict):
+                    try:
+                        self.collabApplyingRemote = True
+                        self.scene.blockSignals(True)
+                        globals_.DirtyOverride += 1
+                        self.ReplaceAreaObjectsFromState(cached_scene)
+                        self.ReplaceAreaSpritesFromState(cached_scene)
+                        self._CollabPruneDuplicateIdsCurrentArea()
+                    except Exception:
+                        pass
+                    finally:
+                        globals_.DirtyOverride -= 1
+                        try:
+                            self.scene.blockSignals(False)
+                        except Exception:
+                            pass
+                        self.collabApplyingRemote = False
+
+                cached_meta = self._CollabMetaCacheForLevel(current_level_name, create=True).get(current_area)
+                if isinstance(cached_meta, dict):
+                    try:
+                        self._ApplyMetaStateToCurrentArea(cached_meta)
+                    except Exception:
+                        pass
+
             self.UpdateTitle()
 
             # Update UI things
