@@ -4783,6 +4783,70 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _ConfigurePassiveCollabProgressDialog(self, dlg):
+        if dlg is None:
+            return
+        try:
+            dlg.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        except Exception:
+            pass
+        try:
+            dlg.setModal(False)
+        except Exception:
+            pass
+        try:
+            dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        except Exception:
+            pass
+        try:
+            dlg.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        except Exception:
+            pass
+        try:
+            dlg.setWindowFlag(QtCore.Qt.WindowType.WindowDoesNotAcceptFocus, True)
+        except Exception:
+            pass
+
+    def _ShowPassiveCollabProgressDialog(self, dlg):
+        if dlg is None:
+            return
+        preferred_focus = None
+        try:
+            focus_widget = QtWidgets.QApplication.focusWidget()
+            if focus_widget is not None and focus_widget.window() is self:
+                preferred_focus = focus_widget
+        except Exception:
+            preferred_focus = None
+
+        try:
+            dlg.show()
+        except Exception:
+            return
+        self._PositionCollabProgressDialog(dlg)
+
+        def restore_focus():
+            try:
+                dlg.clearFocus()
+            except Exception:
+                pass
+            if preferred_focus is not None:
+                try:
+                    preferred_focus.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+                    return
+                except Exception:
+                    pass
+            try:
+                viewport = self.view.viewport()
+                viewport.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+            except Exception:
+                pass
+            try:
+                self.activateWindow()
+            except Exception:
+                pass
+
+        QtCore.QTimer.singleShot(0, restore_focus)
+
     def _UpdateCollabTilesetProgress(self, label=None):
         state = getattr(self, '_collabTilesetSyncState', None)
         if not isinstance(state, dict):
@@ -4794,8 +4858,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
             dlg.setWindowTitle('Collaboration')
             dlg.setAutoClose(False)
             dlg.setMinimumDuration(0)
+            self._ConfigurePassiveCollabProgressDialog(dlg)
             btn = QtWidgets.QPushButton('Cancel')
             btn.setEnabled(False)
+            try:
+                btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            except Exception:
+                pass
             dlg.setCancelButton(btn)
             self._collabTilesetProgressDialog = dlg
 
@@ -4818,9 +4887,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._FormatCollabBytes(state.get('total_bytes', 0)),
             )
         dlg.setLabelText(label)
-        dlg.show()
-        self._PositionCollabProgressDialog(dlg)
-        self._PositionCollabProgressDialog(dlg)
+        self._ShowPassiveCollabProgressDialog(dlg)
 
     def _ResetCollabTilesetSyncState(self):
         self._collabTilesetSyncState = None
