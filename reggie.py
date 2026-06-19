@@ -41,6 +41,7 @@ if sys.version_info < minimum:
     raise Exception(errormsg)
 
 # Stdlib imports
+import argparse
 import os.path
 import random
 import time
@@ -128,6 +129,63 @@ from collaboration import CollaborationManager
 QPT_AVAILABLE = True
 QPT_INITIALIZED = False
 _qpt_functions = None
+STARTUP_CLI_OPTIONS = {}
+
+
+def _parse_startup_cli_options(argv=None):
+    parser = argparse.ArgumentParser(
+        prog='reggie.py',
+        description='Launch Reggie Next with optional collaboration startup actions.',
+        add_help=True,
+        allow_abbrev=False,
+    )
+    parser.add_argument('level', nargs='?', help='Legacy positional level path (keeps existing interactive startup flow).')
+    parser.add_argument('--level', dest='level_path', help='Open the given level immediately on startup.')
+    parser.add_argument('--collab-host', action='store_true', help='Host a collaboration room after startup.')
+    parser.add_argument('--collab-mode', choices=('lan', 'online'), default='lan', help='Collaboration host mode.')
+    parser.add_argument('--collab-port', type=int, default=35000, help='Port for hosting or joining collaboration.')
+    parser.add_argument('--collab-room-name', default=None, help='Public room name for online hosting.')
+    parser.add_argument('--collab-region', default='EU', help='Public room region for online hosting.')
+    parser.add_argument('--collab-password', default='', help='Password for online hosting.')
+    parser.add_argument('--collab-nick', default=None, help='Local collaboration nickname.')
+    parser.add_argument('--collab-color', default=None, help='Local collaboration highlight color.')
+    parser.add_argument('--collab-join-host', default=None, help='Join a collaboration host directly by IP or hostname.')
+    parser.add_argument('--collab-join-port', type=int, default=None, help='Port for direct collaboration join.')
+
+    args, _unknown = parser.parse_known_args(argv)
+
+    if args.collab_host and args.collab_join_host:
+        parser.error('Use either --collab-host or --collab-join-host, not both.')
+    if args.collab_mode == 'online' and args.collab_host and not str(args.collab_password or ''):
+        parser.error('--collab-password is required when --collab-mode=online.')
+    if args.collab_join_port is not None and not args.collab_join_host:
+        parser.error('--collab-join-port requires --collab-join-host.')
+
+    auto_level_path = str(args.level_path or '').strip() or None
+    legacy_level_path = str(args.level or '').strip() or None
+    collab_nick = str(args.collab_nick or '').strip() or None
+    collab_color = str(args.collab_color or '').strip() or None
+    join_host = str(args.collab_join_host or '').strip() or None
+    join_port = int(args.collab_join_port if args.collab_join_port is not None else args.collab_port)
+    host_port = int(args.collab_port)
+    room_mode = 'public' if args.collab_mode == 'online' else 'lan'
+    default_room_name = "%s's room" % (collab_nick or getattr(globals_, 'CollabNickname', 'Player') or 'Player')
+
+    return {
+        'auto_open_level': auto_level_path is not None,
+        'level_path': auto_level_path or legacy_level_path,
+        'legacy_level_path': legacy_level_path,
+        'collab_host': bool(args.collab_host),
+        'collab_room_mode': room_mode,
+        'collab_port': host_port,
+        'collab_room_name': str(args.collab_room_name or '').strip() or default_room_name,
+        'collab_region': str(args.collab_region or 'EU').strip().upper() or 'EU',
+        'collab_password': str(args.collab_password or ''),
+        'collab_nick': collab_nick,
+        'collab_color': collab_color,
+        'collab_join_host': join_host,
+        'collab_join_port': join_port,
+    }
 
 
 def _get_reggie_base_dir():
@@ -1058,6 +1116,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabHostSessionId = None
         self._collabPatchSyncState = None
         self._collabPatchProgressDialog = None
+        self._collabTilesetSyncState = None
+        self._collabTilesetProgressDialog = None
         self._collabGamePluginSummaryCache = {}
         self._collabOutOps = []
         # Rate-limit outgoing ops so we don't spam the network/UI thread while dragging.
@@ -1195,9 +1255,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
         loaded = False
         self.fileSavePath = None
         self._startupExitRequested = False
-        startup_level_arg = None
-        if len(sys.argv) > 1 and (IsNSMBLevel(sys.argv[1]) or self._IsReggieRawLevelPath(sys.argv[1])):
-            startup_level_arg = sys.argv[1]
+        self._startupCliOptions = dict(STARTUP_CLI_OPTIONS or {})
+        self._startupCliActionsDone = False
+        startup_level_arg = self._GetStartupLevelArg()
+        startup_cli_requested = self._HasStartupCliAutomation()
 
         if globals_.RestoredFromAutoSave:
             autosave_path = str(globals_.AutoSavePath or '')
@@ -1205,9 +1266,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 autosave_path = '__autosave__.rgl'
             loaded = self.LoadLevel(autosave_path, True, 1)
             if not loaded:
-                loaded = self.RunStartupFlow(startup_level_arg)
+                if startup_cli_requested:
+                    loaded = self.RunStartupCliFlow(startup_level_arg)
+                else:
+                    loaded = self.RunStartupFlow(startup_level_arg)
         else:
-            loaded = self.RunStartupFlow(startup_level_arg)
+            if startup_cli_requested:
+                loaded = self.RunStartupCliFlow(startup_level_arg)
+            else:
+                loaded = self.RunStartupFlow(startup_level_arg)
         if self._startupExitRequested:
             globals_.Initializing = False
             return
@@ -1238,6 +1305,63 @@ class ReggieWindow(QtWidgets.QMainWindow):
         # Aaaaaand... initializing is done!
         globals_.Initializing = False
         self.UpdateSaveActionsForCollabMode()
+        self._ScheduleStartupCliActions()
+    def _GetStartupLevelArg(self):
+        cli_level_path = str((getattr(self, '_startupCliOptions', {}) or {}).get('level_path') or '').strip()
+        if cli_level_path:
+            return cli_level_path
+        if len(sys.argv) > 1 and (IsNSMBLevel(sys.argv[1]) or self._IsReggieRawLevelPath(sys.argv[1])):
+            return sys.argv[1]
+        return None
+
+    def _HasStartupCliAutomation(self):
+        options = getattr(self, '_startupCliOptions', {}) or {}
+        return bool(
+            options.get('auto_open_level')
+            or options.get('collab_host')
+            or options.get('collab_join_host')
+        )
+
+    def _ScheduleStartupCliActions(self):
+        options = getattr(self, '_startupCliOptions', {}) or {}
+        if not options:
+            return
+        if not any((
+            options.get('collab_nick'),
+            options.get('collab_color'),
+            options.get('collab_host'),
+            options.get('collab_join_host'),
+        )):
+            return
+        QtCore.QTimer.singleShot(0, self._RunStartupCliActions)
+
+    def _RunStartupCliActions(self):
+        if getattr(self, '_startupCliActionsDone', False):
+            return
+        self._startupCliActionsDone = True
+
+        options = getattr(self, '_startupCliOptions', {}) or {}
+        nick = options.get('collab_nick')
+        color = options.get('collab_color')
+        if nick:
+            self.SetCollabNickname(nick, broadcast=False)
+        if color:
+            self.SetCollabHighlightColor(color, broadcast=False)
+
+        if options.get('collab_host'):
+            config = {
+                'mode': options.get('collab_room_mode', 'lan'),
+                'port': int(options.get('collab_port', 35000) or 35000),
+                'name': options.get('collab_room_name'),
+                'region': options.get('collab_region', 'EU'),
+                'password': options.get('collab_password', ''),
+            }
+            self._StartCollabHostFromConfig(config)
+        elif options.get('collab_join_host'):
+            self._ConnectToCollabDirectHost(
+                options.get('collab_join_host'),
+                int(options.get('collab_join_port', options.get('collab_port', 35000)) or 35000),
+            )
     def QueueZoneSpriteRefresh(self):
         if not hasattr(self, '_zoneSpriteRefreshTimer'):
             return
@@ -4572,6 +4696,178 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'level_name': self._CollabCurrentLevelName(),
         }
 
+    def _BuildCollabTilesetTransferEntries(self, slot_map):
+        grouped = collections.OrderedDict()
+        for slot, name in slot_map or []:
+            name = str(name or '')
+            if not name:
+                continue
+            entry = grouped.get(name)
+            if entry is None:
+                entry = {'name': name, 'slots': []}
+                grouped[name] = entry
+            try:
+                slot = int(slot)
+            except Exception:
+                continue
+            if slot not in entry['slots']:
+                entry['slots'].append(slot)
+
+        entries = []
+        for name, entry in grouped.items():
+            override_path = self._EnsureTilesetOverrideFile(name)
+            if not override_path or not os.path.isfile(override_path):
+                continue
+            try:
+                with open(override_path, 'rb') as f:
+                    data = f.read()
+            except Exception:
+                continue
+            entries.append({
+                'name': name,
+                'slots': list(entry['slots']),
+                'data': data,
+                'size': int(len(data)),
+                'sha1': self._TilesetBytesSha1(data),
+            })
+        return entries
+
+    def _BuildCollabTilesetManifestPayload(self, entries):
+        return {
+            'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0) if globals_.Area is not None else 0,
+            'level_name': self._CollabCurrentLevelName(),
+            'file_count': len(entries),
+            'total_bytes': sum(int(entry.get('size', 0) or 0) for entry in entries),
+            'files': [
+                {
+                    'name': str(entry.get('name') or ''),
+                    'slots': list(map(int, entry.get('slots') or [])),
+                    'size': int(entry.get('size', 0) or 0),
+                    'sha1': str(entry.get('sha1') or ''),
+                }
+                for entry in entries
+                if str(entry.get('name') or '')
+            ],
+        }
+
+    def _CloseCollabTilesetProgressDialog(self):
+        dlg = getattr(self, '_collabTilesetProgressDialog', None)
+        if dlg is None:
+            return
+        try:
+            dlg.close()
+        except Exception:
+            pass
+        try:
+            dlg.deleteLater()
+        except Exception:
+            pass
+        self._collabTilesetProgressDialog = None
+
+    def _PositionCollabProgressDialog(self, dlg):
+        if dlg is None:
+            return
+        try:
+            dlg.adjustSize()
+        except Exception:
+            pass
+        try:
+            top_left = self.frameGeometry().topLeft()
+        except Exception:
+            try:
+                top_left = self.mapToGlobal(QtCore.QPoint(0, 0))
+            except Exception:
+                return
+        try:
+            dlg.move(top_left + QtCore.QPoint(12, 12))
+        except Exception:
+            pass
+
+    def _UpdateCollabTilesetProgress(self, label=None):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return
+
+        dlg = getattr(self, '_collabTilesetProgressDialog', None)
+        if dlg is None:
+            dlg = QtWidgets.QProgressDialog(self)
+            dlg.setWindowTitle('Collaboration')
+            dlg.setAutoClose(False)
+            dlg.setMinimumDuration(0)
+            btn = QtWidgets.QPushButton('Cancel')
+            btn.setEnabled(False)
+            dlg.setCancelButton(btn)
+            self._collabTilesetProgressDialog = dlg
+
+        total = int(state.get('total_bytes') or 0)
+        progress = int(state.get('received_bytes') or 0)
+        if total <= 0:
+            total = max(1, int(state.get('total_files') or 1))
+            progress = int(state.get('received_files') or 0)
+        progress = max(0, min(progress, total))
+
+        dlg.setMaximum(total)
+        dlg.setValue(progress)
+        if label is None:
+            percent = 100.0 if total <= 0 else (float(progress) / float(total)) * 100.0
+            label = 'Downloading host tilesets... %.1f%% (%d/%d files)\n%s / %s' % (
+                percent,
+                int(state.get('received_files') or 0),
+                int(state.get('total_files') or 0),
+                self._FormatCollabBytes(state.get('received_bytes', 0)),
+                self._FormatCollabBytes(state.get('total_bytes', 0)),
+            )
+        dlg.setLabelText(label)
+        dlg.show()
+        self._PositionCollabProgressDialog(dlg)
+        self._PositionCollabProgressDialog(dlg)
+
+    def _ResetCollabTilesetSyncState(self):
+        self._collabTilesetSyncState = None
+        self._CloseCollabTilesetProgressDialog()
+
+    def _StartCollabTilesetSyncProgress(self):
+        if not self.IsCollabClientMode():
+            return
+        self._collabTilesetSyncState = {
+            'expected_files': {},
+            'received_names': set(),
+            'total_files': 0,
+            'total_bytes': 0,
+            'received_files': 0,
+            'received_bytes': 0,
+        }
+        self._UpdateCollabTilesetProgress('Requesting host tilesets...')
+
+    def _TrackReceivedCollabTileset(self, name, data):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return
+        name = str(name or '')
+        if not name:
+            return
+        received_names = state.get('received_names')
+        if not isinstance(received_names, set):
+            received_names = set()
+            state['received_names'] = received_names
+        if name in received_names:
+            return
+
+        expected = (state.get('expected_files') or {}).get(name) or {}
+        received_names.add(name)
+        state['received_files'] = int(state.get('received_files', 0) or 0) + 1
+        state['received_bytes'] = int(state.get('received_bytes', 0) or 0) + max(
+            0,
+            int(expected.get('size', 0) or len(data or b'')),
+        )
+
+        total_files = int(state.get('total_files', 0) or 0)
+        if total_files > 0 and int(state.get('received_files', 0) or 0) >= total_files:
+            self._UpdateCollabTilesetProgress('Downloaded host tilesets.')
+            self._ResetCollabTilesetSyncState()
+            return
+        self._UpdateCollabTilesetProgress()
+
     def _ApplyCollabTilesetBytes(self, name, data, slots=None, broadcast=False, target_peer=None):
         """
         Stores the tileset in the collab cache, reloads it locally,
@@ -4639,6 +4935,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         if globals_.Area is None:
             return
+        self._StartCollabTilesetSyncProgress()
         try:
             self.collabManager.broadcast_message('tileset_sync_request', {
                 'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0),
@@ -4670,21 +4967,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         if not slot_map:
             slot_map = [(slot, self._GetTilesetNameForSlot(slot)) for slot in range(4)]
+        entries = self._BuildCollabTilesetTransferEntries(slot_map)
+        manifest = self._BuildCollabTilesetManifestPayload(entries)
+        try:
+            self.collabManager.send_message_to(peer_session_id, 'tileset_manifest', manifest)
+        except Exception:
+            pass
 
-        for slot, name in slot_map:
-            if not name:
-                continue
-
-            override_path = self._EnsureTilesetOverrideFile(name)
-            if not override_path or not os.path.isfile(override_path):
-                continue
-            try:
-                with open(override_path, 'rb') as f:
-                    data = f.read()
-            except Exception:
-                continue
-
-            payload = self._PackTilesetPayload(name, data, slots=[int(slot)])
+        for entry in entries:
+            payload = self._PackTilesetPayload(entry['name'], entry['data'], slots=entry.get('slots'))
             try:
                 if self.collabManager.send_message_to(peer_session_id, 'tileset_data', payload):
                     continue
@@ -4707,19 +4998,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if globals_.Area is None:
             return
 
-        for slot in range(4):
-            name = self._GetTilesetNameForSlot(slot)
-            if not name:
-                continue
-            override_path = self._EnsureTilesetOverrideFile(name)
-            if not override_path or not os.path.isfile(override_path):
-                continue
-            try:
-                with open(override_path, 'rb') as f:
-                    data = f.read()
-            except Exception:
-                continue
-            payload = self._PackTilesetPayload(name, data, slots=self._GetTilesetSlotsForName(name))
+        entries = self._BuildCollabTilesetTransferEntries(
+            [(slot, self._GetTilesetNameForSlot(slot)) for slot in range(4)]
+        )
+        try:
+            self.collabManager.broadcast_message('tileset_manifest', self._BuildCollabTilesetManifestPayload(entries))
+        except Exception:
+            pass
+        for entry in entries:
+            payload = self._PackTilesetPayload(entry['name'], entry['data'], slots=entry.get('slots'))
             try:
                 self.collabManager.broadcast_message('tileset_data', payload)
             except Exception:
@@ -5098,12 +5385,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return None
         return self.LoadLevel(dlg.currentlevel, False, 1)
 
-    def _StartupOpenLevelFromFile(self, startup_level_arg=None):
+    def _StartupOpenLevelFromFile(self, startup_level_arg=None, interactive=True):
         if not self._EnsureGamePathsForLevelOpen():
             return None
 
         if startup_level_arg and os.path.isfile(str(startup_level_arg)):
             return self.LoadLevel(str(startup_level_arg), True, 1)
+        if startup_level_arg and not interactive:
+            return False
 
         filetypes = ''
         filetypes += globals_.trans.string('FileDlgs', 9) + ' (*.arc *.arc.LH *.arc.LZ *.rgl);;'
@@ -5169,6 +5458,19 @@ class ReggieWindow(QtWidgets.QMainWindow):
             else:
                 self._startupExitRequested = True
                 return False
+
+    def RunStartupCliFlow(self, startup_level_arg=None):
+        options = getattr(self, '_startupCliOptions', {}) or {}
+        if startup_level_arg:
+            loaded = self._StartupOpenLevelFromFile(startup_level_arg, interactive=False)
+            if loaded:
+                return True
+            if options.get('auto_open_level'):
+                print('[CLI] Warning: unable to open startup level: %s' % str(startup_level_arg))
+
+        if globals_.Level is None or globals_.Area is None:
+            return self.LoadLevel(None, False, 1)
+        return True
 
     def HandleCollaborationStatus(self, message):
         self.UpdateSaveActionsForCollabMode()
@@ -5443,10 +5745,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         dlg.setValue(progress)
         if label is None:
             percent = 100.0 if total <= 0 else (float(progress) / float(total)) * 100.0
-            label = 'Downloading host patch... %.1f%% (%d/%d files)' % (
+            label = 'Downloading host patch... %.1f%% (%d/%d files)\n%s / %s' % (
                 percent,
                 int(state.get('received_files') or 0),
                 int(state.get('total_files') or 0),
+                self._FormatCollabBytes(state.get('received_bytes', 0)),
+                self._FormatCollabBytes(state.get('total_bytes', 0)),
             )
         dlg.setLabelText(label)
         dlg.show()
@@ -5853,21 +6157,33 @@ class ReggieWindow(QtWidgets.QMainWindow):
         dlg = CollaborationHostDialog(self, 35000, default_mode=default_mode, default_name=default_name)
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
-        config = dlg.selectedConfig()
+        self._StartCollabHostFromConfig(dlg.selectedConfig())
+
+    def _StartCollabHostFromConfig(self, config):
+        config = dict(config or {})
+        raw_mode = str(config.get('mode', 'lan') or 'lan').strip().lower()
+        room_mode = 'public' if raw_mode in ('online', 'public') else 'lan'
         port = int(config.get('port', 35000) or 35000)
+        if room_mode == 'public':
+            config['name'] = str(config.get('name') or ("%s's room" % str(getattr(self, 'collabSelfNick', getattr(globals_, 'CollabNickname', 'Player')) or 'Player'))).strip()
+            config['region'] = str(config.get('region') or 'EU').strip().upper() or 'EU'
+            config['password'] = str(config.get('password') or '')
+        config['mode'] = room_mode
+        config['port'] = port
         self.collabManager.set_local_nickname(getattr(self, 'collabSelfNick', getattr(globals_, 'CollabNickname', 'Player')))
         self.collabManager.set_local_highlight_color(getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
         try:
-            self.collabManager.start_host(port, room_mode=config.get('mode', 'lan'), public_room_config=config)
+            self.collabManager.start_host(port, room_mode=room_mode, public_room_config=config)
         except (OSError, ValueError) as e:
             try:
                 self.collabManager.stop()
             except Exception:
                 pass
             QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to host room:\n%s' % str(e))
-            return
+            return False
         self.BroadcastFullLevelSnapshot()
         self._RefreshCollabUi()
+        return True
 
     def HandleCollabJoin(self):
         default_source = str(setting('CollabJoinSource', 'lan') or 'lan')
@@ -5928,6 +6244,25 @@ class ReggieWindow(QtWidgets.QMainWindow):
         # Do not broadcast immediately on join: wait for host snapshot to avoid
         # racing initial state with client's local copy.
         self._RefreshCollabUi()
+
+    def _ConnectToCollabDirectHost(self, host, port, source='lan'):
+        host = str(host or '').strip()
+        port = int(port or 35000)
+        host_info = CollaborationManager.probe_host(host, port)
+        if self._HasUsableCollabHostGameInfo(host_info) and not self._EnsureCollabGameMatchesHost(host_info):
+            return False
+        self.collabManager.set_local_nickname(getattr(self, 'collabSelfNick', getattr(globals_, 'CollabNickname', 'Player')))
+        self.collabManager.set_local_highlight_color(getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
+        try:
+            self.collabManager.connect_to_host(host, port)
+        except OSError as e:
+            error_text = str(e)
+            if str(source or '').strip().lower() == 'online':
+                error_text += '\n\nThis room is expected to be reachable directly. If you are outside the LAN, make sure the host port is open in the firewall/router.'
+            QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to join room:\n%s' % error_text)
+            return False
+        self._RefreshCollabUi()
+        return True
 
     def HandleCollabStop(self):
         if hasattr(self, 'collabManager'):
@@ -9034,13 +9369,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             state['total_bytes'] = total_bytes if total_bytes > 0 else sum(
                 max(0, int(info.get('size', 0) or 0)) for info in expected_files.values()
             )
-            self._UpdateCollabPatchProgress(
-                'Downloading host patch for %s\n%s across %d files' % (
-                    str(state.get('host_info', {}).get('game_name') or state.get('game_id') or 'host game'),
-                    self._FormatCollabBytes(state.get('total_bytes', 0)),
-                    int(state.get('total_files', 0) or 0),
-                )
-            )
+            self._UpdateCollabPatchProgress()
             return
 
         if msg_type == 'patch_file_data':
@@ -9082,12 +9411,54 @@ class ReggieWindow(QtWidgets.QMainWindow):
             state['received_paths'].add(target_path)
             state['received_files'] = int(state.get('received_files', 0) or 0) + 1
             state['received_bytes'] = int(state.get('received_bytes', 0) or 0) + len(data)
-            self._UpdateCollabPatchProgress('Downloading host patch file:\n%s' % target_path)
+            self._UpdateCollabPatchProgress(
+                'Downloading host patch file:\n%s\n%d/%d files, %s / %s' % (
+                    target_path,
+                    int(state.get('received_files', 0) or 0),
+                    int(state.get('total_files', 0) or 0),
+                    self._FormatCollabBytes(state.get('received_bytes', 0)),
+                    self._FormatCollabBytes(state.get('total_bytes', 0)),
+                )
+            )
             return
 
         if msg_type == 'patch_sync_done':
             if self.IsCollabClientMode():
                 self._FinalizeCollabPatchSync(payload)
+            return
+
+        if msg_type == 'tileset_manifest':
+            if not self.IsCollabClientMode():
+                return
+            files = payload.get('files') or []
+            expected_files = {}
+            total_bytes = int(payload.get('total_bytes', 0) or 0)
+            for entry in files:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get('name') or '').strip()
+                if not name:
+                    continue
+                expected_files[name] = {
+                    'size': int(entry.get('size', 0) or 0),
+                    'sha1': str(entry.get('sha1') or ''),
+                }
+            self._collabTilesetSyncState = {
+                'expected_files': expected_files,
+                'received_names': set(),
+                'total_files': int(payload.get('file_count', len(expected_files)) or len(expected_files)),
+                'total_bytes': total_bytes if total_bytes > 0 else sum(
+                    max(0, int(info.get('size', 0) or 0)) for info in expected_files.values()
+                ),
+                'received_files': 0,
+                'received_bytes': 0,
+            }
+            self._UpdateCollabTilesetProgress(
+                'Downloading host tilesets\n%s across %d files' % (
+                    self._FormatCollabBytes(self._collabTilesetSyncState.get('total_bytes', 0)),
+                    int(self._collabTilesetSyncState.get('total_files', 0) or 0),
+                )
+            )
             return
 
         if globals_.Area is None or globals_.Level is None:
@@ -9260,6 +9631,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         elif msg_type in ('tileset_data', 'tileset_update'):
             name, data, slots = self._DecodeTilesetPayload(payload)
             if name and data:
+                if msg_type == 'tileset_data':
+                    self._TrackReceivedCollabTileset(name, data)
                 self._ApplyCollabTilesetBytes(name, data, slots=slots, broadcast=False)
                 try:
                     self.TryApplyPendingRemoteSnapshot()
@@ -16431,6 +16804,9 @@ def main():
     """
     Main startup function for Reggie
     """
+
+    global STARTUP_CLI_OPTIONS
+    STARTUP_CLI_OPTIONS = _parse_startup_cli_options(sys.argv[1:])
 
     # set High-DPI-Displays-related attributes before creating an application
     # QtGui.QGuiApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
