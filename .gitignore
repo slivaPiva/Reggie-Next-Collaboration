@@ -21,6 +21,7 @@ sdist/
 var/
 Backups/
 collab_tilesets/
+reggiedata/patches_online
 *.egg-info/
 .installed.cfg
 *.egg
