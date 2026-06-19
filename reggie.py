@@ -7223,27 +7223,28 @@ class ReggieWindow(QtWidgets.QMainWindow):
             stage_abs = None
 
         try:
-            for root, _dirs, filenames in os.walk(stage_dir):
-                for filename in filenames:
-                    if not filename:
-                        continue
-                    lower_name = filename.lower()
-                    if not (lower_name.endswith('.arc') or lower_name.endswith('.arc.lz') or lower_name.endswith('.arc.lh')):
-                        continue
-                    full_path = os.path.join(root, filename)
-                    if not os.path.isfile(full_path):
-                        continue
-                    try:
-                        rel = os.path.relpath(full_path, stage_dir)
-                    except Exception:
-                        rel = filename
-                    rel = rel.replace('\\', '/')
-                    # extra safety: ignore anything escaping Stage
-                    if rel.startswith('../') or rel.startswith('..\\'):
-                        continue
-                    rel = self._CollabNormalizeLevelName(rel)
-                    if rel:
-                        files.append(rel)
+            filenames = os.listdir(stage_dir)
+            for filename in filenames:
+                if not filename:
+                    continue
+                lower_name = filename.lower()
+                if not (lower_name.endswith('.arc') or lower_name.endswith('.arc.lz') or lower_name.endswith('.arc.lh')):
+                    continue
+                # Так как мы ищем только в корне, root — это всегда stage_dir
+                full_path = os.path.join(stage_dir, filename)
+                if not os.path.isfile(full_path):
+                    continue
+                try:
+                    rel = os.path.relpath(full_path, stage_dir)
+                except Exception:
+                    rel = filename
+                rel = rel.replace('\\', '/')
+                # extra safety: ignore anything escaping Stage
+                if rel.startswith('../') or rel.startswith('..\\'):
+                    continue
+                rel = self._CollabNormalizeLevelName(rel)
+                if rel:
+                    files.append(rel)
         except Exception:
             return []
         files = sorted(set(files), key=lambda name: name.lower())
