@@ -1538,6 +1538,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabTilesetSyncTimer = QtCore.QTimer(self)
         self._collabTilesetSyncTimer.setSingleShot(True)
         self._collabTilesetSyncTimer.timeout.connect(self._RequestHostTilesetsNow)
+        self._collabTilesetApplyTimer = QtCore.QTimer(self)
+        self._collabTilesetApplyTimer.setSingleShot(True)
+        self._collabTilesetApplyTimer.timeout.connect(self._ProcessPendingTilesetPayloadBatch)
         self._collabPendingTilesetPayloads = []
 
         # set up actions and menus
@@ -5783,7 +5786,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         blocked = False
         if self._CollabTilesetSyncInProgress():
             blocked = True
-            reason = 'Downloading host tilesets...'
+            tileset_state = getattr(self, '_collabTilesetSyncState', None)
+            if str((tileset_state or {}).get('phase') or 'download') == 'apply':
+                reason = 'Applying host tilesets...'
+            else:
+                reason = 'Downloading host tilesets...'
         elif bool(getattr(self, '_collabAwaitingInitialSceneState', False)):
             blocked = True
             reason = 'Synchronizing host objects...'
@@ -5854,28 +5861,44 @@ class ReggieWindow(QtWidgets.QMainWindow):
             dlg.setCancelButton(btn)
             self._collabTilesetProgressDialog = dlg
 
-        total = int(state.get('total_bytes') or 0)
-        progress = int(state.get('received_bytes') or 0)
-        if total <= 0:
-            total = max(1, int(state.get('total_files') or 1))
-            progress = int(state.get('received_files') or 0)
-        progress = max(0, min(progress, total))
-
-        dlg.setMaximum(total)
-        dlg.setValue(progress)
-        if label is None:
-            percent = 100.0 if total <= 0 else (float(progress) / float(total)) * 100.0
-            label = 'Downloading host tilesets... %.1f%% (%d/%d files)\n%s / %s' % (
-                percent,
-                int(state.get('received_files') or 0),
-                int(state.get('total_files') or 0),
-                self._FormatCollabBytes(state.get('received_bytes', 0)),
-                self._FormatCollabBytes(state.get('total_bytes', 0)),
-            )
+        phase = str(state.get('phase') or 'download')
+        if phase == 'apply':
+            total = max(1, int(state.get('apply_total') or 0) or int(state.get('total_files') or 1))
+            progress = int(state.get('applied_files') or 0)
+            progress = max(0, min(progress, total))
+            dlg.setMaximum(total)
+            dlg.setValue(progress)
+            if label is None:
+                label = 'Applying host tilesets... %d/%d files' % (
+                    int(state.get('applied_files') or 0),
+                    total,
+                )
+        else:
+            total = int(state.get('total_bytes') or 0)
+            progress = int(state.get('received_bytes') or 0)
+            if total <= 0:
+                total = max(1, int(state.get('total_files') or 1))
+                progress = int(state.get('received_files') or 0)
+            progress = max(0, min(progress, total))
+            dlg.setMaximum(total)
+            dlg.setValue(progress)
+            if label is None:
+                percent = 100.0 if total <= 0 else (float(progress) / float(total)) * 100.0
+                label = 'Downloading host tilesets... %.1f%% (%d/%d files)\n%s / %s' % (
+                    percent,
+                    int(state.get('received_files') or 0),
+                    int(state.get('total_files') or 0),
+                    self._FormatCollabBytes(state.get('received_bytes', 0)),
+                    self._FormatCollabBytes(state.get('total_bytes', 0)),
+                )
         dlg.setLabelText(label)
         self._ShowPassiveCollabProgressDialog(dlg)
 
     def _ResetCollabTilesetSyncState(self):
+        try:
+            self._collabTilesetApplyTimer.stop()
+        except Exception:
+            pass
         self._collabTilesetSyncState = None
         self._CloseCollabTilesetProgressDialog()
         self._RefreshCollabInteractionBlock()
@@ -5890,6 +5913,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'total_bytes': 0,
             'received_files': 0,
             'received_bytes': 0,
+            'phase': 'download',
+            'apply_queue': collections.deque(),
+            'apply_total': 0,
+            'applied_files': 0,
         }
         self._RefreshCollabInteractionBlock()
         self._UpdateCollabTilesetProgress('Requesting host tilesets...')
@@ -5922,6 +5949,106 @@ class ReggieWindow(QtWidgets.QMainWindow):
             state['complete'] = True
             return
         self._UpdateCollabTilesetProgress()
+
+    def _BuildPendingTilesetApplyQueue(self):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return 0
+        if globals_.Area is None or globals_.Level is None:
+            return 0
+
+        pending = list(self._collabPendingTilesetPayloads)
+        self._collabPendingTilesetPayloads = []
+        latest_by_name = collections.OrderedDict()
+        for payload, _sender in pending:
+            name, data, slots = self._DecodeTilesetPayload(payload)
+            if name and data:
+                latest_by_name[str(name)] = (dict(payload or {}), data, slots)
+
+        queue_ = state.get('apply_queue')
+        if not isinstance(queue_, collections.deque):
+            queue_ = collections.deque()
+            state['apply_queue'] = queue_
+
+        added = 0
+        for _name, (payload, _data, _slots) in latest_by_name.items():
+            queue_.append(payload)
+            added += 1
+        if added > 0:
+            state['apply_total'] = int(state.get('apply_total', 0) or 0) + added
+        return added
+
+    def _BeginDeferredCollabTilesetApply(self):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return
+        state['phase'] = 'apply'
+        self._RefreshCollabInteractionBlock()
+        self._BuildPendingTilesetApplyQueue()
+        self._UpdateCollabTilesetProgress()
+        try:
+            self._collabTilesetApplyTimer.start(0)
+        except Exception:
+            self._ProcessPendingTilesetPayloadBatch()
+
+    def _CompleteDeferredCollabTilesetApply(self):
+        self._UpdateCollabTilesetProgress('Applied host tilesets.')
+        self._ResetCollabTilesetSyncState()
+        try:
+            self._CollabEnsureClientFollowsHostLevel()
+        except Exception:
+            pass
+        try:
+            QtCore.QTimer.singleShot(0, self.TryApplyPendingRemoteSnapshot)
+        except Exception:
+            pass
+
+    def _ProcessPendingTilesetPayloadBatch(self):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return
+
+        state['phase'] = 'apply'
+        if globals_.Area is None or globals_.Level is None:
+            try:
+                self._collabTilesetApplyTimer.start(50)
+            except Exception:
+                pass
+            return
+
+        queue_ = state.get('apply_queue')
+        if not isinstance(queue_, collections.deque):
+            queue_ = collections.deque()
+            state['apply_queue'] = queue_
+        if not queue_:
+            self._BuildPendingTilesetApplyQueue()
+            queue_ = state.get('apply_queue')
+        if not queue_:
+            self._CompleteDeferredCollabTilesetApply()
+            return
+
+        start_time = time.monotonic()
+        processed_any = False
+        while queue_:
+            payload = queue_.popleft()
+            name, data, slots = self._DecodeTilesetPayload(payload)
+            if name and data:
+                self._ApplyCollabTilesetBytes(name, data, slots=slots, broadcast=False)
+                state['applied_files'] = int(state.get('applied_files', 0) or 0) + 1
+                processed_any = True
+            if processed_any and (time.monotonic() - start_time) >= 0.03:
+                break
+
+        self._UpdateCollabTilesetProgress()
+        if queue_:
+            self._collabTilesetApplyTimer.start(0)
+            return
+
+        if self._BuildPendingTilesetApplyQueue() > 0:
+            self._collabTilesetApplyTimer.start(0)
+            return
+
+        self._CompleteDeferredCollabTilesetApply()
 
     def _ApplyCollabTilesetBytes(self, name, data, slots=None, broadcast=False, target_peer=None):
         """
@@ -11200,6 +11327,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 ),
                 'received_files': 0,
                 'received_bytes': 0,
+                'phase': 'download',
+                'apply_queue': collections.deque(),
+                'apply_total': 0,
+                'applied_files': 0,
             }
             self._UpdateCollabTilesetProgress(
                 'Downloading host tilesets\n%s across %d files' % (
@@ -11207,6 +11338,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     int(self._collabTilesetSyncState.get('total_files', 0) or 0),
                 )
             )
+            if int(self._collabTilesetSyncState.get('total_files', 0) or 0) <= 0:
+                self._BeginDeferredCollabTilesetApply()
             return
 
         if globals_.Area is None or globals_.Level is None:
@@ -11479,12 +11612,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     received_files = int((sync_state or {}).get('received_files', 0) or 0)
                     if msg_type == 'tileset_data' and total_files > 0 and received_files >= total_files:
                         try:
-                            self._ApplyPendingTilesetPayloads()
-                        except Exception:
-                            pass
-                        self._ResetCollabTilesetSyncState()
-                        try:
-                            self._CollabEnsureClientFollowsHostLevel()
+                            self._BeginDeferredCollabTilesetApply()
                         except Exception:
                             pass
                 else:
