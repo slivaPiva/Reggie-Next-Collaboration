@@ -7466,7 +7466,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         for entry, raw in download_entries:
             payload = {
                 'game_id': game_id,
-                'path': entry['target_path'],
+                'path': entry['path'],
                 'size': int(len(raw)),
                 'sha1': str(entry.get('sha1') or self._TilesetBytesSha1(raw)),
                 'data': base64.b64encode(zlib.compress(raw, 6)).decode('ascii'),
