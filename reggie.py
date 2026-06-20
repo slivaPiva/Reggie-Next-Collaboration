@@ -1418,6 +1418,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabPendingSnapshot = None
         self.collabPendingMessages = collections.deque()
         self.collabHostSessionId = None
+        self._collabHostCurrentLevelName = ''
+        self._collabHostCurrentAreaNum = 1
         self.collabKnownHostedStageFiles = []
         self.collabModifiedLevels = collections.OrderedDict()
         self._collabPatchSyncState = None
@@ -1514,6 +1516,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabPingTimer.timeout.connect(self._UpdateCollabPings)
         self._collabSessionRestoreState = None
         self._collabDownloadedOnlineGameId = ''
+        self._collabInteractionBlocked = False
+        self._collabInteractionBlockReason = ''
+        self._collabAwaitingInitialSceneState = False
+        self._collabAwaitingInitialLevelName = ''
+        self._collabAwaitingInitialAreaNum = 0
         self._collabStopping = False
         self.collabManager.set_local_nickname(self.collabSelfNick)
         self.collabManager.set_local_highlight_color(self.collabSelfHighlightColor)
@@ -3366,6 +3373,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         sid = str(sender or '')
         if not sid:
             return
+        if sid == str(self._CollabLocalSessionId() or ''):
+            return
 
         nick = str(payload.get('nick') or '').strip()
         if nick:
@@ -3498,6 +3507,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         sid = str(sender or '')
         if not sid:
+            return
+        if sid == str(self._CollabLocalSessionId() or ''):
             return
 
         try:
@@ -5764,6 +5775,64 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         QtCore.QTimer.singleShot(0, restore_focus)
 
+    def _CollabTilesetSyncInProgress(self):
+        return isinstance(getattr(self, '_collabTilesetSyncState', None), dict)
+
+    def _RefreshCollabInteractionBlock(self):
+        reason = ''
+        blocked = False
+        if self._CollabTilesetSyncInProgress():
+            blocked = True
+            reason = 'Downloading host tilesets...'
+        elif bool(getattr(self, '_collabAwaitingInitialSceneState', False)):
+            blocked = True
+            reason = 'Synchronizing host objects...'
+        self._SetCollabInteractionBlocked(blocked, reason)
+
+    def _BeginCollabInitialSceneSync(self, level_name, area_num):
+        self._collabAwaitingInitialSceneState = True
+        self._collabAwaitingInitialLevelName = self._CollabNormalizeLevelName(level_name)
+        try:
+            self._collabAwaitingInitialAreaNum = max(1, min(4, int(area_num)))
+        except Exception:
+            self._collabAwaitingInitialAreaNum = 1
+        self._RefreshCollabInteractionBlock()
+
+    def _EndCollabInitialSceneSync(self):
+        self._collabAwaitingInitialSceneState = False
+        self._collabAwaitingInitialLevelName = ''
+        self._collabAwaitingInitialAreaNum = 0
+        self._RefreshCollabInteractionBlock()
+
+    def _SetCollabInteractionBlocked(self, blocked, reason=''):
+        blocked = bool(blocked)
+        reason = str(reason or '')
+        self._collabInteractionBlocked = blocked
+        self._collabInteractionBlockReason = reason
+
+        for widget_name in ('view', 'creationTabs', 'areaComboBox'):
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                continue
+            try:
+                widget.setEnabled(not blocked)
+            except Exception:
+                pass
+
+        try:
+            if blocked:
+                self.setCursor(QtCore.Qt.CursorShape.WaitCursor)
+            else:
+                self.unsetCursor()
+        except Exception:
+            pass
+
+        if hasattr(self, 'hoverLabel'):
+            try:
+                self.hoverLabel.setText(reason if blocked else '')
+            except Exception:
+                pass
+
     def _UpdateCollabTilesetProgress(self, label=None):
         state = getattr(self, '_collabTilesetSyncState', None)
         if not isinstance(state, dict):
@@ -5809,6 +5878,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
     def _ResetCollabTilesetSyncState(self):
         self._collabTilesetSyncState = None
         self._CloseCollabTilesetProgressDialog()
+        self._RefreshCollabInteractionBlock()
 
     def _StartCollabTilesetSyncProgress(self):
         if not self.IsCollabClientMode():
@@ -5821,6 +5891,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'received_files': 0,
             'received_bytes': 0,
         }
+        self._RefreshCollabInteractionBlock()
         self._UpdateCollabTilesetProgress('Requesting host tilesets...')
 
     def _TrackReceivedCollabTileset(self, name, data):
@@ -5848,7 +5919,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         total_files = int(state.get('total_files', 0) or 0)
         if total_files > 0 and int(state.get('received_files', 0) or 0) >= total_files:
             self._UpdateCollabTilesetProgress('Downloaded host tilesets.')
-            self._ResetCollabTilesetSyncState()
+            state['complete'] = True
             return
         self._UpdateCollabTilesetProgress()
 
@@ -6063,10 +6134,48 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         pending = list(self._collabPendingTilesetPayloads)
         self._collabPendingTilesetPayloads = []
-        for payload, _sender in pending:
+        latest_by_name = collections.OrderedDict()
+        for payload, sender in pending:
+            name, data, slots = self._DecodeTilesetPayload(payload)
+            if name and data:
+                latest_by_name[str(name)] = (payload, sender, data, slots)
+        for _name, (payload, _sender, _data, _slots) in latest_by_name.items():
             name, data, slots = self._DecodeTilesetPayload(payload)
             if name and data:
                 self._ApplyCollabTilesetBytes(name, data, slots=slots, broadcast=False)
+
+    def _CollabAdoptHostedLevelIdentity(self, level_name):
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return False
+        stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+        if stage_dir:
+            self.fileSavePath = os.path.join(stage_dir, *level_name.split('/'))
+        else:
+            self.fileSavePath = str(level_name)
+        self.fileTitle = level_name
+        self.collabLastLevelName = level_name
+        self._CollabSyncCurrentLevelCaches()
+        return True
+
+    def _CollabEnsureClientFollowsHostLevel(self):
+        if not self.IsCollabClientMode() or not self._CollabEnabled():
+            return False
+        host_level_name = self._CollabNormalizeLevelName(getattr(self, '_collabHostCurrentLevelName', '') or '')
+        if not host_level_name:
+            return False
+        try:
+            host_area_num = max(1, min(4, int(getattr(self, '_collabHostCurrentAreaNum', 1) or 1)))
+        except Exception:
+            host_area_num = 1
+        local_level_name = self._CollabNormalizeLevelName(self._CollabCurrentLevelName())
+        try:
+            local_area_num = int(getattr(getattr(globals_, 'Area', None), 'areanum', 0) or 0)
+        except Exception:
+            local_area_num = 0
+        if local_level_name == host_level_name and local_area_num == host_area_num:
+            return False
+        return bool(self._CollabRequestHostedLevelOpen(host_level_name, host_area_num))
 
     def _GetTilesetNamesFromLevelData(self, level_data, area_num):
         names = []
@@ -7003,6 +7112,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.TryApplyPendingRemoteSnapshot()
         except Exception:
             pass
+        try:
+            self._CollabEnsureClientFollowsHostLevel()
+        except Exception:
+            pass
 
     def _HostSendPatchFilesToPeer(self, peer_session_id, game_def_id=None):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
@@ -7097,6 +7210,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'game_patch_total_bytes': int(summary.get('total_bytes', 0) or 0),
             'stage_files': self._CollabListHostStageFiles(),
             'current_level_name': self._CollabCurrentLevelName(),
+            'current_area_num': int(getattr(getattr(globals_, 'Area', None), 'areanum', 1) or 1),
         }
 
     def _HasUsableCollabHostGameInfo(self, host_info):
@@ -7461,6 +7575,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if hasattr(self, 'collabManager'):
                 self.collabManager.stop()
             self._ResetCollabPatchSyncState(cleanup_staging=True)
+            self._ResetCollabTilesetSyncState()
+            self._EndCollabInitialSceneSync()
             try:
                 self._CollabClearRemoteSelections()
             except Exception:
@@ -7966,6 +8082,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not hasattr(self, 'collabPendingMessages') or not self.collabPendingMessages:
             return False
         if self._CollabPatchSyncInProgress():
+            return False
+        if self._CollabTilesetSyncInProgress():
             return False
         if self.collabApplyingRemote or self.collabApplyingRemoteHistory or getattr(self, 'collabSwitchingArea', False):
             return False
@@ -9183,6 +9301,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         if self.collabApplyingRemote or self.collabApplyingRemoteHistory or getattr(self, 'collabSwitchingArea', False):
             return
+        if self.IsCollabClientMode() and bool(getattr(self, '_collabAwaitingInitialSceneState', False)):
+            return
         if globals_.Area is None:
             return
         self._collabOutOps.append(op)
@@ -10228,18 +10348,35 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
 
         existing = self._collabObjectById.get(obj_id)
+        if existing is None:
+            try:
+                candidate = self._CollabFindItemById(obj_id)
+                if isinstance(candidate, ObjectItem):
+                    self._collabObjectById[obj_id] = candidate
+                    existing = candidate
+            except Exception:
+                existing = None
         if existing is not None and self._CollabItemIsHot(existing):
             return
         if existing is None:
             try:
-                for candidate in globals_.Area.layers[layer_idx]:
-                    if getattr(candidate, '_collab_id', None):
-                        continue
-                    if (candidate.tileset, candidate.type, candidate.objx, candidate.objy, candidate.width, candidate.height) == (tileset, obj_type, x, y, w, h):
-                        candidate._collab_id = obj_id
-                        self._collabObjectById[obj_id] = candidate
-                        existing = candidate
+                for layer in globals_.Area.layers[:3]:
+                    for candidate in layer:
+                        if str(getattr(candidate, '_collab_id', '') or '') == obj_id:
+                            self._collabObjectById[obj_id] = candidate
+                            existing = candidate
+                            break
+                    if existing is not None:
                         break
+                if existing is None:
+                    for candidate in globals_.Area.layers[layer_idx]:
+                        if getattr(candidate, '_collab_id', None):
+                            continue
+                        if (candidate.tileset, candidate.type, candidate.objx, candidate.objy, candidate.width, candidate.height) == (tileset, obj_type, x, y, w, h):
+                            candidate._collab_id = obj_id
+                            self._collabObjectById[obj_id] = candidate
+                            existing = candidate
+                            break
             except Exception:
                 existing = None
 
@@ -10306,6 +10443,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         obj_id = str(obj_id)
         victim = self._collabObjectById.pop(obj_id, None)
         if victim is None:
+            try:
+                candidate = self._CollabFindItemById(obj_id)
+                if isinstance(candidate, ObjectItem):
+                    victim = candidate
+            except Exception:
+                victim = None
+        if victim is None:
             return
         try:
             victim.delete()
@@ -10339,14 +10483,28 @@ class ReggieWindow(QtWidgets.QMainWindow):
         existing = self._collabSpriteById.get(spr_id)
         if existing is None:
             try:
+                candidate = self._CollabFindItemById(spr_id)
+                if isinstance(candidate, SpriteItem):
+                    self._collabSpriteById[spr_id] = candidate
+                    existing = candidate
+            except Exception:
+                existing = None
+        if existing is None:
+            try:
                 for candidate in globals_.Area.sprites:
-                    if getattr(candidate, '_collab_id', None):
-                        continue
-                    if int(getattr(candidate, 'type', -1)) == spr_type and int(getattr(candidate, 'objx', 0)) == x and int(getattr(candidate, 'objy', 0)) == y:
-                        candidate._collab_id = spr_id
+                    if str(getattr(candidate, '_collab_id', '') or '') == spr_id:
                         self._collabSpriteById[spr_id] = candidate
                         existing = candidate
                         break
+                if existing is None:
+                    for candidate in globals_.Area.sprites:
+                        if getattr(candidate, '_collab_id', None):
+                            continue
+                        if int(getattr(candidate, 'type', -1)) == spr_type and int(getattr(candidate, 'objx', 0)) == x and int(getattr(candidate, 'objy', 0)) == y:
+                            candidate._collab_id = spr_id
+                            self._collabSpriteById[spr_id] = candidate
+                            existing = candidate
+                            break
             except Exception:
                 existing = None
 
@@ -10407,6 +10565,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         spr_id = str(spr_id)
         victim = self._collabSpriteById.pop(spr_id, None)
+        if victim is None:
+            try:
+                candidate = self._CollabFindItemById(spr_id)
+                if isinstance(candidate, SpriteItem):
+                    victim = candidate
+            except Exception:
+                victim = None
         if victim is None:
             return
         try:
@@ -11058,6 +11223,32 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._QueuePendingRemoteMessage(message, sender)
             return
 
+        if self.IsCollabClientMode() and self._CollabTilesetSyncInProgress() and msg_type not in {
+            'host_hello',
+            'peer_kicked',
+            'peer_banned',
+            'peer_rejected',
+            'tileset_manifest',
+            'tileset_data',
+            'tileset_update',
+        }:
+            self._QueuePendingRemoteMessage(message, sender)
+            return
+
+        if self.IsCollabClientMode() and bool(getattr(self, '_collabAwaitingInitialSceneState', False)) and msg_type not in {
+            'host_hello',
+            'peer_kicked',
+            'peer_banned',
+            'peer_rejected',
+            'scene_patch',
+            'meta_state',
+            'tileset_manifest',
+            'tileset_data',
+            'tileset_update',
+        }:
+            self._QueuePendingRemoteMessage(message, sender)
+            return
+
         if msg_type not in {'host_hello', 'peer_kicked', 'peer_banned', 'peer_rejected'} and (
             getattr(self, 'collabSwitchingArea', False)
             or self.collabApplyingRemote
@@ -11074,8 +11265,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
             else:
                 self.collabHostSessionId = str(sender)
             current_level_name = self._CollabNormalizeLevelName(payload.get('current_level_name'))
-            if current_level_name and not self._CollabNormalizeLevelName():
-                self.collabLastLevelName = current_level_name
+            if current_level_name:
+                self._collabHostCurrentLevelName = current_level_name
+                if not self._CollabNormalizeLevelName():
+                    self.collabLastLevelName = current_level_name
+            try:
+                self._collabHostCurrentAreaNum = max(1, min(4, int(payload.get('current_area_num', 1) or 1)))
+            except Exception:
+                self._collabHostCurrentAreaNum = 1
             stage_files = payload.get('stage_files')
             if isinstance(stage_files, list):
                 self.collabKnownHostedStageFiles = [
@@ -11090,6 +11287,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._RequestHostTilesetsNow(include_all_game_tilesets=True, force=True)
             except Exception:
                 self._MaybeScheduleCollabTilesetSync(50)
+            if self.IsCollabClientMode() and not self._CollabTilesetSyncInProgress():
+                try:
+                    QtCore.QTimer.singleShot(0, self.TryApplyPendingRemoteSnapshot)
+                except Exception:
+                    pass
             # Request authoritative undo/redo history state from the host.
             if self._CollabHistoryEnabled() and self.IsCollabClientMode():
                 try:
@@ -11115,6 +11317,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 area_num = 0
             level_name = str(payload.get('level_name') or '')
+            if self.IsCollabClientMode() and str(sender or '') == str(getattr(self, 'collabHostSessionId', '') or ''):
+                normalized_level_name = self._CollabNormalizeLevelName(level_name)
+                if normalized_level_name:
+                    self._collabHostCurrentLevelName = normalized_level_name
+                if area_num > 0:
+                    self._collabHostCurrentAreaNum = area_num
             self._CollabSetPeerEditorState(sender, level_name, area_num)
         elif msg_type == 'chat':
             nick = str(payload.get('nick') or '').strip()
@@ -11258,9 +11466,29 @@ class ReggieWindow(QtWidgets.QMainWindow):
         elif msg_type in ('tileset_data', 'tileset_update'):
             name, data, slots = self._DecodeTilesetPayload(payload)
             if name and data:
+                sync_active = isinstance(getattr(self, '_collabTilesetSyncState', None), dict)
                 if msg_type == 'tileset_data':
                     self._TrackReceivedCollabTileset(name, data)
-                self._ApplyCollabTilesetBytes(name, data, slots=slots, broadcast=False)
+                if sync_active:
+                    try:
+                        self._collabPendingTilesetPayloads.append((dict(payload or {}), sender))
+                    except Exception:
+                        pass
+                    sync_state = getattr(self, '_collabTilesetSyncState', None)
+                    total_files = int((sync_state or {}).get('total_files', 0) or 0)
+                    received_files = int((sync_state or {}).get('received_files', 0) or 0)
+                    if msg_type == 'tileset_data' and total_files > 0 and received_files >= total_files:
+                        try:
+                            self._ApplyPendingTilesetPayloads()
+                        except Exception:
+                            pass
+                        self._ResetCollabTilesetSyncState()
+                        try:
+                            self._CollabEnsureClientFollowsHostLevel()
+                        except Exception:
+                            pass
+                else:
+                    self._ApplyCollabTilesetBytes(name, data, slots=slots, broadcast=False)
                 try:
                     self.TryApplyPendingRemoteSnapshot()
                 except Exception:
@@ -11479,6 +11707,22 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self.collabApplyingRemote = False
+
+        if (
+            self.IsCollabClientMode()
+            and str(sender or '') == str(getattr(self, 'collabHostSessionId', '') or '')
+            and bool(getattr(self, '_collabAwaitingInitialSceneState', False))
+        ):
+            current_level_name = self._CollabNormalizeLevelName(self._CollabCurrentLevelName())
+            awaited_level_name = self._CollabNormalizeLevelName(getattr(self, '_collabAwaitingInitialLevelName', ''))
+            try:
+                current_area_num = int(getattr(globals_.Area, 'areanum', 0) or 0)
+            except Exception:
+                current_area_num = 0
+            if current_area_num == int(getattr(self, '_collabAwaitingInitialAreaNum', 0) or 0) and (
+                not awaited_level_name or awaited_level_name == current_level_name
+            ):
+                self._EndCollabInitialSceneSync()
 
     def ApplyRemoteSceneDelta(self, prev_state, next_state):
         self.ApplyRemoteObjectsDelta(prev_state.get('objects', []), next_state.get('objects', []))
@@ -12505,6 +12749,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         if self.IsCollabClientMode() and self.collabHostSessionId is not None and sender != self.collabHostSessionId:
             return
+        if self.IsCollabClientMode() and self.collabLastHash is None:
+            host_level_name = self._CollabNormalizeLevelName(
+                getattr(self, '_collabHostCurrentLevelName', '') or getattr(self, 'collabLastLevelName', '')
+            )
+            if not host_level_name:
+                self.collabPendingSnapshot = (level_data, area_num, sender)
+                if hasattr(self, 'hoverLabel'):
+                    self.hoverLabel.setText('Waiting for the host level information...')
+                return
         if self._CollabPatchSyncInProgress():
             self.collabPendingSnapshot = (level_data, area_num, sender)
             if hasattr(self, 'hoverLabel'):
@@ -12530,6 +12783,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if self.collabLastHash == new_digest:
                 return
 
+            try:
+                target_area_num = max(1, min(4, int(area_num)))
+            except Exception:
+                target_area_num = int(getattr(globals_.Area, 'areanum', 1) or 1)
+            initial_client_sync = bool(self.IsCollabClientMode() and self.collabLastHash is None)
+            host_level_name = self._CollabNormalizeLevelName(
+                getattr(self, '_collabHostCurrentLevelName', '') or getattr(self, 'collabLastLevelName', '')
+            )
+
             suppress_missing_tileset_warnings = self.IsCollabClientMode()
             if suppress_missing_tileset_warnings:
                 self._SetCollabMissingTilesetWarningsSuppressed(True)
@@ -12539,19 +12801,60 @@ class ReggieWindow(QtWidgets.QMainWindow):
             merge_applied, merge_changed = self.TryMergeConcurrentCurrentArea(level_data, area_num)
             if (merge_applied is not None) and has_local_conflict:
                 if merge_changed:
+                    if self.IsCollabClientMode() and host_level_name:
+                        self._CollabAdoptHostedLevelIdentity(host_level_name)
                     self.LoadLevelFromNetwork(merge_applied, globals_.Area.areanum)
                     self.collabLastHash = hash(merge_applied)
                 else:
                     self.collabLastHash = new_digest
                 self.collabLastSentHash = self.collabLastHash
-            elif self.CanApplyRemoteAreaWithoutReload(level_data, area_num):
+            elif (not initial_client_sync) and self.CanApplyRemoteAreaWithoutReload(level_data, area_num):
                 self.ApplyRemoteAreaWithoutReload(level_data, area_num)
                 self.collabLastHash = new_digest
                 self.collabLastSentHash = self.collabLastHash
             else:
-                self.LoadLevelFromNetwork(level_data, globals_.Area.areanum)
+                if self.IsCollabClientMode() and host_level_name:
+                    self._CollabAdoptHostedLevelIdentity(host_level_name)
+                self.LoadLevelFromNetwork(level_data, target_area_num)
                 self.collabLastHash = new_digest
                 self.collabLastSentHash = self.collabLastHash
+                if self.IsCollabClientMode():
+                    applied_cached_state = False
+                    try:
+                        current_level_name = self._CollabCurrentLevelName()
+                        cached_scene = self._CollabSceneCacheForLevel(current_level_name, create=True).get(target_area_num)
+                        if isinstance(cached_scene, dict):
+                            self.scene.blockSignals(True)
+                            globals_.DirtyOverride += 1
+                            try:
+                                self.ReplaceAreaObjectsFromState(cached_scene)
+                                self.ReplaceAreaSpritesFromState(cached_scene)
+                                self._CollabPruneDuplicateIdsCurrentArea()
+                                applied_cached_state = True
+                            finally:
+                                globals_.DirtyOverride -= 1
+                                self.scene.blockSignals(False)
+                        cached_meta = self._CollabMetaCacheForLevel(current_level_name, create=True).get(target_area_num)
+                        if isinstance(cached_meta, dict):
+                            self._ApplyMetaStateToCurrentArea(cached_meta)
+                            applied_cached_state = True
+                        if applied_cached_state:
+                            self._CollabRebuildIndexes()
+                            self._CollabReapplySelectionOwnership()
+                            self.scene.update()
+                            self.levelOverview.update()
+                    except Exception:
+                        applied_cached_state = False
+
+                    if not applied_cached_state and self.collabHostSessionId is not None:
+                        try:
+                            self._BeginCollabInitialSceneSync(self._CollabCurrentLevelName(), target_area_num)
+                            self.collabManager.broadcast_message('request_full_sync', {
+                                'area_num': target_area_num,
+                                'level_name': self._CollabCurrentLevelName(),
+                            })
+                        except Exception:
+                            pass
             if hasattr(self, 'hoverLabel'):
                 self.hoverLabel.setText('Applied update from peer (area %d)' % area_num)
         finally:
@@ -12603,6 +12906,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return False
         if self.collabApplyingRemote:
             return False
+        if self._CollabPatchSyncInProgress() or self._CollabTilesetSyncInProgress():
+            return False
+        if self.IsCollabClientMode() and self.collabLastHash is None:
+            host_level_name = self._CollabNormalizeLevelName(
+                getattr(self, '_collabHostCurrentLevelName', '') or getattr(self, 'collabLastLevelName', '')
+            )
+            if not host_level_name:
+                return False
         if self.IsLocalEditInProgress():
             return False
 
@@ -15040,19 +15351,19 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         self.collabApplyingRemote = True
         try:
-            # Never store the host absolute path locally. Use our local Stage path
-            # if available so code that relies on `fileSavePath` still works.
-            stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
-            if stage_dir:
-                self.fileSavePath = os.path.join(stage_dir, *level_name.split('/'))
-            else:
-                self.fileSavePath = str(level_name)
-            self.fileTitle = level_name
-            self.collabLastLevelName = level_name
-            self._CollabSyncCurrentLevelCaches()
+            self._CollabAdoptHostedLevelIdentity(level_name)
             self.LoadLevelFromNetwork(bytes(level_bytes), area_num)
             self._CacheCurrentAreaCollabState(include_scene=True, include_meta=True)
             self.collabLastSceneSig = hash(repr(self.BuildCollabSceneState()))
+            if self.IsCollabClientMode() and self.collabHostSessionId is not None:
+                self._BeginCollabInitialSceneSync(level_name, area_num)
+                try:
+                    self.collabManager.broadcast_message('request_full_sync', {
+                        'area_num': int(area_num),
+                        'level_name': level_name,
+                    })
+                except Exception:
+                    pass
             return True
         finally:
             self.collabApplyingRemote = False
@@ -16442,6 +16753,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
             self.levelOverview.Reset()
             self.levelOverview.update()
+            self._CollabRebuildIndexes()
+            self._CollabReapplySelectionOwnership()
             if same:
                 self.RestoreTransientUiState(ui_state)
 

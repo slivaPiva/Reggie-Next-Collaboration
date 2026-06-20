@@ -327,6 +327,25 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         self.lastCursorPosForMidButtonScroll = None
         self.cursorEdgeScrollTimer = None
 
+    def _BroadcastCollabCursorFromEvent(self, event, force=False):
+        mw = getattr(globals_, 'mainWindow', None)
+        if mw is None:
+            return
+        try:
+            scene_pos = self.mapToScene(event.pos())
+            scene_pos.setX(max(0.0, float(scene_pos.x())))
+            scene_pos.setY(max(0.0, float(scene_pos.y())))
+        except Exception:
+            return
+        try:
+            mw.collabLastMouseScenePos = QtCore.QPointF(float(scene_pos.x()), float(scene_pos.y()))
+        except Exception:
+            pass
+        try:
+            mw._MaybeBroadcastCollabCursorState(scene_pos, force=force)
+        except Exception:
+            pass
+
     def _GetPixelBrushTilePos(self, scene_pos, footprint):
         clickedx = int(max(0, scene_pos.x()) / 24)
         clickedy = int(max(0, scene_pos.y()) / 24)
@@ -383,6 +402,7 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         """
         Overrides mouse pressing events if needed
         """
+        self._BroadcastCollabCursorFromEvent(event, force=True)
         try:
             qpt_funcs = getattr(globals_, 'qpt_functions', None)
             if qpt_funcs and qpt_funcs.get('press'):
@@ -828,6 +848,7 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         """
         Overrides mouse movement events if needed
         """
+        self._BroadcastCollabCursorFromEvent(event, force=False)
         try:
             qpt_funcs = getattr(globals_, 'qpt_functions', None)
             if qpt_funcs and qpt_funcs.get('move') and qpt_funcs['move'](event):
@@ -868,6 +889,7 @@ class LevelViewWidget(QtWidgets.QGraphicsView):
         """
         Overrides mouse release events if needed
         """
+        self._BroadcastCollabCursorFromEvent(event, force=True)
         try:
             qpt_funcs = getattr(globals_, 'qpt_functions', None)
             if qpt_funcs and qpt_funcs.get('release') and qpt_funcs['release'](event):
