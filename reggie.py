@@ -1424,6 +1424,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabModifiedLevels = collections.OrderedDict()
         self._collabPatchSyncState = None
         self._collabPatchProgressDialog = None
+        self._collabPatchWatcher = QtCore.QFileSystemWatcher(self)
+        self._collabPatchWatcher.fileChanged.connect(self._HandleCollabPatchFilesystemChanged)
+        self._collabPatchWatcher.directoryChanged.connect(self._HandleCollabPatchFilesystemChanged)
+        self._collabPatchWatcherDebounce = QtCore.QTimer(self)
+        self._collabPatchWatcherDebounce.setSingleShot(True)
+        self._collabPatchWatcherDebounce.timeout.connect(self._FlushCollabPatchFilesystemChanged)
+        self._collabLastBroadcastHostPatchInfo = None
         self._collabTilesetSyncState = None
         self._collabTilesetProgressDialog = None
         self._collabGamePluginSummaryCache = {}
@@ -6788,9 +6795,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._MaybeScheduleCollabTilesetSync(250)
         if message.startswith('Peer connected'):
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
-                host_payload = {'host': self.collabManager.session_id}
-                host_payload.update(self._BuildCollabRoomInfo())
-                self.collabManager.broadcast_message('host_hello', host_payload)
+                self._RefreshHostCollabPatchWatcher()
+                self._BroadcastHostHelloToPeers(force=True)
                 self._BroadcastCollabNick()
                 try:
                     self._MaybeBroadcastCollabEditorState(force=True)
@@ -7021,6 +7027,129 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if key[0] == normalized_id:
                 cache.pop(key, None)
 
+    def _BuildCollabPatchKnownFileHashes(self, game_def_id=None, primary_root=None):
+        known = {}
+        for entry in self._EnumerateCollabPatchEntries(game_def_id, primary_root=primary_root):
+            digest = hashlib.sha1()
+            try:
+                with open(entry['file_path'], 'rb') as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            except OSError:
+                return {}
+            known[str(entry['target_path'])] = digest.hexdigest()
+        return known
+
+    def _ClearCollabPatchWatcherPaths(self):
+        watcher = getattr(self, '_collabPatchWatcher', None)
+        if watcher is None:
+            return
+        try:
+            files = list(watcher.files())
+        except Exception:
+            files = []
+        try:
+            directories = list(watcher.directories())
+        except Exception:
+            directories = []
+        if files:
+            try:
+                watcher.removePaths(files)
+            except Exception:
+                pass
+        if directories:
+            try:
+                watcher.removePaths(directories)
+            except Exception:
+                pass
+
+    def _RefreshHostCollabPatchWatcher(self):
+        watcher = getattr(self, '_collabPatchWatcher', None)
+        if watcher is None:
+            return
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
+            self._ClearCollabPatchWatcherPaths()
+            return
+
+        game_id = self._CurrentCollabGameDefId()
+        current_root = self._CurrentCollabGameRootPath() or GAMEDEF_PATCH_ROOT
+        defs = self._CollectCollabPatchDefs(game_id, primary_root=current_root)
+        if not defs:
+            self._ClearCollabPatchWatcherPaths()
+            return
+
+        file_paths = []
+        dir_paths = set()
+        for def_ in defs:
+            patch_dir = os.path.join(str(getattr(def_, 'patch_root_path', '') or ''), str(getattr(def_, 'gamepath', '') or ''))
+            if not os.path.isdir(patch_dir):
+                continue
+            dir_paths.add(os.path.abspath(patch_dir))
+            for root, dirs, files in os.walk(patch_dir):
+                root = os.path.abspath(root)
+                dir_paths.add(root)
+                dirs[:] = [name for name in sorted(dirs) if name != '__pycache__']
+                for filename in sorted(files):
+                    file_paths.append(os.path.abspath(os.path.join(root, filename)))
+
+        self._ClearCollabPatchWatcherPaths()
+        if dir_paths:
+            try:
+                watcher.addPaths(sorted(dir_paths))
+            except Exception:
+                pass
+        if file_paths:
+            try:
+                watcher.addPaths(file_paths)
+            except Exception:
+                pass
+
+    def _BroadcastHostHelloToPeers(self, force=False):
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
+            return False
+        host_payload = {'host': self.collabManager.session_id}
+        host_payload.update(self._BuildCollabRoomInfo())
+        info_key = (
+            self._NormalizeCollabGameDefId(host_payload.get('game_id')),
+            str(host_payload.get('game_plugin_hash') or ''),
+        )
+        if not force and info_key == getattr(self, '_collabLastBroadcastHostPatchInfo', None):
+            return False
+        self._collabLastBroadcastHostPatchInfo = info_key
+        try:
+            self.collabManager.broadcast_message('host_hello', host_payload)
+            return True
+        except Exception:
+            return False
+
+    def _HandleCollabPatchFilesystemChanged(self, _path):
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
+            return
+        try:
+            self._collabPatchWatcherDebounce.start(350)
+        except Exception:
+            pass
+
+    def _FlushCollabPatchFilesystemChanged(self):
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
+            self._ClearCollabPatchWatcherPaths()
+            return
+        game_id = self._CurrentCollabGameDefId()
+        if not game_id:
+            self._ClearCollabPatchWatcherPaths()
+            return
+        self._InvalidateCollabGamePluginCache(game_id)
+        self._RefreshHostCollabPatchWatcher()
+        if self._BroadcastHostHelloToPeers(force=False):
+            try:
+                if hasattr(self, 'hoverLabel'):
+                    self.hoverLabel.setText('Updated hosted patch files for connected peers.')
+            except Exception:
+                pass
+
     def _CollabPatchSyncInProgress(self):
         return bool(getattr(self, '_collabPatchSyncState', None))
 
@@ -7060,12 +7189,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
             total = max(1, int(state.get('total_files') or 1))
             progress = int(state.get('received_files') or 0)
         progress = max(0, min(progress, total))
+        action_word = 'Updating' if bool(state.get('using_cached_files')) else 'Downloading'
 
         dlg.setMaximum(total)
         dlg.setValue(progress)
         if label is None:
             percent = 100.0 if total <= 0 else (float(progress) / float(total)) * 100.0
-            label = 'Downloading host patch... %.1f%% (%d/%d files)\n%s / %s' % (
+            label = '%s host patch... %.1f%% (%d/%d files)\n%s / %s' % (
+                action_word,
                 percent,
                 int(state.get('received_files') or 0),
                 int(state.get('total_files') or 0),
@@ -7143,21 +7274,30 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'staging_root': staging_root,
             'online_root': online_root,
             'expected_files': {},
+            'manifest_paths': set(),
             'received_paths': set(),
             'folders': [],
             'total_files': 0,
             'total_bytes': 0,
             'received_files': 0,
             'received_bytes': 0,
+            'using_cached_files': False,
         }
 
-        label = 'Requesting host patch files for %s' % host_name
+        label = 'Checking host patch files for %s' % host_name
         total_bytes = int(host_info.get('game_patch_total_bytes', 0) or 0)
         if total_bytes > 0:
             label += '\nApproximate size: %s' % self._FormatCollabBytes(total_bytes)
+        known_files = self._BuildCollabPatchKnownFileHashes(game_id, primary_root=GAMEDEF_ONLINE_PATCH_ROOT)
+        self._collabPatchSyncState['using_cached_files'] = bool(known_files)
+        if known_files:
+            label += '\nUsing cached online patch files when possible.'
         self._UpdateCollabPatchProgress(label)
         try:
-            self.collabManager.broadcast_message('patch_sync_request', {'game_id': game_id})
+            self.collabManager.broadcast_message('patch_sync_request', {
+                'game_id': game_id,
+                'known_files': known_files,
+            })
         except Exception:
             self._FailCollabPatchSync('Unable to request the host patch files.', disconnect=True)
         return True
@@ -7177,27 +7317,61 @@ class ReggieWindow(QtWidgets.QMainWindow):
             )
             return
 
-        online_root = str(state.get('online_root') or GAMEDEF_ONLINE_PATCH_ROOT)
-        staging_root = str(state.get('staging_root') or '')
-        folders = list(state.get('folders') or [])
+        online_root = os.path.abspath(str(state.get('online_root') or GAMEDEF_ONLINE_PATCH_ROOT))
+        staging_root = os.path.abspath(str(state.get('staging_root') or ''))
+        manifest_paths = set(state.get('manifest_paths') or set())
+        game_id = str(state.get('game_id') or '')
         try:
             os.makedirs(online_root, exist_ok=True)
-            for folder in folders:
-                src_dir = os.path.join(staging_root, folder)
-                dst_dir = os.path.join(online_root, folder)
-                if not os.path.isdir(src_dir):
-                    raise OSError('Missing downloaded patch folder: %s' % folder)
-                if os.path.isdir(dst_dir):
-                    shutil.rmtree(dst_dir)
-                elif os.path.exists(dst_dir):
-                    os.remove(dst_dir)
-                shutil.move(src_dir, dst_dir)
+            for target_path in sorted(received_paths):
+                src_path = os.path.abspath(os.path.join(staging_root, *str(target_path).split('/')))
+                dst_path = os.path.abspath(os.path.join(online_root, *str(target_path).split('/')))
+                if not src_path.startswith(staging_root + os.sep):
+                    raise OSError('Invalid downloaded patch file path: %s' % str(target_path))
+                if not dst_path.startswith(online_root + os.sep):
+                    raise OSError('Invalid destination patch file path: %s' % str(target_path))
+                if not os.path.isfile(src_path):
+                    raise OSError('Missing downloaded patch file: %s' % str(target_path))
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                if os.path.isdir(dst_path):
+                    shutil.rmtree(dst_path)
+                elif os.path.exists(dst_path):
+                    os.remove(dst_path)
+                shutil.move(src_path, dst_path)
+
+            existing_paths = {
+                str(entry.get('target_path') or '')
+                for entry in self._EnumerateCollabPatchEntries(game_id, primary_root=GAMEDEF_ONLINE_PATCH_ROOT)
+                if str(entry.get('target_path') or '')
+            }
+            stale_paths = sorted(existing_paths - manifest_paths)
+            for target_path in stale_paths:
+                stale_path = os.path.abspath(os.path.join(online_root, *str(target_path).split('/')))
+                if not stale_path.startswith(online_root + os.sep):
+                    continue
+                if os.path.isfile(stale_path):
+                    os.remove(stale_path)
+                elif os.path.isdir(stale_path):
+                    shutil.rmtree(stale_path, ignore_errors=True)
+
+            cleanup_roots = set()
+            for def_ in self._CollectCollabPatchDefs(game_id, primary_root=GAMEDEF_ONLINE_PATCH_ROOT):
+                patch_dir = os.path.join(str(getattr(def_, 'patch_root_path', '') or ''), str(getattr(def_, 'gamepath', '') or ''))
+                if os.path.isdir(patch_dir):
+                    cleanup_roots.add(os.path.abspath(patch_dir))
+            for patch_dir in sorted(cleanup_roots, key=len, reverse=True):
+                for root, dirs, files in os.walk(patch_dir, topdown=False):
+                    if dirs or files:
+                        continue
+                    try:
+                        os.rmdir(root)
+                    except OSError:
+                        pass
         except Exception as e:
             self._FailCollabPatchSync('Unable to install the host patch files.\n%s' % str(e), disconnect=True)
             return
 
         shutil.rmtree(staging_root, ignore_errors=True)
-        game_id = str(state.get('game_id') or '')
         host_info = dict(state.get('host_info') or {})
         self._collabDownloadedOnlineGameId = self._NormalizeCollabGameDefId(game_id)
         self._InvalidateCollabGamePluginCache(game_id)
@@ -7215,7 +7389,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             )
             return
 
-        self._UpdateCollabPatchProgress('Loading host patch...')
+        self._UpdateCollabPatchProgress('Applying host patch...')
         if not self._LoadCollabGameDef(game_id, prefer_online=True):
             self._FailCollabPatchSync(
                 'The host patch files downloaded successfully, but Reggie could not load them.',
@@ -7244,7 +7418,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _HostSendPatchFilesToPeer(self, peer_session_id, game_def_id=None):
+    def _HostSendPatchFilesToPeer(self, peer_session_id, game_def_id=None, known_files=None):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
             return
 
@@ -7252,6 +7426,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not game_id:
             return
 
+        known_files = dict(known_files or {})
         current_root = self._CurrentCollabGameRootPath() or GAMEDEF_PATCH_ROOT
         summary = self._GetCollabGamePluginSummary(game_id, primary_root=current_root)
         entries = self._EnumerateCollabPatchEntries(game_id, primary_root=current_root)
@@ -7259,6 +7434,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
 
         manifest_entries = []
+        download_entries = []
         for entry in entries:
             try:
                 with open(entry['file_path'], 'rb') as f:
@@ -7271,30 +7447,28 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 'size': int(entry['size']),
                 'sha1': self._TilesetBytesSha1(raw),
             })
+            if str(known_files.get(entry['target_path']) or '') != str(manifest_entries[-1]['sha1'] or ''):
+                download_entries.append((dict(manifest_entries[-1]), raw))
 
         try:
             if not self.collabManager.send_message_to(peer_session_id, 'patch_manifest', {
                 'game_id': game_id,
                 'plugin_hash': summary.get('hash', ''),
-                'file_count': summary.get('file_count', 0),
-                'total_bytes': summary.get('total_bytes', 0),
+                'file_count': len(download_entries),
+                'total_bytes': sum(int(entry.get('size', 0) or 0) for entry, _raw in download_entries),
                 'files': manifest_entries,
+                'download_files': [dict(entry) for entry, _raw in download_entries],
             }):
                 return
         except Exception:
             return
 
-        for entry in entries:
-            try:
-                with open(entry['file_path'], 'rb') as f:
-                    raw = f.read()
-            except OSError:
-                return
+        for entry, raw in download_entries:
             payload = {
                 'game_id': game_id,
                 'path': entry['target_path'],
                 'size': int(len(raw)),
-                'sha1': self._TilesetBytesSha1(raw),
+                'sha1': str(entry.get('sha1') or self._TilesetBytesSha1(raw)),
                 'data': base64.b64encode(zlib.compress(raw, 6)).decode('ascii'),
             }
             try:
@@ -7307,8 +7481,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabManager.send_message_to(peer_session_id, 'patch_sync_done', {
                 'game_id': game_id,
                 'plugin_hash': summary.get('hash', ''),
-                'file_count': summary.get('file_count', 0),
-                'total_bytes': summary.get('total_bytes', 0),
+                'file_count': len(download_entries),
+                'total_bytes': sum(int(entry.get('size', 0) or 0) for entry, _raw in download_entries),
             })
         except Exception:
             return
@@ -7374,6 +7548,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.GameDefMenu.gameChanged.emit()
         except Exception:
             pass
+        try:
+            self._RefreshHostCollabPatchWatcher()
+        except Exception:
+            pass
 
     def _LoadCollabGameDef(self, game_def_id, prefer_online=False):
         dlg = QtWidgets.QProgressDialog()
@@ -7394,6 +7572,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if result:
             setSetting('LastGameDef', game_def_id)
             self._SetCheckedGameDefAction(game_def_id)
+            self._RefreshHostCollabPatchWatcher()
         return result
 
     def _CaptureCollabSessionRestoreState(self):
@@ -7447,7 +7626,6 @@ class ReggieWindow(QtWidgets.QMainWindow):
     def _RestoreCollabSessionState(self):
         state = getattr(self, '_collabSessionRestoreState', None)
         if not isinstance(state, dict):
-            self._CleanupCollabDownloadedOnlinePatch()
             self._ClearCollabSessionRestoreState()
             return
 
@@ -7483,7 +7661,6 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        self._CleanupCollabDownloadedOnlinePatch()
         self._ClearCollabSessionRestoreState()
 
     def _EnsureCollabGameMatchesHost(self, host_info):
@@ -7602,6 +7779,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 pass
             QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to host room:\n%s' % str(e))
             return False
+        self._collabLastBroadcastHostPatchInfo = None
+        self._RefreshHostCollabPatchWatcher()
         self.BroadcastFullLevelSnapshot()
         self._RefreshCollabUi()
         return True
@@ -7701,6 +7880,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         try:
             if hasattr(self, 'collabManager'):
                 self.collabManager.stop()
+            self._collabLastBroadcastHostPatchInfo = None
+            self._ClearCollabPatchWatcherPaths()
             self._ResetCollabPatchSyncState(cleanup_staging=True)
             self._ResetCollabTilesetSyncState()
             self._EndCollabInitialSceneSync()
@@ -11218,10 +11399,25 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if not isinstance(state, dict):
                 return
             files = payload.get('files') or []
+            download_files = payload.get('download_files')
+            if not isinstance(download_files, list):
+                download_files = files
             expected_files = {}
+            manifest_paths = set()
             folders = set()
             total_bytes = int(payload.get('total_bytes', 0) or 0)
             for entry in files:
+                if not isinstance(entry, dict):
+                    continue
+                target_path = str(entry.get('path') or '').strip().replace('\\', '/')
+                if not target_path or target_path.startswith('/') or '..' in target_path.split('/'):
+                    continue
+                patch_folder = str(entry.get('patch_folder') or target_path.split('/', 1)[0] or '').strip()
+                if not patch_folder:
+                    continue
+                manifest_paths.add(target_path)
+                folders.add(patch_folder)
+            for entry in download_files:
                 if not isinstance(entry, dict):
                     continue
                 target_path = str(entry.get('path') or '').strip().replace('\\', '/')
@@ -11234,8 +11430,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     'size': int(entry.get('size', 0) or 0),
                     'sha1': str(entry.get('sha1') or ''),
                 }
-                folders.add(patch_folder)
             state['expected_files'] = expected_files
+            state['manifest_paths'] = manifest_paths
             state['folders'] = sorted(folders)
             state['received_paths'] = set()
             state['received_files'] = 0
@@ -11286,8 +11482,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             state['received_paths'].add(target_path)
             state['received_files'] = int(state.get('received_files', 0) or 0) + 1
             state['received_bytes'] = int(state.get('received_bytes', 0) or 0) + len(data)
+            action_word = 'Updating' if bool(state.get('using_cached_files')) else 'Downloading'
             self._UpdateCollabPatchProgress(
-                'Downloading host patch file:\n%s\n%d/%d files, %s / %s' % (
+                '%s host patch file:\n%s\n%d/%d files, %s / %s' % (
+                    action_word,
                     target_path,
                     int(state.get('received_files', 0) or 0),
                     int(state.get('total_files', 0) or 0),
@@ -11595,7 +11793,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 )
         elif msg_type == 'patch_sync_request':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
-                self._HostSendPatchFilesToPeer(sender, payload.get('game_id'))
+                self._HostSendPatchFilesToPeer(
+                    sender,
+                    payload.get('game_id'),
+                    known_files=payload.get('known_files'),
+                )
         elif msg_type in ('tileset_data', 'tileset_update'):
             name, data, slots = self._DecodeTilesetPayload(payload)
             if name and data:
