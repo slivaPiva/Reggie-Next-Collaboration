@@ -1439,6 +1439,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabSelectionDebounce.setSingleShot(True)
         self._collabSelectionDebounce.timeout.connect(self._FlushCollabSelectionBroadcast)
         self._collabLastBroadcastSelection = set()
+        self._collabSelectionForceBroadcast = False
         self._collabOutOpsTimer = QtCore.QTimer(self)
         self._collabOutOpsTimer.setSingleShot(True)
         self._collabOutOpsTimer.timeout.connect(self._FlushCollabOps)
@@ -1511,6 +1512,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabPingTimer = QtCore.QTimer(self)
         self._collabPingTimer.setInterval(33)
         self._collabPingTimer.timeout.connect(self._UpdateCollabPings)
+        self._collabSessionRestoreState = None
+        self._collabDownloadedOnlineGameId = ''
+        self._collabStopping = False
         self.collabManager.set_local_nickname(self.collabSelfNick)
         self.collabManager.set_local_highlight_color(self.collabSelfHighlightColor)
         self.collabManager.set_ban_list(setting('CollabBanList', {}))
@@ -4017,6 +4021,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._CollabSetPeerColor(participant.get('session_id'), participant.get('highlight_color'))
             except Exception:
                 pass
+        try:
+            self._CollabReapplySelectionOwnership()
+        except Exception:
+            pass
         if (
             self._CollabEnabled()
             and getattr(self.collabManager, 'mode', None) == 'host'
@@ -4028,6 +4036,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.BroadcastFullLevelSnapshot()
                 self.BroadcastFullSceneState()
                 self.BroadcastFullMetaState()
+            except Exception:
+                pass
+        if self._CollabEnabled():
+            try:
+                self._ScheduleCollabSelectionBroadcast(delay_ms=0, force=True)
             except Exception:
                 pass
         self._RefreshCollabUi()
@@ -6531,6 +6544,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._MaybeBroadcastCollabEditorState(force=True)
             except Exception:
                 pass
+            try:
+                self._ScheduleCollabSelectionBroadcast(delay_ms=0, force=True)
+            except Exception:
+                pass
             if message.startswith('Connected to') and self.IsCollabClientMode():
                 self._MaybeScheduleCollabTilesetSync(250)
         if message.startswith('Peer connected'):
@@ -6552,6 +6569,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._HostBroadcastTilesetsToAllPeers()
             except Exception:
                 pass
+            try:
+                self._ScheduleCollabSelectionBroadcast(delay_ms=0, force=True)
+            except Exception:
+                pass
         if message.startswith('Disconnected from host') or message.startswith('Collaboration stopped'):
             self.collabPeerNicks = {}
             self.collabPeerColors = {}
@@ -6568,6 +6589,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._collabLastBroadcastEditorStateAt = 0.0
             self._CollabSetPeerNick(getattr(self.collabManager, 'session_id', ''), getattr(self, 'collabSelfNick', 'Player'))
             self._CollabSetPeerColor(getattr(self.collabManager, 'session_id', ''), getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
+        if message.startswith('Disconnected from host') and self.IsCollabClientMode():
+            try:
+                QtCore.QTimer.singleShot(0, self.HandleCollabStop)
+            except Exception:
+                pass
         self._UpdateChatEnabled()
         self._RefreshCollabUi()
         self.UpdateTitle()
@@ -6937,6 +6963,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         shutil.rmtree(staging_root, ignore_errors=True)
         game_id = str(state.get('game_id') or '')
         host_info = dict(state.get('host_info') or {})
+        self._collabDownloadedOnlineGameId = self._NormalizeCollabGameDefId(game_id)
         self._InvalidateCollabGamePluginCache(game_id)
         ClearGameDefCache()
 
@@ -7128,6 +7155,96 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._SetCheckedGameDefAction(game_def_id)
         return result
 
+    def _CaptureCollabSessionRestoreState(self):
+        if getattr(self, '_collabSessionRestoreState', None) is not None:
+            return
+
+        level_bytes = None
+        area_num = 1
+        try:
+            if globals_.Level is not None and globals_.Area is not None:
+                level_bytes = globals_.Level.save()
+                area_num = int(getattr(globals_.Area, 'areanum', 1) or 1)
+        except Exception:
+            level_bytes = None
+            area_num = 1
+
+        self._collabSessionRestoreState = {
+            'game_def_id': self._CurrentCollabGameDefId(),
+            'game_root_path': self._CurrentCollabGameRootPath(),
+            'file_path': self.fileSavePath,
+            'file_title': getattr(self, 'fileTitle', ''),
+            'level_name': getattr(self, 'collabLastLevelName', None),
+            'level_bytes': bytes(level_bytes) if isinstance(level_bytes, (bytes, bytearray)) else None,
+            'area_num': int(area_num),
+            'ui_state': self.CaptureTransientUiState() if globals_.Area is not None else None,
+            'dirty': bool(getattr(globals_, 'Dirty', False)),
+        }
+
+    def _ClearCollabSessionRestoreState(self):
+        self._collabSessionRestoreState = None
+        self._collabDownloadedOnlineGameId = ''
+
+    def _CleanupCollabDownloadedOnlinePatch(self):
+        game_id = self._NormalizeCollabGameDefId(getattr(self, '_collabDownloadedOnlineGameId', ''))
+        if not game_id:
+            return
+        patch_dir = os.path.abspath(os.path.join(GAMEDEF_ONLINE_PATCH_ROOT, game_id))
+        root_dir = os.path.abspath(GAMEDEF_ONLINE_PATCH_ROOT)
+        if not patch_dir.startswith(root_dir + os.sep):
+            return
+        try:
+            shutil.rmtree(patch_dir, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            self._InvalidateCollabGamePluginCache(game_id)
+            ClearGameDefCache()
+        except Exception:
+            pass
+
+    def _RestoreCollabSessionState(self):
+        state = getattr(self, '_collabSessionRestoreState', None)
+        if not isinstance(state, dict):
+            self._CleanupCollabDownloadedOnlinePatch()
+            self._ClearCollabSessionRestoreState()
+            return
+
+        target_game_id = self._NormalizeCollabGameDefId(state.get('game_def_id'))
+        target_root = str(state.get('game_root_path') or '')
+        current_game_id = self._CurrentCollabGameDefId()
+        current_root = self._CurrentCollabGameRootPath()
+
+        try:
+            if target_game_id:
+                prefer_online = (target_root == GAMEDEF_ONLINE_PATCH_ROOT)
+                if current_game_id != target_game_id or current_root != target_root:
+                    self._LoadCollabGameDef(target_game_id, prefer_online=prefer_online)
+            elif current_game_id or current_root:
+                if LoadGameDef(None, prompt_for_stage_path=False):
+                    setSetting('LastGameDef', None)
+                    self._SetCheckedGameDefAction(None)
+        except Exception:
+            pass
+
+        level_bytes = state.get('level_bytes')
+        if isinstance(level_bytes, (bytes, bytearray)):
+            try:
+                self.fileSavePath = state.get('file_path')
+                self.fileTitle = str(state.get('file_title', '') or '')
+                self.collabLastLevelName = state.get('level_name')
+                self.LoadLevelFromNetwork(bytes(level_bytes), max(1, min(4, int(state.get('area_num', 1) or 1))))
+                ui_state = state.get('ui_state')
+                if isinstance(ui_state, dict):
+                    self.RestoreTransientUiState(ui_state)
+                globals_.Dirty = bool(state.get('dirty', False))
+                self.UpdateTitle()
+            except Exception:
+                pass
+
+        self._CleanupCollabDownloadedOnlinePatch()
+        self._ClearCollabSessionRestoreState()
+
     def _EnsureCollabGameMatchesHost(self, host_info):
         if not self._HasUsableCollabHostGameInfo(host_info):
             # Some hosts or network paths do not provide pre-connect room info.
@@ -7267,10 +7384,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     QtWidgets.QLineEdit.EchoMode.Password,
                 )
                 if not ok:
+                    self._ClearCollabSessionRestoreState()
                     return
             resolved_host = CollaborationManager.resolve_public_room_host(host_info, password=password)
             if not resolved_host:
                 QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to resolve the selected public room. Check the password and try again.')
+                self._ClearCollabSessionRestoreState()
                 return
             room_method = str(host_info.get('method') or 'direct').strip().lower() or 'direct'
             host = resolved_host
@@ -7286,7 +7405,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
         else:
             room_method = 'direct'
 
+        self._CaptureCollabSessionRestoreState()
+
         if self._HasUsableCollabHostGameInfo(host_info) and not self._EnsureCollabGameMatchesHost(host_info):
+            self._RestoreCollabSessionState()
             return
         self.collabManager.set_local_nickname(getattr(self, 'collabSelfNick', getattr(globals_, 'CollabNickname', 'Player')))
         self.collabManager.set_local_highlight_color(getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
@@ -7303,6 +7425,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 else:
                     error_text += '\n\nThis public room uses direct TCP. If you are on the same LAN as the host, refresh the LAN list or check that the host stays visible there. If you are outside the LAN, make sure the host port is open in the firewall/router.'
             QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to join room:\n%s' % error_text)
+            self._RestoreCollabSessionState()
             return
         # Do not broadcast immediately on join: wait for host snapshot to avoid
         # racing initial state with client's local copy.
@@ -7311,8 +7434,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
     def _ConnectToCollabDirectHost(self, host, port, source='lan'):
         host = str(host or '').strip()
         port = int(port or 35000)
+        self._CaptureCollabSessionRestoreState()
         host_info = CollaborationManager.probe_host(host, port)
         if self._HasUsableCollabHostGameInfo(host_info) and not self._EnsureCollabGameMatchesHost(host_info):
+            self._RestoreCollabSessionState()
             return False
         self.collabManager.set_local_nickname(getattr(self, 'collabSelfNick', getattr(globals_, 'CollabNickname', 'Player')))
         self.collabManager.set_local_highlight_color(getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
@@ -7323,28 +7448,38 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if str(source or '').strip().lower() == 'online':
                 error_text += '\n\nThis room is expected to be reachable directly. If you are outside the LAN, make sure the host port is open in the firewall/router.'
             QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to join room:\n%s' % error_text)
+            self._RestoreCollabSessionState()
             return False
         self._RefreshCollabUi()
         return True
 
     def HandleCollabStop(self):
-        if hasattr(self, 'collabManager'):
-            self.collabManager.stop()
-        self._ResetCollabPatchSyncState(cleanup_staging=True)
+        if getattr(self, '_collabStopping', False):
+            return
+        self._collabStopping = True
         try:
-            self._CollabClearRemoteSelections()
-        except Exception:
-            pass
-        self.collabRemoteCursors = {}
-        self.collabRemoteRubberBands = {}
-        self.collabLocalRubberBand = None
-        self.collabCursorPKeyHeld = False
-        self.collabLastBroadcastCursorAt = 0.0
-        self.collabLastBroadcastCursorPos = None
-        self._collabLastBroadcastRubberBandAt = 0.0
-        self._collabLastBroadcastRubberBand = None
-        self.UpdateSaveActionsForCollabMode()
-        self._RefreshCollabUi()
+            if hasattr(self, 'collabManager'):
+                self.collabManager.stop()
+            self._ResetCollabPatchSyncState(cleanup_staging=True)
+            try:
+                self._CollabClearRemoteSelections()
+            except Exception:
+                pass
+            self.collabRemoteCursors = {}
+            self.collabRemoteRubberBands = {}
+            self.collabLocalRubberBand = None
+            self.collabCursorPKeyHeld = False
+            self.collabLastBroadcastCursorAt = 0.0
+            self.collabLastBroadcastCursorPos = None
+            self._collabLastBroadcastRubberBandAt = 0.0
+            self._collabLastBroadcastRubberBand = None
+            self._collabLastBroadcastSelection = set()
+            self._collabSelectionForceBroadcast = False
+            self._RestoreCollabSessionState()
+            self.UpdateSaveActionsForCollabMode()
+            self._RefreshCollabUi()
+        finally:
+            self._collabStopping = False
 
     def CollaborationSyncTick(self):
         if not hasattr(self, 'collabManager') or self.collabManager.mode is None:
@@ -8745,6 +8880,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if globals_.Area is None or globals_.Level is None:
             return
         try:
+            if force:
+                self._collabSelectionForceBroadcast = True
             if self._collabSelectionDebounce.isActive():
                 if not force:
                     return
@@ -8758,6 +8895,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         if globals_.Area is None or globals_.Level is None:
             return
+        force_broadcast = bool(getattr(self, '_collabSelectionForceBroadcast', False))
+        self._collabSelectionForceBroadcast = False
         try:
             selitems = list(self.scene.selectedItems())
         except Exception:
@@ -8772,7 +8911,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 continue
 
-        if selected_ids == set(getattr(self, '_collabLastBroadcastSelection', set()) or set()):
+        if (not force_broadcast) and selected_ids == set(getattr(self, '_collabLastBroadcastSelection', set()) or set()):
             return
         self._collabLastBroadcastSelection = set(selected_ids)
 
@@ -8848,6 +8987,22 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         self._collabSelectionItemsByOwner[local_id] = set(claimed_ids)
         return ownership_changed
+
+    def _CollabReapplySelectionOwnership(self):
+        if globals_.Area is None:
+            return
+
+        local_session = self._CollabLocalSessionId()
+        owners_map = getattr(self, '_collabSelectionItemsByOwner', {}) or {}
+        for owner_session_id, item_ids in list(owners_map.items()):
+            owner_session_id = str(owner_session_id or '')
+            if not owner_session_id or owner_session_id == local_session:
+                continue
+            color = self._CollabPeerColor(owner_session_id)
+            for item_id in list(item_ids or set()):
+                item = self._CollabFindItemById(item_id)
+                if item is not None:
+                    self._CollabEnsureRemoteOutline(item, owner_session_id, color)
 
     def _ApplyRemoteSelection(self, payload, sender):
         """
@@ -11306,6 +11461,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.levelOverview.update()
             self.collabLastSceneSig = hash(repr(self.BuildCollabSceneState()))
             self._CollabRebuildIndexes()
+            self._CollabReapplySelectionOwnership()
             self.collabPeerLastState[state_key] = remote_state
             if remote_rev:
                 self.collabPeerLastRev[state_key] = remote_rev
@@ -15900,7 +16056,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'collabBanListDialog') and self.collabBanListDialog is not None:
             self.collabBanListDialog.close()
         if hasattr(self, 'collabManager'):
-            self.collabManager.stop()
+            self.HandleCollabStop()
 
         event.accept()
 
@@ -15962,6 +16118,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.UpdateTitle()
             self.levelOverview.Reset()
             self.levelOverview.update()
+            self._CollabRebuildIndexes()
+            self._CollabReapplySelectionOwnership()
             self.RestoreTransientUiState(ui_state)
         finally:
             globals_.OverrideSnapping = False
