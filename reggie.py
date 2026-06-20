@@ -4757,13 +4757,16 @@ class ReggieWindow(QtWidgets.QMainWindow):
         Returns the path used for tileset overrides.
 
         - Host / offline: write into Stage\\Texture (so the game uses it).
-        - Client: keep a local cache (do not touch user's game directory).
+        - Client with a downloaded online patch: write into that patch's
+          Stage\\Texture so the downloaded patch stays self-contained.
+        - Other client cases: keep a local cache (do not touch user's game directory).
         """
         name = str(name or '')
         if not name:
             return os.path.join(self._GetTilesetCacheDir(), '.arc')
 
-        if not self.IsCollabClientMode():
+        current_root = self._CurrentCollabGameRootPath()
+        if (not self.IsCollabClientMode()) or current_root == GAMEDEF_ONLINE_PATCH_ROOT:
             final_dir = self._GetTilesetFinalDir()
             if final_dir:
                 return os.path.join(final_dir, '%s.arc' % name)
@@ -15679,6 +15682,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             area_num = 1
 
+        current_root = self._CurrentCollabGameRootPath()
+        if self.IsCollabClientMode() and current_root == GAMEDEF_ONLINE_PATCH_ROOT:
+            target_path = self._CollabHostedStageFilePath(level_name)
+            if target_path:
+                try:
+                    self._CollabWriteLevelBytesToPath(target_path, bytes(level_bytes))
+                except Exception:
+                    pass
+
         self.collabApplyingRemote = True
         try:
             self._CollabAdoptHostedLevelIdentity(level_name)
@@ -15873,6 +15885,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not self._ConfirmIfNullSaveData(data, target_path):
             return False
         try:
+            parent_dir = os.path.dirname(target_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
             with open(target_path, 'wb') as f:
                 f.write(data)
         except IOError as e:
