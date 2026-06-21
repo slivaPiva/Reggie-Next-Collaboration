@@ -5691,6 +5691,31 @@ class ReggieWindow(QtWidgets.QMainWindow):
             ],
         }
 
+    def _BuildCollabKnownTilesetHashes(self, include_all_game_tilesets=False):
+        known = {}
+
+        slot_map = [(slot, self._GetTilesetNameForSlot(slot)) for slot in range(4)]
+        if include_all_game_tilesets:
+            try:
+                slot_map.extend(self._EnumerateAllHostTilesetSlotMap())
+            except Exception:
+                pass
+
+        seen = set()
+        for _slot, name in slot_map:
+            name = str(name or '').strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            try:
+                data, _src = self._ReadTilesetArcFromGame(name)
+            except Exception:
+                data = None
+            if not data:
+                continue
+            known[name] = self._TilesetBytesSha1(data)
+        return known
+
     def _CloseCollabTilesetProgressDialog(self):
         dlg = getattr(self, '_collabTilesetProgressDialog', None)
         if dlg is None:
@@ -6161,20 +6186,24 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not force and not self._NeedsCollabTilesetSync():
             return
         self._StartCollabTilesetSyncProgress()
+        known_files = self._BuildCollabKnownTilesetHashes(include_all_game_tilesets=include_all_game_tilesets)
         try:
             self.collabManager.broadcast_message('tileset_sync_request', {
                 'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0),
                 'level_name': self._CollabCurrentLevelName(),
                 'include_all_game_tilesets': bool(include_all_game_tilesets),
+                'known_files': known_files,
             })
         except Exception:
             pass
 
-    def _HostSendTilesetsToPeer(self, peer_session_id, area_num=None, include_all_game_tilesets=False):
+    def _HostSendTilesetsToPeer(self, peer_session_id, area_num=None, include_all_game_tilesets=False, known_files=None):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
             return
         if globals_.Area is None:
             return
+
+        known_files = dict(known_files or {})
 
         if area_num is not None:
             try:
@@ -6200,13 +6229,29 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if extra_slot_map:
             slot_map.extend(extra_slot_map)
         entries = self._BuildCollabTilesetTransferEntries(slot_map)
+        download_entries = [
+            entry for entry in entries
+            if str(known_files.get(str(entry.get('name') or '')) or '') != str(entry.get('sha1') or '')
+        ]
         manifest = self._BuildCollabTilesetManifestPayload(entries)
+        manifest['file_count'] = len(download_entries)
+        manifest['total_bytes'] = sum(int(entry.get('size', 0) or 0) for entry in download_entries)
+        manifest['download_files'] = [
+            {
+                'name': str(entry.get('name') or ''),
+                'slots': list(map(int, entry.get('slots') or [])),
+                'size': int(entry.get('size', 0) or 0),
+                'sha1': str(entry.get('sha1') or ''),
+            }
+            for entry in download_entries
+            if str(entry.get('name') or '')
+        ]
         try:
             self.collabManager.send_message_to(peer_session_id, 'tileset_manifest', manifest)
         except Exception:
             pass
 
-        for entry in entries:
+        for entry in download_entries:
             payload = self._PackTilesetPayload(entry['name'], entry['data'], slots=entry.get('slots'))
             try:
                 if self.collabManager.send_message_to(peer_session_id, 'tileset_data', payload):
@@ -11507,9 +11552,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if not self.IsCollabClientMode():
                 return
             files = payload.get('files') or []
+            download_files = payload.get('download_files')
+            if not isinstance(download_files, list):
+                download_files = files
             expected_files = {}
             total_bytes = int(payload.get('total_bytes', 0) or 0)
-            for entry in files:
+            for entry in download_files:
                 if not isinstance(entry, dict):
                     continue
                 name = str(entry.get('name') or '').strip()
@@ -11793,6 +11841,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     sender,
                     area_num=area_num,
                     include_all_game_tilesets=bool(payload.get('include_all_game_tilesets')),
+                    known_files=payload.get('known_files'),
                 )
         elif msg_type == 'patch_sync_request':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
