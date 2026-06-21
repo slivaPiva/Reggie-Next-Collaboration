@@ -4726,11 +4726,57 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             base_dir = os.getcwd()
         path = os.path.join(base_dir, 'collab_tilesets')
+        game_id = self._CurrentCollabGameDefId() or self._NormalizeCollabGameDefId(getattr(self, '_collabDownloadedOnlineGameId', ''))
+        if game_id:
+            safe_game_id = ''.join(ch if (ch.isalnum() or ch in ('-', '_', '.')) else '_' for ch in str(game_id))
+            safe_game_id = safe_game_id.strip(' ._')
+            if safe_game_id:
+                path = os.path.join(path, safe_game_id)
         try:
             os.makedirs(path, exist_ok=True)
         except Exception:
             pass
         return path
+
+    def _GetCollabDownloadedOnlineGameId(self):
+        game_id = self._NormalizeCollabGameDefId(getattr(self, '_collabDownloadedOnlineGameId', ''))
+        if game_id:
+            return game_id
+        if self.IsCollabClientMode() and self._CurrentCollabGameRootPath() == GAMEDEF_ONLINE_PATCH_ROOT:
+            return self._CurrentCollabGameDefId()
+        return ''
+
+    def _GetCollabDownloadedOnlineGameDir(self, game_id=None):
+        game_id = self._NormalizeCollabGameDefId(game_id) or self._GetCollabDownloadedOnlineGameId()
+        if not game_id:
+            return ''
+        try:
+            folder = ResolveGameDefDirectory(game_id, prefer_online=True, primary_root=GAMEDEF_ONLINE_PATCH_ROOT)
+        except Exception:
+            folder = None
+        if not folder:
+            return ''
+        try:
+            folder = os.path.abspath(folder)
+        except Exception:
+            folder = str(folder)
+        return folder if os.path.isdir(folder) else ''
+
+    def _GetCollabHostedStageDir(self):
+        if self.IsCollabClientMode():
+            game_dir = self._GetCollabDownloadedOnlineGameDir()
+            if game_dir:
+                stage_dir = os.path.join(game_dir, 'Stage')
+                try:
+                    os.makedirs(stage_dir, exist_ok=True)
+                except Exception:
+                    pass
+                return stage_dir
+
+        try:
+            return str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+        except Exception:
+            return ''
 
     def _GetTilesetFinalDir(self):
         """
@@ -4738,10 +4784,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         User expectation: <StageGamePath>\\Texture\\
         """
-        try:
-            stage_dir = str(getattr(globals_, 'gamedef', None).GetStageGamePath() or '')
-        except Exception:
-            stage_dir = ''
+        stage_dir = self._GetCollabHostedStageDir()
         if not stage_dir:
             return None
         out_dir = os.path.join(stage_dir, 'Texture')
@@ -4751,6 +4794,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
             # If we can't create it (permissions, invalid path), fall back later.
             return None
         return out_dir
+
+    def _GetTilesetDownloadPath(self, name):
+        name = str(name or '')
+        if not name:
+            return os.path.join(self._GetTilesetCacheDir(), '.arc')
+        return os.path.join(self._GetTilesetCacheDir(), '%s.arc' % name)
 
     def _GetTilesetOverridePath(self, name):
         """
@@ -5694,6 +5743,57 @@ class ReggieWindow(QtWidgets.QMainWindow):
     def _BuildCollabKnownTilesetHashes(self, include_all_game_tilesets=False):
         known = {}
 
+        if include_all_game_tilesets:
+            search_dirs = []
+            try:
+                final_dir = self._GetTilesetFinalDir()
+            except Exception:
+                final_dir = None
+            if final_dir:
+                search_dirs.append(final_dir)
+            try:
+                cache_dir = self._GetTilesetCacheDir()
+            except Exception:
+                cache_dir = None
+            if cache_dir:
+                search_dirs.append(cache_dir)
+
+            seen_names = set()
+            for base_path in search_dirs:
+                base_path = str(base_path or '').strip()
+                if not base_path or not os.path.isdir(base_path):
+                    continue
+                try:
+                    filenames = sorted(os.listdir(base_path))
+                except Exception:
+                    continue
+                for filename in filenames:
+                    lower_name = filename.lower()
+                    tileset_name = ''
+                    if lower_name.endswith('.arc.lh'):
+                        tileset_name = filename[:-7]
+                    elif lower_name.endswith('.arc'):
+                        tileset_name = filename[:-4]
+                    if not tileset_name or tileset_name in seen_names:
+                        continue
+                    full_path = os.path.join(base_path, filename)
+                    if not os.path.isfile(full_path):
+                        continue
+                    try:
+                        with open(full_path, 'rb') as f:
+                            raw = f.read()
+                    except Exception:
+                        continue
+                    if lower_name.endswith('.arc.lh') and raw:
+                        try:
+                            if (raw[0] & 0xF0) == 0x40:
+                                raw = lh.UncompressLH(raw)
+                        except Exception:
+                            continue
+                    seen_names.add(tileset_name)
+                    known[str(tileset_name)] = self._TilesetBytesSha1(raw)
+            return known
+
         slot_map = [(slot, self._GetTilesetNameForSlot(slot)) for slot in range(4)]
         if include_all_game_tilesets:
             try:
@@ -5823,9 +5923,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
             blocked = True
             tileset_state = getattr(self, '_collabTilesetSyncState', None)
             if str((tileset_state or {}).get('phase') or 'download') == 'apply':
-                reason = 'Applying host tilesets...'
+                reason = 'Applying patch tilesets...'
             else:
-                reason = 'Downloading host tilesets...'
+                reason = 'Downloading patch tilesets...'
         elif bool(getattr(self, '_collabAwaitingInitialSceneState', False)):
             blocked = True
             reason = 'Synchronizing host objects...'
@@ -5904,7 +6004,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             dlg.setMaximum(total)
             dlg.setValue(progress)
             if label is None:
-                label = 'Applying host tilesets... %d/%d files' % (
+                label = 'Applying patch tilesets... %d/%d files' % (
                     int(state.get('applied_files') or 0),
                     total,
                 )
@@ -5919,7 +6019,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             dlg.setValue(progress)
             if label is None:
                 percent = 100.0 if total <= 0 else (float(progress) / float(total)) * 100.0
-                label = 'Downloading host tilesets... %.1f%% (%d/%d files)\n%s / %s' % (
+                label = 'Downloading patch tilesets... %.1f%% (%d/%d files)\n%s / %s' % (
                     percent,
                     int(state.get('received_files') or 0),
                     int(state.get('total_files') or 0),
@@ -5938,6 +6038,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._CloseCollabTilesetProgressDialog()
         self._RefreshCollabInteractionBlock()
 
+    def _FailCollabTilesetSync(self, message, disconnect=False):
+        self._ResetCollabTilesetSyncState()
+        QtWidgets.QMessageBox.warning(self, 'Collaboration', str(message))
+        if disconnect and self._CollabEnabled():
+            self.HandleCollabStop()
+
     def _StartCollabTilesetSyncProgress(self):
         if not self.IsCollabClientMode():
             return
@@ -5954,7 +6060,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'applied_files': 0,
         }
         self._RefreshCollabInteractionBlock()
-        self._UpdateCollabTilesetProgress('Requesting host tilesets...')
+        self._UpdateCollabTilesetProgress('Requesting patch tilesets...')
 
     def _TrackReceivedCollabTileset(self, name, data):
         state = getattr(self, '_collabTilesetSyncState', None)
@@ -5970,6 +6076,17 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if name in received_names:
             return
 
+        download_path = self._GetTilesetDownloadPath(name)
+        try:
+            with open(download_path, 'wb') as f:
+                f.write(bytes(data or b''))
+        except Exception as e:
+            self._FailCollabTilesetSync(
+                'Unable to write a downloaded patch tileset.\n%s' % str(e),
+                disconnect=True,
+            )
+            return
+
         expected = (state.get('expected_files') or {}).get(name) or {}
         received_names.add(name)
         state['received_files'] = int(state.get('received_files', 0) or 0) + 1
@@ -5980,7 +6097,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         total_files = int(state.get('total_files', 0) or 0)
         if total_files > 0 and int(state.get('received_files', 0) or 0) >= total_files:
-            self._UpdateCollabTilesetProgress('Downloaded host tilesets.')
+            self._UpdateCollabTilesetProgress('Downloaded patch tilesets.')
             state['complete'] = True
             return
         self._UpdateCollabTilesetProgress()
@@ -6017,6 +6134,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         state = getattr(self, '_collabTilesetSyncState', None)
         if not isinstance(state, dict):
             return
+        self._UpdateCollabTilesetProgress('Preparing downloaded patch tilesets...')
+        if not self._InstallDownloadedCollabTilesets():
+            return
         state['phase'] = 'apply'
         self._RefreshCollabInteractionBlock()
         self._BuildPendingTilesetApplyQueue()
@@ -6026,8 +6146,54 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             self._ProcessPendingTilesetPayloadBatch()
 
+    def _InstallDownloadedCollabTilesets(self):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return False
+        if not self.IsCollabClientMode():
+            return True
+        if self._CurrentCollabGameRootPath() != GAMEDEF_ONLINE_PATCH_ROOT:
+            return True
+
+        final_dir = self._GetTilesetFinalDir()
+        if not final_dir:
+            self._FailCollabTilesetSync(
+                'Unable to find the downloaded online patch Texture folder for patch tilesets.',
+                disconnect=True,
+            )
+            return False
+
+        expected_files = state.get('expected_files') or {}
+        received_names = state.get('received_names') or set()
+        names = [name for name in expected_files if name in received_names]
+        if not names:
+            names = sorted(received_names)
+
+        try:
+            for name in names:
+                name = str(name or '').strip()
+                if not name:
+                    continue
+                src_path = self._GetTilesetDownloadPath(name)
+                dst_path = os.path.join(final_dir, '%s.arc' % name)
+                if not os.path.isfile(src_path):
+                    raise OSError('Missing downloaded patch tileset: %s' % name)
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                if os.path.isdir(dst_path):
+                    shutil.rmtree(dst_path, ignore_errors=True)
+                elif os.path.exists(dst_path):
+                    os.remove(dst_path)
+                shutil.move(src_path, dst_path)
+        except Exception as e:
+            self._FailCollabTilesetSync(
+                'Unable to move downloaded patch tilesets into the online patch folder.\n%s' % str(e),
+                disconnect=True,
+            )
+            return False
+        return True
+
     def _CompleteDeferredCollabTilesetApply(self):
-        self._UpdateCollabTilesetProgress('Applied host tilesets.')
+        self._UpdateCollabTilesetProgress('Applied patch tilesets.')
         self._ResetCollabTilesetSyncState()
         try:
             self._CollabEnsureClientFollowsHostLevel()
@@ -6044,12 +6210,6 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
 
         state['phase'] = 'apply'
-        if globals_.Area is None or globals_.Level is None:
-            try:
-                self._collabTilesetApplyTimer.start(50)
-            except Exception:
-                pass
-            return
 
         queue_ = state.get('apply_queue')
         if not isinstance(queue_, collections.deque):
@@ -6181,21 +6341,25 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         if not self._CollabEnabled():
             return
-        if globals_.Area is None:
+        if self._CollabTilesetSyncInProgress():
+            return
+        if globals_.Area is None and not include_all_game_tilesets:
             return
         if not force and not self._NeedsCollabTilesetSync():
             return
-        self._StartCollabTilesetSyncProgress()
         known_files = self._BuildCollabKnownTilesetHashes(include_all_game_tilesets=include_all_game_tilesets)
+        self._StartCollabTilesetSyncProgress()
         try:
-            self.collabManager.broadcast_message('tileset_sync_request', {
-                'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0),
-                'level_name': self._CollabCurrentLevelName(),
+            sent = self.collabManager.broadcast_message('tileset_sync_request', {
+                'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0) if globals_.Area is not None else None,
+                'level_name': self._CollabCurrentLevelName() if globals_.Area is not None else '',
                 'include_all_game_tilesets': bool(include_all_game_tilesets),
                 'known_files': known_files,
             })
         except Exception:
-            pass
+            sent = False
+        if not sent:
+            self._ResetCollabTilesetSyncState()
 
     def _HostSendTilesetsToPeer(self, peer_session_id, area_num=None, include_all_game_tilesets=False, known_files=None):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
@@ -6330,9 +6494,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         level_name = self._CollabNormalizeLevelName(level_name)
         if not level_name:
             return False
-        stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
-        if stage_dir:
-            self.fileSavePath = os.path.join(stage_dir, *level_name.split('/'))
+        target_path = self._CollabHostedStageFilePath(level_name)
+        if target_path:
+            self.fileSavePath = target_path
         else:
             self.fileSavePath = str(level_name)
         self.fileTitle = level_name
@@ -6853,12 +7017,6 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.BroadcastFullLevelSnapshot()
             self.BroadcastFullSceneState()
             self.BroadcastFullMetaState()
-            # Send current tilesets proactively so clients don't rely on their
-            # local game files matching the host.
-            try:
-                self._HostBroadcastTilesetsToAllPeers()
-            except Exception:
-                pass
             try:
                 self._ScheduleCollabSelectionBroadcast(delay_ms=0, force=True)
             except Exception:
@@ -7461,10 +7619,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.TryApplyPendingRemoteSnapshot()
         except Exception:
             pass
-        try:
-            self._CollabEnsureClientFollowsHostLevel()
-        except Exception:
-            pass
+        if not self._CollabTilesetSyncInProgress():
+            try:
+                self._CollabEnsureClientFollowsHostLevel()
+            except Exception:
+                pass
 
     def _HostSendPatchFilesToPeer(self, peer_session_id, game_def_id=None, known_files=None):
         if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
@@ -8633,7 +8792,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabAreaMetaState = self._CollabMetaCacheForLevel(current_level_name, create=True)
 
     def _CollabHostedStageFilePath(self, level_name):
-        stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
+        stage_dir = self._GetCollabHostedStageDir()
         level_name = self._CollabNormalizeLevelName(level_name)
         if not stage_dir or not level_name:
             return ''
@@ -11567,10 +11726,22 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     'size': int(entry.get('size', 0) or 0),
                     'sha1': str(entry.get('sha1') or ''),
                 }
+            total_files = int(payload.get('file_count', len(expected_files)) or len(expected_files))
+            if total_files <= 0:
+                self._ResetCollabTilesetSyncState()
+                try:
+                    self._CollabEnsureClientFollowsHostLevel()
+                except Exception:
+                    pass
+                try:
+                    QtCore.QTimer.singleShot(0, self.TryApplyPendingRemoteSnapshot)
+                except Exception:
+                    pass
+                return
             self._collabTilesetSyncState = {
                 'expected_files': expected_files,
                 'received_names': set(),
-                'total_files': int(payload.get('file_count', len(expected_files)) or len(expected_files)),
+                'total_files': total_files,
                 'total_bytes': total_bytes if total_bytes > 0 else sum(
                     max(0, int(info.get('size', 0) or 0)) for info in expected_files.values()
                 ),
@@ -11587,8 +11758,6 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     int(self._collabTilesetSyncState.get('total_files', 0) or 0),
                 )
             )
-            if int(self._collabTilesetSyncState.get('total_files', 0) or 0) <= 0:
-                self._BeginDeferredCollabTilesetApply()
             return
 
         if globals_.Area is None or globals_.Level is None:
