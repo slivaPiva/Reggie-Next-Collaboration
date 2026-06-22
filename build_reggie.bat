@@ -6,3 +6,4 @@ echo Older PyInstaller command line:
 echo pyinstaller --upx-dir=/path/to/upx --windowed -y --onefile reggie.py
 echo
 python -OO build_reggie.py
+pause

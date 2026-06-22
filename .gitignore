@@ -28,6 +28,12 @@ reggiedata/patches_online
 *.spec
 build.bat
 
+# Patch folder
+reggiedata/patches/*
+!reggiedata/patches/NewerSMBW/
+!reggiedata/patches/NewerSMBW/**
+reggiedata/patches/NewerSMBW/__pycache__
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
