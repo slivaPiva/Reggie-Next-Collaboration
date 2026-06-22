@@ -131,6 +131,7 @@ QPT_AVAILABLE = True
 QPT_INITIALIZED = False
 _qpt_functions = None
 STARTUP_CLI_OPTIONS = {}
+COLLAB_RUNTIME_INSTANCE_ID = uuid.uuid4().hex[:12]
 
 
 def _parse_startup_cli_options(argv=None):
@@ -199,6 +200,33 @@ def _get_reggie_base_dir():
         return os.path.dirname(os.path.abspath(__file__))
     except Exception:
         return os.getcwd()
+
+
+def _get_collab_runtime_dir():
+    """
+    Return a per-process collaboration runtime directory.
+
+    Multiple Reggie instances launched from the same folder must not share
+    transient collaboration caches, otherwise localhost host/client sessions
+    can race on downloaded tilesets and patch staging files.
+    """
+    path = os.path.join(_get_reggie_base_dir(), 'collab_runtime', COLLAB_RUNTIME_INSTANCE_ID)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _get_collab_debug_log_path():
+    return os.path.join(_get_collab_runtime_dir(), 'collaboration-debug.log')
+
+
+def _collab_runtime_logs_enabled():
+    try:
+        return bool(setting('CollabRuntimeLogsEnabled', False))
+    except Exception:
+        return False
 
 
 def _get_quickpaint_dir():
@@ -1385,6 +1413,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.LevelBackupTimer.start(300000)
         self._GetBackupsDir()
         self.collabManager = CollaborationManager(self)
+        self.collabManager.set_debug_logger(self._HandleCollabManagerDebugLog)
         self.collabManager.set_room_info_provider(self._BuildCollabRoomInfo)
 #       self.collabManager.set_peer_intro_validator(self._ValidateCollabPeerIntro)
         self.collabManager.statusChanged.connect(self.HandleCollaborationStatus)
@@ -1553,6 +1582,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabTilesetApplyTimer = QtCore.QTimer(self)
         self._collabTilesetApplyTimer.setSingleShot(True)
         self._collabTilesetApplyTimer.timeout.connect(self._ProcessPendingTilesetPayloadBatch)
+        self._collabTilesetSyncWatchdogTimer = QtCore.QTimer(self)
+        self._collabTilesetSyncWatchdogTimer.setSingleShot(True)
+        self._collabTilesetSyncWatchdogTimer.timeout.connect(self._HandleCollabTilesetSyncWatchdogTimeout)
         self._collabPendingTilesetPayloads = []
 
         # set up actions and menus
@@ -1648,6 +1680,37 @@ class ReggieWindow(QtWidgets.QMainWindow):
         globals_.Initializing = False
         self.UpdateSaveActionsForCollabMode()
         self._ScheduleStartupCliActions()
+
+    def _CollabDebugLog(self, event, **fields):
+        if not _collab_runtime_logs_enabled():
+            return
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        parts = [
+            timestamp,
+            'pid=%s' % os.getpid(),
+            'instance=%s' % COLLAB_RUNTIME_INSTANCE_ID,
+            'event=%s' % str(event or ''),
+        ]
+        for key in sorted(fields):
+            value = fields.get(key)
+            try:
+                if isinstance(value, (dict, list, tuple, set)):
+                    rendered = repr(value)
+                else:
+                    rendered = str(value)
+            except Exception:
+                rendered = '<unreprable>'
+            parts.append('%s=%s' % (str(key), rendered.replace('\r', '\\r').replace('\n', '\\n')))
+        try:
+            with open(_get_collab_debug_log_path(), 'a', encoding='utf-8') as f:
+                f.write(' | '.join(parts) + '\n')
+        except Exception:
+            pass
+
+    def _HandleCollabManagerDebugLog(self, **fields):
+        event = str(fields.pop('event', '') or '')
+        self._CollabDebugLog('manager.%s' % event, **fields)
+
     def _GetStartupLevelArg(self):
         cli_level_path = str((getattr(self, '_startupCliOptions', {}) or {}).get('level_path') or '').strip()
         if cli_level_path:
@@ -4726,11 +4789,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         return slots
 
     def _GetTilesetCacheDir(self):
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-        except Exception:
-            base_dir = os.getcwd()
-        path = os.path.join(base_dir, 'collab_tilesets')
+        path = os.path.join(_get_collab_runtime_dir(), 'collab_tilesets')
         game_id = self._CurrentCollabGameDefId() or self._NormalizeCollabGameDefId(getattr(self, '_collabDownloadedOnlineGameId', ''))
         if game_id:
             safe_game_id = ''.join(ch if (ch.isalnum() or ch in ('-', '_', '.')) else '_' for ch in str(game_id))
@@ -5004,8 +5063,16 @@ class ReggieWindow(QtWidgets.QMainWindow):
             pass
         self._ReloadTilesetNameEverywhere(name)
 
+        initial_signature = self._GetTilesetEditFileSignature(override_path)
+
         # (Re)start file watcher for this tileset edit session.
-        self._tilesetEditSession = {'name': name, 'path': override_path, 'flush_retry_count': 0}
+        self._tilesetEditSession = {
+            'name': name,
+            'path': override_path,
+            'flush_retry_count': 0,
+            'last_seen_signature': initial_signature,
+            'stable_signature_candidate': None,
+        }
         try:
             with open(override_path, 'rb') as f:
                 self._collabTilesetSha1ByName[name] = self._TilesetBytesSha1(f.read())
@@ -5056,12 +5123,33 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 pass
         self.collabManager.broadcast_message('tileset_update', payload)
 
+    def _GetTilesetEditFileSignature(self, path):
+        path = str(path or '')
+        if not path:
+            return None
+        try:
+            stat_result = os.stat(path)
+        except Exception:
+            return None
+        return (int(getattr(stat_result, 'st_mtime_ns', 0) or 0), int(getattr(stat_result, 'st_size', 0) or 0))
+
     def _PollTilesetEditorProcess(self):
         session = getattr(self, '_tilesetEditSession', None)
         process = getattr(self, '_tilesetEditProcess', None)
         if not isinstance(session, dict) or process is None:
             self._tilesetEditProcessTimer.stop()
             return
+
+        try:
+            path = str(session.get('path') or '')
+            current_signature = self._GetTilesetEditFileSignature(path)
+            previous_signature = session.get('last_seen_signature')
+            if current_signature is not None and current_signature != previous_signature:
+                session['last_seen_signature'] = current_signature
+                self._tilesetEditPendingPath = path
+                self._tilesetEditDebounce.start(150)
+        except Exception:
+            pass
 
         try:
             return_code = process.poll()
@@ -5137,6 +5225,17 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not name:
             return
 
+        current_signature = self._GetTilesetEditFileSignature(path)
+        stable_signature_candidate = self._tilesetEditSession.get('stable_signature_candidate')
+        if current_signature is None:
+            if self._RetryTilesetEditorFileChanged(150):
+                return
+            return
+        if stable_signature_candidate != current_signature:
+            self._tilesetEditSession['stable_signature_candidate'] = current_signature
+            if self._RetryTilesetEditorFileChanged(150):
+                return
+
         try:
             with open(path, 'rb') as f:
                 data = f.read()
@@ -5150,9 +5249,18 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if self._RetryTilesetEditorFileChanged(150):
                 return
             return
+        try:
+            self._tilesetEditSession['last_seen_signature'] = current_signature
+            self._tilesetEditSession['stable_signature_candidate'] = None
+        except Exception:
+            pass
 
         new_sha1 = self._TilesetBytesSha1(data)
         if new_sha1 and new_sha1 == str(self._collabTilesetSha1ByName.get(name) or ''):
+            try:
+                self._tilesetEditSession['flush_retry_count'] = 0
+            except Exception:
+                pass
             return
 
         try:
@@ -5174,18 +5282,47 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._ReloadTilesetNameEverywhere(name)
         self._BroadcastCollabTilesetBytes(name, data, slots=self._GetTilesetSlotsForName(name))
 
-    def _ReloadTilesetNameEverywhere(self, name):
-        name = str(name or '')
-        if not name or globals_.Area is None:
+    def _ReloadTilesetNamesEverywhere(self, names):
+        ordered_names = []
+        seen_names = set()
+        for name in names or ():
+            name = str(name or '').strip()
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            ordered_names.append(name)
+        if not ordered_names or globals_.Area is None:
             return
-        slots = self._GetTilesetSlotsForName(name)
+        try:
+            LoadTilesetInfo(True)
+        except Exception:
+            pass
+
+        slots = []
+        seen_slots = set()
+        for name in ordered_names:
+            for slot in self._GetTilesetSlotsForName(name):
+                try:
+                    slot = int(slot)
+                except Exception:
+                    continue
+                if slot in seen_slots:
+                    continue
+                seen_slots.add(slot)
+                slots.append(slot)
+
         for slot in slots:
             try:
-                LoadTileset(int(slot), name, reload_=True)
+                UnloadTileset(slot)
+                LoadTileset(slot, self._GetTilesetNameForSlot(slot), reload_=True)
             except Exception:
                 pass
 
         # Refresh object picker even if tileset names didn't change.
+        try:
+            self.objPicker.LoadFromTilesets()
+        except Exception:
+            pass
         try:
             self._lastObjectPickerTilesets = None
         except Exception:
@@ -5210,6 +5347,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
             pass
 
         self._RefreshQuickPaintTilesetState()
+
+    def _ReloadTilesetNameEverywhere(self, name):
+        self._ReloadTilesetNamesEverywhere([name])
 
     def _RefreshQuickPaintTilesetState(self, schedule_retry=True):
         """
@@ -5859,7 +5999,20 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 final_dir = self._GetTilesetFinalDir()
             except Exception:
                 final_dir = None
-            if final_dir:
+            allow_final_dir = bool(final_dir)
+            if allow_final_dir and self.IsCollabClientMode():
+                current_root = self._CurrentCollabGameRootPath()
+                # Same-folder localhost sessions can share Stage\Texture.
+                # Only trust the final dir as a private cache when we are using
+                # a downloaded online patch root.
+                allow_final_dir = (current_root == GAMEDEF_ONLINE_PATCH_ROOT)
+                if not allow_final_dir:
+                    self._CollabDebugLog(
+                        'tileset.known_hashes.skip_final_dir',
+                        final_dir=final_dir,
+                        reason='shared_stage_texture_directory',
+                    )
+            if final_dir and allow_final_dir:
                 search_dirs.append(final_dir)
             try:
                 cache_dir = self._GetTilesetCacheDir()
@@ -6139,9 +6292,103 @@ class ReggieWindow(QtWidgets.QMainWindow):
         dlg.setLabelText(label)
         self._ShowPassiveCollabProgressDialog(dlg)
 
+    def _TouchCollabTilesetSyncProgress(self, reason):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            try:
+                self._collabTilesetSyncWatchdogTimer.stop()
+            except Exception:
+                pass
+            return
+
+        state['last_progress_at'] = time.monotonic()
+        state['last_progress_reason'] = str(reason or '')
+        try:
+            self._collabTilesetSyncWatchdogTimer.start(15000)
+        except Exception:
+            pass
+
+    def _HandleCollabTilesetSyncWatchdogTimeout(self):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return
+
+        phase = str(state.get('phase') or 'download')
+        expected_files = state.get('expected_files') or {}
+        received_files = int(state.get('received_files', 0) or 0)
+        total_files = int(state.get('total_files', 0) or 0)
+        pending_payloads = len(getattr(self, '_collabPendingTilesetPayloads', []) or [])
+        queue_ = state.get('apply_queue')
+        queue_len = len(queue_) if isinstance(queue_, collections.deque) else 0
+        self._CollabDebugLog(
+            'tileset.sync.watchdog_timeout',
+            phase=phase,
+            received_files=received_files,
+            total_files=total_files,
+            host_done_seen=bool(state.get('host_done_seen')),
+            pending_payloads=pending_payloads,
+            apply_queue_len=queue_len,
+            last_progress_reason=str(state.get('last_progress_reason') or ''),
+            expected_files=sorted(str(name or '') for name in expected_files.keys() if str(name or ''))[:24],
+        )
+
+        if phase == 'apply':
+            if queue_len or pending_payloads:
+                self._TouchCollabTilesetSyncProgress('watchdog.resume_apply')
+                try:
+                    self._collabTilesetApplyTimer.start(0)
+                except Exception:
+                    self._ProcessPendingTilesetPayloadBatch()
+                return
+            self._CompleteDeferredCollabTilesetApply()
+            return
+
+        if total_files <= 0 and not expected_files:
+            self._FinishCollabTilesetSyncWithoutDownloads()
+            return
+
+        if total_files > 0 and received_files >= total_files:
+            self._BeginDeferredCollabTilesetApply()
+            return
+
+        retry_count = int(state.get('watchdog_retries', 0) or 0)
+        if retry_count < 1:
+            state['watchdog_retries'] = retry_count + 1
+            self._CollabDebugLog(
+                'tileset.sync.watchdog_retry',
+                retry_count=state['watchdog_retries'],
+                pending_payloads=pending_payloads,
+                remaining_expected=sorted(str(name or '') for name in expected_files.keys() if str(name or ''))[:24],
+            )
+            self._TouchCollabTilesetSyncProgress('sync.watchdog_retry')
+            try:
+                sent = self.collabManager.broadcast_message('tileset_sync_request', {
+                    'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0) if globals_.Area is not None else None,
+                    'level_name': self._CollabCurrentLevelName() if globals_.Area is not None else '',
+                    'include_all_game_tilesets': bool(state.get('include_all_game_tilesets')),
+                    'known_files': self._BuildCollabKnownTilesetHashes(
+                        include_all_game_tilesets=bool(state.get('include_all_game_tilesets'))
+                    ),
+                })
+            except Exception:
+                sent = False
+            if sent:
+                return
+
+        missing_names = sorted(str(name or '') for name in expected_files.keys() if str(name or ''))
+        self._FailCollabTilesetSync(
+            'Timed out waiting for host tilesets.\nMissing tilesets: %s'
+            % (', '.join(missing_names[:8]) if missing_names else 'unknown'),
+            disconnect=True,
+        )
+
     def _ResetCollabTilesetSyncState(self):
         try:
             self._collabTilesetApplyTimer.stop()
+        except Exception:
+            pass
+        try:
+            self._collabTilesetSyncWatchdogTimer.stop()
         except Exception:
             pass
         self._collabTilesetSyncState = None
@@ -6168,13 +6415,18 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'apply_queue': collections.deque(),
             'apply_total': 0,
             'applied_files': 0,
+            'apply_changed_names': set(),
             'host_done_seen': False,
             'host_done_retries': 0,
+            'watchdog_retries': 0,
         }
+        self._CollabDebugLog('tileset.sync.start')
         self._RefreshCollabInteractionBlock()
         self._UpdateCollabTilesetProgress('Requesting patch tilesets...')
+        self._TouchCollabTilesetSyncProgress('sync.start')
 
     def _FinishCollabTilesetSyncWithoutDownloads(self):
+        self._CollabDebugLog('tileset.sync.finish_without_downloads')
         self._ResetCollabTilesetSyncState()
         try:
             self._CollabEnsureClientFollowsHostLevel()
@@ -6184,6 +6436,27 @@ class ReggieWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self.TryApplyPendingRemoteSnapshot)
         except Exception:
             pass
+
+    def _MaybeContinueDeferredCollabTilesetSync(self):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return False
+        if not bool(state.get('host_done_seen')):
+            return False
+        if globals_.Area is None or globals_.Level is None:
+            return False
+        total_files = int(state.get('total_files', 0) or 0)
+        received_files = int(state.get('received_files', 0) or 0)
+        if total_files > 0 and received_files < total_files:
+            return False
+        self._CollabDebugLog(
+            'tileset.sync.resume_after_level_ready',
+            received_files=received_files,
+            total_files=total_files,
+            pending_payloads=len(getattr(self, '_collabPendingTilesetPayloads', []) or []),
+        )
+        self._BeginDeferredCollabTilesetApply()
+        return True
 
     def _PrimeCollabTilesetSyncFromLocalFiles(self):
         state = getattr(self, '_collabTilesetSyncState', None)
@@ -6231,6 +6504,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
         state['expected_files'] = expected_files
         state['received_files'] = int(state.get('received_files', 0) or 0) + len(matched_names)
         state['received_bytes'] = int(state.get('received_bytes', 0) or 0) + matched_bytes
+        self._CollabDebugLog(
+            'tileset.sync.prime_local_matches',
+            matched_count=len(matched_names),
+            matched_names=matched_names,
+            matched_bytes=matched_bytes,
+            remaining_expected=sorted(expected_files.keys()),
+        )
+        self._TouchCollabTilesetSyncProgress('sync.prime_local_matches')
         return len(matched_names)
 
     def _TrackReceivedCollabTileset(self, name, data):
@@ -6265,6 +6546,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
             0,
             int(expected.get('size', 0) or len(data or b'')),
         )
+        self._CollabDebugLog(
+            'tileset.sync.received_file',
+            name=name,
+            received_files=state.get('received_files', 0),
+            total_files=state.get('total_files', 0),
+            expected_size=expected.get('size', 0),
+            payload_size=len(data or b''),
+        )
+        self._TouchCollabTilesetSyncProgress('sync.received_file:%s' % name)
 
         total_files = int(state.get('total_files', 0) or 0)
         if total_files > 0 and int(state.get('received_files', 0) or 0) >= total_files:
@@ -6309,6 +6599,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return
         if str(state.get('phase') or '') == 'apply':
             return
+        self._CollabDebugLog(
+            'tileset.sync.begin_apply',
+            received_files=state.get('received_files', 0),
+            total_files=state.get('total_files', 0),
+            pending_payloads=len(getattr(self, '_collabPendingTilesetPayloads', []) or []),
+        )
         self._UpdateCollabTilesetProgress('Preparing downloaded patch tilesets...')
         if not self._InstallDownloadedCollabTilesets():
             return
@@ -6316,6 +6612,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._RefreshCollabInteractionBlock()
         self._BuildPendingTilesetApplyQueue()
         self._UpdateCollabTilesetProgress()
+        self._TouchCollabTilesetSyncProgress('sync.begin_apply')
         try:
             self._collabTilesetApplyTimer.start(0)
         except Exception:
@@ -6326,10 +6623,25 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not isinstance(state, dict):
             return
         state['host_done_seen'] = True
+        self._CollabDebugLog(
+            'tileset.sync.host_done',
+            payload=payload or {},
+            received_files=state.get('received_files', 0),
+            total_files=state.get('total_files', 0),
+            expected_files=sorted((state.get('expected_files') or {}).keys()),
+        )
+        self._TouchCollabTilesetSyncProgress('sync.host_done')
 
         self._PrimeCollabTilesetSyncFromLocalFiles()
         total_files = int(state.get('total_files', 0) or 0)
         received_files = int(state.get('received_files', 0) or 0)
+        if globals_.Area is None or globals_.Level is None:
+            self._CollabDebugLog(
+                'tileset.sync.host_done.defer_until_level_ready',
+                received_files=received_files,
+                total_files=total_files,
+            )
+            return
         if total_files > 0 and received_files < total_files:
             retry_count = int(state.get('host_done_retries', 0) or 0)
             if retry_count < 8:
@@ -6407,6 +6719,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         return True
 
     def _CompleteDeferredCollabTilesetApply(self):
+        self._CollabDebugLog('tileset.sync.apply_complete')
         self._UpdateCollabTilesetProgress('Applied patch tilesets.')
         self._ResetCollabTilesetSyncState()
         try:
@@ -6438,12 +6751,31 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         start_time = time.monotonic()
         processed_any = False
+        changed_names = state.get('apply_changed_names')
+        if not isinstance(changed_names, set):
+            changed_names = set()
+            state['apply_changed_names'] = changed_names
+
         while queue_:
             payload = queue_.popleft()
             name, data, slots = self._DecodeTilesetPayload(payload)
             if name and data:
-                self._ApplyCollabTilesetBytes(name, data, slots=slots, broadcast=False)
+                self._CollabDebugLog(
+                    'tileset.sync.apply_file',
+                    name=name,
+                    slots=slots or [],
+                    queue_remaining=len(queue_),
+                )
+                if self._ApplyCollabTilesetBytes(
+                    name,
+                    data,
+                    slots=slots,
+                    broadcast=False,
+                    reload_ui=False,
+                ):
+                    changed_names.add(str(name))
                 state['applied_files'] = int(state.get('applied_files', 0) or 0) + 1
+                self._TouchCollabTilesetSyncProgress('sync.apply_file:%s' % name)
                 processed_any = True
             if processed_any and (time.monotonic() - start_time) >= 0.03:
                 break
@@ -6457,25 +6789,39 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._collabTilesetApplyTimer.start(0)
             return
 
+        if changed_names:
+            self._ReloadTilesetNamesEverywhere(changed_names)
+
         self._CompleteDeferredCollabTilesetApply()
 
-    def _ApplyCollabTilesetBytes(self, name, data, slots=None, broadcast=False, target_peer=None):
+    def _ApplyCollabTilesetBytes(self, name, data, slots=None, broadcast=False, target_peer=None, reload_ui=True):
         """
         Stores the tileset in the collab cache, reloads it locally,
         and optionally sends it to collaboration peers.
         """
         name = str(name or '')
         if not name:
-            return
+            return False
         raw = bytes(data or b'')
         if not raw:
-            return
+            return False
         raw_sha1 = self._TilesetBytesSha1(raw)
+        self._CollabDebugLog(
+            'tileset.apply.begin',
+            name=name,
+            slots=list(slots or []),
+            size=len(raw),
+            sha1=raw_sha1,
+            broadcast=broadcast,
+            target_peer=target_peer or '',
+            reload_ui=bool(reload_ui),
+        )
         if raw_sha1 and raw_sha1 == str(self._collabTilesetSha1ByName.get(name) or ''):
             # Exact same tileset bytes already applied locally: do not reload
             # caches or repopulate the picker again when users revisit the same
             # area/level. Real reloads should only happen after an actual edit.
-            return
+            self._CollabDebugLog('tileset.apply.skip_same_sha1', name=name, sha1=raw_sha1)
+            return False
 
         active_edit = getattr(self, '_tilesetEditSession', None)
         active_name = str((active_edit or {}).get('name') or '')
@@ -6489,14 +6835,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     self.hoverLabel.setText('Queued remote tileset update for %s until Puzzle closes' % name)
             except Exception:
                 pass
-            return
+            return False
 
         override_path = self._GetTilesetOverridePath(name)
         try:
             with open(override_path, 'wb') as f:
                 f.write(raw)
         except Exception:
-            return
+            self._CollabDebugLog('tileset.apply.write_failed', name=name, override_path=override_path)
+            return False
 
         try:
             globals_.CollabTilesetOverrides[name] = override_path
@@ -6505,11 +6852,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if raw_sha1:
             self._collabTilesetSha1ByName[name] = raw_sha1
 
-        self._ReloadTilesetNameEverywhere(name)
+        if reload_ui:
+            self._ReloadTilesetNameEverywhere(name)
+        self._CollabDebugLog('tileset.apply.done', name=name, override_path=override_path)
 
-        if not broadcast or not self._CollabEnabled():
-            return
-        self._BroadcastCollabTilesetBytes(name, raw, slots=slots, target_peer=target_peer)
+        if broadcast and self._CollabEnabled():
+            self._BroadcastCollabTilesetBytes(name, raw, slots=slots, target_peer=target_peer)
+        return True
 
     def _ScheduleCollabTilesetSync(self, delay_ms=250):
         if not self.IsCollabClientMode():
@@ -6561,7 +6910,17 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not force and not self._NeedsCollabTilesetSync():
             return
         known_files = self._BuildCollabKnownTilesetHashes(include_all_game_tilesets=include_all_game_tilesets)
+        self._CollabDebugLog(
+            'tileset.request_host_now',
+            include_all_game_tilesets=include_all_game_tilesets,
+            force=force,
+            area_num=int(getattr(globals_.Area, 'areanum', 0) or 0) if globals_.Area is not None else 0,
+            known_files_count=len(known_files),
+            known_names=sorted(known_files.keys())[:24],
+        )
         self._StartCollabTilesetSyncProgress()
+        if isinstance(getattr(self, '_collabTilesetSyncState', None), dict):
+            self._collabTilesetSyncState['include_all_game_tilesets'] = bool(include_all_game_tilesets)
         try:
             sent = self.collabManager.broadcast_message('tileset_sync_request', {
                 'area_num': int(getattr(globals_.Area, 'areanum', 0) or 0) if globals_.Area is not None else None,
@@ -6572,6 +6931,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             sent = False
         if not sent:
+            self._CollabDebugLog(
+                'tileset.request_host_now.failed_send',
+                include_all_game_tilesets=include_all_game_tilesets,
+                force=force,
+            )
             self._ResetCollabTilesetSyncState()
 
     def _HostSendTilesetsToPeer(self, peer_session_id, area_num=None, include_all_game_tilesets=False, known_files=None):
@@ -6610,6 +6974,17 @@ class ReggieWindow(QtWidgets.QMainWindow):
             entry for entry in entries
             if str(known_files.get(str(entry.get('name') or '')) or '') != str(entry.get('sha1') or '')
         ]
+        self._CollabDebugLog(
+            'tileset.host_manifest',
+            peer_session_id=peer_session_id,
+            include_all_game_tilesets=include_all_game_tilesets,
+            requested_area_num=area_num,
+            entry_count=len(entries),
+            download_count=len(download_entries),
+            known_files_count=len(known_files),
+            entry_names=[str(entry.get('name') or '') for entry in entries[:24]],
+            download_names=[str(entry.get('name') or '') for entry in download_entries[:24]],
+        )
         manifest = self._BuildCollabTilesetManifestPayload(entries)
         manifest['file_count'] = len(download_entries)
         manifest['total_bytes'] = sum(int(entry.get('size', 0) or 0) for entry in download_entries)
@@ -6716,6 +7091,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         for _name, (payload, _sender, _data, _slots) in latest_by_name.items():
             name, data, slots = self._DecodeTilesetPayload(payload)
             if name and data:
+                self._CollabDebugLog('tileset.apply_pending_payload', name=name, slots=slots or [])
                 self._ApplyCollabTilesetBytes(name, data, slots=slots, broadcast=False)
 
     def _CollabAdoptHostedLevelIdentity(self, level_name):
@@ -7697,7 +8073,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return False
 
         online_root = GAMEDEF_ONLINE_PATCH_ROOT
-        staging_root = os.path.join(online_root, '__incoming__%s' % game_id)
+        staging_root = os.path.join(_get_collab_runtime_dir(), 'patch_staging', game_id)
         os.makedirs(online_root, exist_ok=True)
         shutil.rmtree(staging_root, ignore_errors=True)
         os.makedirs(staging_root, exist_ok=True)
@@ -11973,7 +12349,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 'applied_files': 0,
                 'host_done_seen': False,
                 'host_done_retries': 0,
+                'watchdog_retries': 0,
             }
+            self._TouchCollabTilesetSyncProgress('sync.manifest_received')
             self._PrimeCollabTilesetSyncFromLocalFiles()
             if int(self._collabTilesetSyncState.get('received_files', 0) or 0) >= int(self._collabTilesetSyncState.get('total_files', 0) or 0):
                 self._FinishCollabTilesetSyncWithoutDownloads()
@@ -11995,6 +12373,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
             # During startup, tileset updates may arrive before the level is
             # ready. Keep them around for later.
             if msg_type in {'tileset_data', 'tileset_update'}:
+                if msg_type == 'tileset_data' and isinstance(getattr(self, '_collabTilesetSyncState', None), dict):
+                    try:
+                        name, data, _slots = self._DecodeTilesetPayload(message.get('payload') or {})
+                    except Exception:
+                        name, data = None, None
+                    if name and data:
+                        self._TrackReceivedCollabTileset(name, data)
                 try:
                     self._collabPendingTilesetPayloads.append((message.get('payload') or {}, sender))
                 except Exception:
@@ -12033,7 +12418,16 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._QueuePendingRemoteMessage(message, sender)
             return
 
-        if msg_type not in {'host_hello', 'peer_kicked', 'peer_banned', 'peer_rejected'} and (
+        if msg_type not in {
+            'host_hello',
+            'peer_kicked',
+            'peer_banned',
+            'peer_rejected',
+            'tileset_manifest',
+            'tileset_data',
+            'tileset_update',
+            'tileset_sync_done',
+        } and (
             getattr(self, 'collabSwitchingArea', False)
             or self.collabApplyingRemote
             or self.collabApplyingRemoteHistory
@@ -12239,6 +12633,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         elif msg_type == 'tileset_sync_request':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 area_num = payload.get('area_num')
+                self._CollabDebugLog(
+                    'tileset.host_request_received',
+                    sender=sender,
+                    area_num=area_num,
+                    include_all_game_tilesets=bool(payload.get('include_all_game_tilesets')),
+                    known_files_count=len(payload.get('known_files') or {}),
+                )
                 self._HostSendTilesetsToPeer(
                     sender,
                     area_num=area_num,
@@ -13538,11 +13939,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 getattr(self, '_collabHostCurrentLevelName', '') or getattr(self, 'collabLastLevelName', '')
             )
             if not host_level_name:
+                self._CollabDebugLog('snapshot.defer.wait_host_level', sender=sender, area_num=area_num)
                 self.collabPendingSnapshot = (level_data, area_num, sender)
                 if hasattr(self, 'hoverLabel'):
                     self.hoverLabel.setText('Waiting for the host level information...')
                 return
         if self._CollabPatchSyncInProgress():
+            self._CollabDebugLog('snapshot.defer.patch_sync', sender=sender, area_num=area_num)
             self.collabPendingSnapshot = (level_data, area_num, sender)
             if hasattr(self, 'hoverLabel'):
                 self.hoverLabel.setText('Waiting for the host patch download to finish...')
@@ -13550,6 +13953,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if self.collabApplyingRemote:
             return
         if self.IsLocalEditInProgress():
+            self._CollabDebugLog('snapshot.defer.local_edit', sender=sender, area_num=area_num)
             self.collabPendingSnapshot = (level_data, area_num, sender)
             if hasattr(self, 'hoverLabel'):
                 self.hoverLabel.setText('Queued peer update (area %d) while editing' % area_num)
@@ -13557,6 +13961,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if self.IsCollabClientMode():
             missing_tilesets = self._GetMissingTilesetsForLevelData(level_data, area_num)
             if missing_tilesets:
+                self._CollabDebugLog(
+                    'snapshot.defer.missing_tilesets',
+                    sender=sender,
+                    area_num=area_num,
+                    missing_tilesets=missing_tilesets,
+                )
                 self.collabPendingSnapshot = (level_data, area_num, sender)
                 self._MaybeScheduleCollabTilesetSync(50)
                 if hasattr(self, 'hoverLabel'):
@@ -13581,6 +13991,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self._SetCollabMissingTilesetWarningsSuppressed(True)
             self.collabApplyingRemote = True
             self.collabLastRemoteSender = sender
+            self._CollabDebugLog(
+                'snapshot.apply.begin',
+                sender=sender,
+                area_num=target_area_num,
+                digest=new_digest,
+                initial_client_sync=initial_client_sync,
+                host_level_name=host_level_name,
+            )
             has_local_conflict = self.HasUnsyncedLocalChanges()
             merge_applied, merge_changed = self.TryMergeConcurrentCurrentArea(level_data, area_num)
             if (merge_applied is not None) and has_local_conflict:
@@ -13641,6 +14059,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                             pass
             if hasattr(self, 'hoverLabel'):
                 self.hoverLabel.setText('Applied update from peer (area %d)' % area_num)
+            self._CollabDebugLog('snapshot.apply.done', sender=sender, area_num=area_num, digest=new_digest)
         finally:
             if self.IsCollabClientMode():
                 self._SetCollabMissingTilesetWarningsSuppressed(False)
@@ -15886,6 +16305,17 @@ class ReggieWindow(QtWidgets.QMainWindow):
         globals_.InsertPathNode = dlg.generalTab.insertPathNode.isChecked()
         setSetting('InsertPathNode', globals_.InsertPathNode)
 
+        # Collaboration runtime logging setting
+        collab_runtime_logs_enabled = dlg.generalTab.collabRuntimeLogs.isChecked()
+        setSetting('CollabRuntimeLogsEnabled', collab_runtime_logs_enabled)
+        if not collab_runtime_logs_enabled:
+            try:
+                os.remove(_get_collab_debug_log_path())
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
         # Get the Toolbar tab settings
         boxes = (
             dlg.toolbarTab.FileBoxes, dlg.toolbarTab.EditBoxes, dlg.toolbarTab.ViewBoxes, dlg.toolbarTab.SettingsBoxes,
@@ -17223,12 +17653,27 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabLastLevelName = self._CollabNormalizeLevelName()
             self._CollabSyncCurrentLevelCaches()
             self.UpdateTitle()
+            self._CollabDebugLog(
+                'level.load.done',
+                level_name=self._CollabCurrentLevelName(),
+                area_num=int(getattr(getattr(globals_, 'Area', None), 'areanum', areaNum) or areaNum),
+            )
             self.levelOverview.Reset()
             self.levelOverview.update()
             self._CollabRebuildIndexes()
             self._CollabReapplySelectionOwnership()
             self.RestoreTransientUiState(ui_state)
+            try:
+                self._MaybeContinueDeferredCollabTilesetSync()
+            except Exception:
+                pass
         finally:
+            self._CollabDebugLog(
+                'level.load.finally',
+                area_num=areaNum,
+                current_level=self._CollabCurrentLevelName(),
+                current_area=int(getattr(getattr(globals_, 'Area', None), 'areanum', 0) or 0),
+            )
             globals_.OverrideSnapping = False
             if 'dirty_override_set' in locals() and dirty_override_set:
                 globals_.DirtyOverride -= 1
@@ -17317,6 +17762,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         """
         Load a level from NSMBW into the editor.
         """
+        self._CollabDebugLog(
+            'level.load.begin',
+            name=name,
+            is_full_path=isFullPath,
+            area_num=areaNum,
+            collab_mode=getattr(getattr(self, 'collabManager', None), 'mode', None),
+        )
         new = name is None
         same = False
         restoring_autosave = bool(globals_.RestoredFromAutoSave)
@@ -17422,6 +17874,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             dirty_override_set = True
 
             self._PumpUiDuringAreaLoad('Loading area...')
+            self._CollabDebugLog('level.load.phase', phase='loading_area')
 
             # First, clear out the existing level.
             try:
@@ -17438,6 +17891,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 thingList.selectionModel().setCurrentIndex(QtCore.QModelIndex(), QtCore.QItemSelectionModel.SelectionFlag.Clear)
 
             self._PumpUiDuringAreaLoad('Preparing area...')
+            self._CollabDebugLog('level.load.phase', phase='preparing_area')
 
             # Reset these here, because if they are set after
             # creating the objects, they use the old values.
@@ -17469,6 +17923,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.ResetPalette()
 
             self._PumpUiDuringAreaLoad('Finishing area...')
+            self._CollabDebugLog('level.load.phase', phase='finishing_area')
 
             # Fill up the area list
             self.areaComboBox.clear()
@@ -17553,6 +18008,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._CollabReapplySelectionOwnership()
             if same:
                 self.RestoreTransientUiState(ui_state)
+            try:
+                self._MaybeContinueDeferredCollabTilesetSync()
+            except Exception:
+                pass
 
             if new:
                 SetDirty()
@@ -17611,6 +18070,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         Do not call this directly - use LoadLevel instead!
         """
         # Create the new level object
+        self._CollabDebugLog('level.load_nsmw.begin', area_num=areaNum, level_bytes=len(levelData or b''))
         globals_.Level = Level_NSMBW()
 
         # Load it
@@ -17631,6 +18091,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(None, title, msg)
 
         self.ResetPalette()
+        self._CollabDebugLog('level.load_nsmw.done', area_num=areaNum)
 
     def ResetPalette(self):
         """

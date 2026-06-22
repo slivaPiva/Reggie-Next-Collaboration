@@ -2608,7 +2608,9 @@ def SetupObjectModel(self, objects, tiles):
 
         for i in range(len(object.tiles)):
             for tile in object.tiles[i]:
-                if Tileset.slot == (tile[2] & 3):
+                if (tile[2] & 3) == 0 and tile[1] == 0:
+                    pass
+                elif Tileset.slot == (tile[2] & 3):
                     painter.drawImage(Xoffset, Yoffset, tiles[tile[1]].image)
                 Xoffset += 24
             Xoffset = 0
@@ -4195,7 +4197,11 @@ class tileWidget(QtWidgets.QWidget):
         for row in object.tiles:
             self.tiles.append([])
             for tile in row:
-                if Tileset.slot == (tile[2] & 3):
+                if (tile[2] & 3) == 0 and tile[1] == 0:
+                    img = QtGui.QImage(24, 24, QtGui.QImage.Format.Format_ARGB32)
+                    img.fill(QtCore.Qt.GlobalColor.transparent)
+                    self.tiles[-1].append(img)
+                elif Tileset.slot == (tile[2] & 3):
                     self.tiles[-1].append(Tileset.tiles[tile[1]].image)
                 else:
                     img = QtGui.QImage(24, 24, QtGui.QImage.Format.Format_ARGB32)
@@ -4241,6 +4247,7 @@ class tileWidget(QtWidgets.QWidget):
 
         TileMenu = QtWidgets.QMenu(self)
 
+        TileMenu.addAction('Erase tile', self.eraseTile)
         TileMenu.addAction('Set tile...', self.setTile)
         TileMenu.addAction('Set item...', self.setItem)
         TileMenu.addAction('Set raw data...', self.setRaw)
@@ -4280,22 +4287,14 @@ class tileWidget(QtWidgets.QWidget):
             if pos.x() < upperLeftX or pos.y() < upperLeftY or pos.x() > lowerRightX or pos.y() > lowerRightY:
                 return
 
-            if Tileset.slot == 0:
-                try:
-                    self.tiles[y][x] = Tileset.tiles[0].image
-                    Tileset.objects[self.object].tiles[y][x] = (Tileset.objects[self.object].tiles[y][x][0], 0, 0)
-                except IndexError:
-                    pass
+            img = QtGui.QImage(24, 24, QtGui.QImage.Format.Format_ARGB32)
+            img.fill(QtCore.Qt.GlobalColor.transparent)
 
-            else:
-                img = QtGui.QImage(24, 24, QtGui.QImage.Format.Format_ARGB32)
-                img.fill(QtCore.Qt.GlobalColor.transparent)
-
-                try:
-                    self.tiles[y][x] = img
-                    Tileset.objects[self.object].tiles[y][x] = (Tileset.objects[self.object].tiles[y][x][0], 0, 0)
-                except IndexError:
-                    pass
+            try:
+                self.tiles[y][x] = img
+                Tileset.objects[self.object].tiles[y][x] = (Tileset.objects[self.object].tiles[y][x][0], 0, 0)
+            except IndexError:
+                pass
 
         else:
             if window.tileDisplay.selectedIndexes() == []:
@@ -4365,6 +4364,21 @@ class tileWidget(QtWidgets.QWidget):
         object.setIcon(QtGui.QIcon(tex))
 
         window.objectList.update()
+
+
+    def _applyNullTile(self, x, y):
+        global Tileset
+
+        Tileset.objects[self.object].tiles[y][x] = (Tileset.objects[self.object].tiles[y][x][0], 0, 0)
+        window.tileWidget.setObject(Tileset.objects[self.object])
+        self.update()
+        self.updateList()
+
+
+    def eraseTile(self):
+        x = self.contX
+        y = self.contY
+        self._applyNullTile(x, y)
 
 
 
@@ -6826,6 +6840,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._SetTileImageByIndex(idx, blank)
 
 
+    def _ClearTileByIndex(self, index):
+        if index is None or index < 0 or index >= len(Tileset.tiles):
+            return
+        self._SetTileImageByIndex(index, self._CreateTransparentTileImage())
+        tile = Tileset.tiles[index]
+        tile.byte0 = 0
+        tile.byte1 = 0
+        tile.byte2 = 0
+        tile.byte3 = 0
+        tile.byte4 = 0
+        tile.byte5 = 0
+        tile.byte6 = 0
+        tile.byte7 = 0
+
+
     def _SetImportedTileRegion(self, region):
         self.importedTileRegion = region
         self.tileDisplay.viewport().update()
@@ -7178,7 +7207,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for row in object.tiles:
             for tile in row:
-                if tile[2] & 3 or not Tileset.slot:
+                if ((tile[2] & 3) != 0 or tile[1] != 0) and (tile[2] & 3 or not Tileset.slot):
                     if tile[1] not in tilesReplaced:
                         tilesReplaced.append(tile[1])
 
@@ -7435,7 +7464,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for i in range(len(object.tiles)):
             for tile in object.tiles[i]:
-                if (Tileset.slot == 0) or ((tile[2] & 3) != 0):
+                if ((tile[2] & 3) != 0 or tile[1] != 0) and ((Tileset.slot == 0) or ((tile[2] & 3) != 0)):
                     painter.drawImage(Xoffset, Yoffset, Tileset.tiles[tile[1]].image)
                 Tilebuffer += (Tileset.tiles[tile[1]].byte0).to_bytes(1, 'big')
                 Tilebuffer += (Tileset.tiles[tile[1]].byte1).to_bytes(1, 'big')
@@ -7812,6 +7841,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tile_x, tile_y = self._TileIndexToCoords(self.index.row())
         menu = QtWidgets.QMenu(self)
         menu.addAction('Импортировать картинку сюда...', lambda: self._ImportImageAtTile(tile_x, tile_y))
+        menu.addAction('Стереть тайл', self._EraseTileAtContextIndex)
 
         if self.importedTileClipboard:
             menu.addAction('Вставить скопированную картинку', lambda: self._PasteImportedTileClipboardAt(tile_x, tile_y))
@@ -7827,6 +7857,20 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addSeparator()
         menu.addAction('Изменить raw hex...', self._OpenHexDataEditor)
         menu.exec(self.tileDisplay.viewport().mapToGlobal(QtCore.QPoint(x, y)))
+
+
+    def _EraseTileAtContextIndex(self):
+        if not hasattr(self, 'index') or not self.index.isValid():
+            return
+        tile_index = int(self.index.row())
+        if self._TileIndexInImportedRegion(tile_index):
+            self._SetImportedTileRegion(None)
+        self._ClearTileByIndex(tile_index)
+        self._RefreshTileImageViews()
+        index = self.model.index(tile_index, 0)
+        if index.isValid():
+            self.tileDisplay.setCurrentIndex(index)
+        self.updateInfo(0, 0)
 
 
     def _OpenHexDataEditor(self):

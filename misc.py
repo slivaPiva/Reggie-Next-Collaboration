@@ -1529,6 +1529,9 @@ class PreferencesDialog(QtWidgets.QDialog):
                 self.Trans = QtWidgets.QComboBox()
                 self.Trans.setMaximumWidth(256)
 
+                # Collaboration runtime logging toggle
+                self.collabRuntimeLogs = QtWidgets.QCheckBox(globals_.trans.string('PrefsDlg', 42))
+
                 # Add the Zone Entrance Indicator checkbox
                 self.zEntIndicator = QtWidgets.QCheckBox(globals_.trans.string('PrefsDlg', 31))
 
@@ -1561,6 +1564,7 @@ class PreferencesDialog(QtWidgets.QDialog):
                 L = QtWidgets.QFormLayout()
                 L.addRow(globals_.trans.string('PrefsDlg', 14), self.Trans)
                 L.addRow(globals_.trans.string('PrefsDlg', 15), ClearRecentBtn)
+                L.addWidget(self.collabRuntimeLogs)
                 L.addWidget(self.epbIndicator)
                 L.addRow(globals_.trans.string('PrefsDlg', 36), self.psValue)
                 L.addWidget(self.zEntIndicator)
@@ -1607,6 +1611,7 @@ class PreferencesDialog(QtWidgets.QDialog):
 
                 self.fullObjSize.setChecked(globals_.PlaceObjectsAtFullSize)
                 self.insertPathNode.setChecked(globals_.InsertPathNode)
+                self.collabRuntimeLogs.setChecked(setting('CollabRuntimeLogsEnabled', False))
 
             def ClearRecent(self):
                 """

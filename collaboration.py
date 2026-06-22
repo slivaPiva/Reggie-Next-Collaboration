@@ -702,6 +702,7 @@ class CollaborationManager(QtCore.QObject):
     PUBLIC_LOBBY_URL = "https://lobby.dolphin-emu.org"
     PUBLIC_IP_URL = "https://ip.dolphin-emu.org/"
     PUBLIC_ROOM_VERSION = "Reggie-Next-Collaboration"
+    DIRECT_CONNECT_TIMEOUT_SECONDS = 8.0
     UPNP_DISCOVERY_ADDRESS = ("239.255.255.250", 1900)
     UPNP_SERVICE_TYPES = (
         "urn:schemas-upnp-org:service:WANIPConnection:1",
@@ -767,6 +768,96 @@ class CollaborationManager(QtCore.QObject):
         self._upnp_internal_ip = ""
         self._upnp_external_port = 0
         self._traversal_endpoint = None
+        self._debug_logger = None
+
+    def set_debug_logger(self, logger):
+        self._debug_logger = logger if callable(logger) else None
+
+    @staticmethod
+    def _debug_sanitize(value, depth=0):
+        if depth >= 2:
+            if isinstance(value, dict):
+                return "{...}"
+            if isinstance(value, (list, tuple, set)):
+                return "[...]"
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, bytes):
+            return "<bytes:%d>" % len(value)
+        if isinstance(value, dict):
+            out = {}
+            for key, item in list(value.items())[:12]:
+                out[str(key)] = CollaborationManager._debug_sanitize(item, depth + 1)
+            if len(value) > 12:
+                out["..."] = "+%d keys" % (len(value) - 12)
+            return out
+        if isinstance(value, (list, tuple, set)):
+            seq = list(value)
+            out = [CollaborationManager._debug_sanitize(item, depth + 1) for item in seq[:10]]
+            if len(seq) > 10:
+                out.append("... +%d items" % (len(seq) - 10))
+            return out
+        return repr(value)
+
+    @classmethod
+    def _summarize_message_for_debug(cls, message):
+        if not isinstance(message, dict):
+            return cls._debug_sanitize(message)
+        summary = {
+            "type": str(message.get("type") or ""),
+            "sender": str(message.get("sender") or ""),
+        }
+        if "area" in message:
+            summary["area"] = cls._debug_sanitize(message.get("area"))
+        payload = message.get("payload")
+        if isinstance(payload, dict):
+            summary["payload_keys"] = sorted(str(key) for key in payload.keys())
+            for key in ("area_num", "level_name", "file_count", "total_bytes", "game_id", "host", "current_level_name", "current_area_num"):
+                if key in payload:
+                    summary[key] = cls._debug_sanitize(payload.get(key))
+            if "download_files" in payload:
+                try:
+                    summary["download_files_count"] = len(payload.get("download_files") or [])
+                except Exception:
+                    pass
+            if "files" in payload:
+                try:
+                    summary["files_count"] = len(payload.get("files") or [])
+                except Exception:
+                    pass
+            if "known_files" in payload:
+                try:
+                    summary["known_files_count"] = len(payload.get("known_files") or {})
+                except Exception:
+                    pass
+            if "data" in payload:
+                try:
+                    summary["data_len"] = len(base64.b64decode(payload.get("data") or b""))
+                except Exception:
+                    summary["data_len"] = "<decode-error>"
+        elif payload is not None:
+            summary["payload"] = cls._debug_sanitize(payload)
+        elif "payload" in message:
+            summary["payload"] = None
+        if "payload" in message and isinstance(message.get("payload"), str):
+            summary["payload_len"] = len(message.get("payload") or "")
+        return summary
+
+    def _debug(self, event, **fields):
+        logger = self._debug_logger
+        if logger is None:
+            return
+        data = {
+            "event": str(event or ""),
+            "mode": str(self._mode or ""),
+            "session_id": str(self.session_id or ""),
+        }
+        for key, value in fields.items():
+            data[str(key)] = self._debug_sanitize(value)
+        try:
+            logger(**data)
+        except Exception:
+            pass
 
     @property
     def online_count(self):
@@ -885,6 +976,7 @@ class CollaborationManager(QtCore.QObject):
         self._host_room_mode = room_mode
         self._accept_stop.clear()
         self._mode = "host"
+        self._debug("start_host", port=port, room_mode=room_mode)
         self._ensure_sender_thread()
         if room_mode == "public":
             self.statusChanged.emit("Hosting public room on port %d" % port)
@@ -903,18 +995,63 @@ class CollaborationManager(QtCore.QObject):
 
     def connect_to_host(self, ip, port):
         self.stop()
+        requested_ip = str(ip or "").strip()
         port = int(port)
+        connect_ip = requested_ip
+        if connect_ip.lower() == "localhost":
+            # Keep localhost joins on the IPv4 loopback that the host TCP
+            # server actually listens on.
+            connect_ip = "127.0.0.1"
+        elif connect_ip:
+            try:
+                connect_ip = socket.gethostbyname(connect_ip)
+            except OSError:
+                connect_ip = requested_ip
+
+        self._debug(
+            "connect_to_host_begin",
+            requested_ip=requested_ip,
+            resolved_ip=connect_ip,
+            port=port,
+            timeout_seconds=self.DIRECT_CONNECT_TIMEOUT_SECONDS,
+        )
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        conn.connect((ip, port))
-        conn_id = self._register_connection(conn, (ip, port))
+        conn.settimeout(float(self.DIRECT_CONNECT_TIMEOUT_SECONDS))
+        connect_started = time.monotonic()
+        try:
+            conn.connect((connect_ip, port))
+        except OSError as exc:
+            self._debug(
+                "connect_to_host_failed",
+                requested_ip=requested_ip,
+                resolved_ip=connect_ip,
+                port=port,
+                elapsed_ms=int((time.monotonic() - connect_started) * 1000),
+                error=str(exc),
+            )
+            try:
+                conn.close()
+            except OSError:
+                pass
+            raise
+        conn.settimeout(None)
+        conn_id = self._register_connection(conn, (connect_ip, port))
         self._mode = "client"
-        self._connected_addr = (ip, port)
+        self._connected_addr = (connect_ip, port)
         self._ensure_sender_thread()
-        self.statusChanged.emit("Connected to %s:%d" % (ip, port))
+        self.statusChanged.emit("Connected to %s:%d" % (connect_ip, port))
         self._emit_peer_count_if_changed()
         self._set_participants([self._build_local_participant()])
         self._start_reader(conn_id, conn)
         self._send_identity(conn_id)
+        self._debug(
+            "connect_to_host_done",
+            requested_ip=requested_ip,
+            resolved_ip=connect_ip,
+            port=port,
+            conn_id=conn_id,
+            elapsed_ms=int((time.monotonic() - connect_started) * 1000),
+        )
 
     def connect_to_public_host(self, host_code, bind_port=None):
         self.stop()
@@ -947,6 +1084,7 @@ class CollaborationManager(QtCore.QObject):
         self._send_identity(conn_id)
 
     def stop(self):
+        self._debug("stop_begin")
         self._stop_public_room()
         self._stop_traversal_endpoint()
         self._mode = None
@@ -996,6 +1134,7 @@ class CollaborationManager(QtCore.QObject):
         self.statusChanged.emit("Collaboration stopped")
         self._set_participants([])
         self._emit_peer_count_if_changed()
+        self._debug("stop_done")
 
     def broadcast_snapshot(self, level_bytes, area_num):
         if not self._connections:
@@ -1011,7 +1150,7 @@ class CollaborationManager(QtCore.QObject):
 
     def broadcast_message(self, message_type, payload=None):
         if not self._connections:
-            return
+            return False
         if payload is None:
             payload = {}
         message = {
@@ -1020,6 +1159,7 @@ class CollaborationManager(QtCore.QObject):
             "payload": payload,
         }
         self._broadcast_message(message)
+        return True
 
     def send_message_to(self, session_id, message_type, payload=None):
         """
@@ -1044,6 +1184,7 @@ class CollaborationManager(QtCore.QObject):
         while not self._accept_stop.is_set():
             try:
                 conn, addr = self._server.accept()
+                self._debug("accept_connection", addr=addr)
             except socket.timeout:
                 continue
             except OSError:
@@ -1154,6 +1295,7 @@ class CollaborationManager(QtCore.QObject):
             }
         if emit_peer_count:
             self._emit_peer_count_if_changed()
+        self._debug("register_connection", conn_id=conn_id, addr=addr, emit_peer_count=emit_peer_count)
         return conn_id
 
     def _ensure_sender_thread(self):
@@ -1234,10 +1376,12 @@ class CollaborationManager(QtCore.QObject):
                 self._set_participants([])
                 self.statusChanged.emit("Disconnected from host")
         self._emit_peer_count_if_changed()
+        self._debug("drop_connection", conn_id=conn_id, removed_meta=removed_meta)
 
     def _broadcast_message(self, message, exclude=None):
         if exclude is None:
             exclude = set()
+        self._debug("broadcast_message", message=self._summarize_message_for_debug(message), exclude=list(exclude))
         data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
         try:
             self._send_queue.put_nowait((data, set(exclude)))
@@ -1245,6 +1389,7 @@ class CollaborationManager(QtCore.QObject):
             pass
 
     def _send_direct_message(self, conn_id, message):
+        self._debug("send_direct_message", conn_id=conn_id, message=self._summarize_message_for_debug(message))
         data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
         with self._connections_lock:
             conn = self._connections.get(conn_id)
@@ -1259,6 +1404,7 @@ class CollaborationManager(QtCore.QObject):
             self._drop_connection(conn_id)
 
     def _send_rejection(self, conn, message):
+        self._debug("send_rejection", message=self._summarize_message_for_debug(message))
         data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
         try:
             conn.sendall(data)
@@ -1290,6 +1436,7 @@ class CollaborationManager(QtCore.QObject):
             self._broadcast_message(message)
         else:
             self._send_direct_message(conn_id, message)
+        self._debug("send_identity", conn_id=conn_id, nickname=self.local_nickname)
 
     def _set_participants(self, participants):
         cleaned = []
@@ -2235,12 +2382,15 @@ class CollaborationManager(QtCore.QObject):
         try:
             msg = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
+            self._debug("receive_decode_error", conn_id=conn_id, raw_preview=raw[:120])
             return
 
         sender = msg.get("sender", "")
         if sender == self.session_id:
+            self._debug("receive_own_message_ignored", conn_id=conn_id, message=self._summarize_message_for_debug(msg))
             return
         msg_type = msg.get("type")
+        self._debug("receive_message", conn_id=conn_id, message=self._summarize_message_for_debug(msg))
 
         if self._mode == "host" and msg_type == "peer_intro":
             payload = msg.get("payload") or {}
@@ -2262,6 +2412,7 @@ class CollaborationManager(QtCore.QObject):
                 })
                 label = nickname or meta.get("ip") or "unknown peer"
                 self.statusChanged.emit("Rejected peer: %s" % label)
+                self._debug("peer_intro_rejected", conn_id=conn_id, label=label, reason=rejection_message)
                 self._drop_connection(conn_id)
                 return
             with self._connections_lock:
@@ -2281,6 +2432,7 @@ class CollaborationManager(QtCore.QObject):
                 self.statusChanged.emit("Peer connected: %s:%d" % (peer_ip, int(peer_port)))
             self._emit_peer_count_if_changed()
             self._broadcast_roster()
+            self._debug("peer_intro_accepted", conn_id=conn_id, sender=sender, peer_ip=peer_ip, peer_port=peer_port)
             return
 
         if msg_type == "roster":

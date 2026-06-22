@@ -683,6 +683,7 @@ class ReggieTranslation:
                 39: 'Insert new path node after selected node',
                 40: 'Themes',
                 41: 'Theme:',
+                42: 'Enable collaboration debug logs in collab_runtime',
             },
             'ScrShtDlg': {
                 0: 'Choose a Screenshot source',

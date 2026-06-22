@@ -10,6 +10,17 @@ from levelitems import EntranceItem, SpriteItem, ZoneItem, LocationItem, ObjectI
 from misc2 import DecodeOldReggieInfo
 from spriteeditor import SpriteEditorWidget
 
+
+def _collab_debug_log(event, **fields):
+    try:
+        main_window = getattr(globals_, 'mainWindow', None)
+        logger = getattr(main_window, '_CollabDebugLog', None)
+        if callable(logger):
+            logger(event, **fields)
+    except Exception:
+        pass
+
+
 class AbstractLevel:
     """
     Class for an abstract level from any game. Defines the API.
@@ -334,6 +345,7 @@ class Area:
         Loads an area from the archive files
         """
         assert not self._is_loaded
+        _collab_debug_log('area.load.begin', area_num=getattr(self, 'areanum', 0), has_course=self.course is not None)
 
         # Load in the course file and blocks - if the course file is None, we
         # just create a new area with the default settings (as stored in the
@@ -371,10 +383,20 @@ class Area:
             globals_.firstLoad = False
 
         # Load the tilesets
-        LoadTileset(0, self.tileset0)
-        LoadTileset(1, self.tileset1)
-        LoadTileset(2, self.tileset2)
-        LoadTileset(3, self.tileset3)
+        _collab_debug_log(
+            'area.load.tilesets',
+            area_num=getattr(self, 'areanum', 0),
+            tilesets=[self.tileset0, self.tileset1, self.tileset2, self.tileset3],
+        )
+        for idx, name in enumerate((self.tileset0, self.tileset1, self.tileset2, self.tileset3)):
+            result = LoadTileset(idx, name)
+            _collab_debug_log(
+                'area.load.tileset_result',
+                area_num=getattr(self, 'areanum', 0),
+                idx=idx,
+                name=name,
+                result=bool(result),
+            )
 
         # Load the object layers
         self.layers = [[], [], []]
@@ -391,6 +413,14 @@ class Area:
         self.InitialiseIdTypes()
 
         self._is_loaded = True
+        _collab_debug_log(
+            'area.load.done',
+            area_num=getattr(self, 'areanum', 0),
+            layer_counts=[len(layer) for layer in self.layers],
+            sprite_count=len(self.sprites),
+            entrance_count=len(self.entrances),
+            zone_count=len(self.zones),
+        )
         return True
 
     def save(self):

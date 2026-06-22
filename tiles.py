@@ -12,6 +12,16 @@ from libs import lh, lz77, tpl, lib_versions
 ################################################################################
 ################################################################################
 
+
+def _collab_debug_log(event, **fields):
+    try:
+        main_window = getattr(globals_, 'mainWindow', None)
+        logger = getattr(main_window, '_CollabDebugLog', None)
+        if callable(logger):
+            logger(event, **fields)
+    except Exception:
+        pass
+
 class ObjectDef:
     """
     Class for the object definitions
@@ -851,6 +861,8 @@ def LoadTileset(idx, name, reload_=False):
 
     found = False
     compressed = False
+    source = 'game'
+    _collab_debug_log('tileset.load.begin', idx=idx, name=name, reload=bool(reload_))
 
     # Collaboration override: allow host-provided tilesets to take precedence
     # over the user's local game files.
@@ -863,6 +875,7 @@ def LoadTileset(idx, name, reload_=False):
         arcname = str(override_path)
         compressed = arcname.lower().endswith('.lh')
         found = True
+        source = 'collab_override'
     else:
         arcname = None
 
@@ -889,6 +902,7 @@ def LoadTileset(idx, name, reload_=False):
 
     # warning if not found
     if not found:
+        _collab_debug_log('tileset.load.missing', idx=idx, name=name, source=source)
         if getattr(globals_, 'CollabSuppressMissingTilesetWarnings', False):
             return False
         QtWidgets.QMessageBox.warning(None, globals_.trans.string('Err_MissingTileset', 0),
@@ -896,7 +910,9 @@ def LoadTileset(idx, name, reload_=False):
         return False
 
     # if this file's already loaded, return
-    if globals_.TilesetFilesLoaded[idx] == arcname and not reload_: return
+    if globals_.TilesetFilesLoaded[idx] == arcname and not reload_:
+        _collab_debug_log('tileset.load.skip_cached', idx=idx, name=name, arcname=arcname)
+        return True
 
     # get the data
     with open(arcname, 'rb') as fileobj:
@@ -907,6 +923,7 @@ def LoadTileset(idx, name, reload_=False):
             try:
                 arcdata = lh.UncompressLH(arcdata)
             except IndexError:
+                _collab_debug_log('tileset.load.decompress_failed', idx=idx, name=name, arcname=arcname)
                 QtWidgets.QMessageBox.warning(None, globals_.trans.string('Err_Decompress', 0),
                                               globals_.trans.string('Err_Decompress', 1, '[file]', name))
                 return False
@@ -929,6 +946,14 @@ def LoadTileset(idx, name, reload_=False):
         comptiledata = arc['BG_tex/%s_tex.bin.LZ' % name]
         colldata = arc['BG_chk/d_bgchk_%s.bin' % name]
     else:
+        _collab_debug_log(
+            'tileset.load.corrupted',
+            idx=idx,
+            name=name,
+            arcname=arcname,
+            has_tex=bool(found),
+            has_chk=bool(found2),
+        )
         QtWidgets.QMessageBox.warning(None, globals_.trans.string('Err_CorruptedTilesetData', 0),
                                       globals_.trans.string('Err_CorruptedTilesetData', 1, '[file]', name))
         return False
@@ -1074,6 +1099,21 @@ def LoadTileset(idx, name, reload_=False):
 
     # Add Tiles to spritelib
     SLib.Tiles = globals_.Tiles
+
+    _collab_debug_log(
+        'tileset.load.done',
+        idx=idx,
+        name=name,
+        reload=bool(reload_),
+        source=source,
+        arcname=arcname,
+        compressed=bool(compressed),
+        arc_bytes=len(arcdata),
+        texture_bytes=len(comptiledata),
+        collision_bytes=len(colldata),
+        object_count=objcount,
+        animated=bool(isAnimated),
+    )
 
     return True
 
