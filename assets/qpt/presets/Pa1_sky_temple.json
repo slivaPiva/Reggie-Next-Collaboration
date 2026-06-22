@@ -1,0 +1,38 @@
+{
+  "name": "Pa1_sky_temple",
+  "tileset_names": [
+    "Pa1_sky_temple"
+  ],
+  "slot": "Pa1",
+  "painting_mode": "SmartPaint",
+  "priority": 5,
+  "terrain": {
+    "center": 5,
+    "top": 2,
+    "bottom": 6,
+    "left": 3,
+    "right": 4,
+    "top_left": 0,
+    "top_right": 1,
+    "bottom_left": 11,
+    "bottom_right": 12,
+    "inner_top_left": 7,
+    "inner_top_right": 8,
+    "inner_bottom_left": 9,
+    "inner_bottom_right": 10
+  },
+  "slopes": {
+    "slope_top_1x1_left": 13,
+    "slope_top_1x1_right": 14,
+    "slope_top_2x1_left": 15,
+    "slope_top_2x1_right": 16,
+    "slope_top_4x1_left": 17,
+    "slope_top_4x1_right": 18,
+    "slope_bottom_1x1_left": 19,
+    "slope_bottom_1x1_right": 20,
+    "slope_bottom_2x1_left": 21,
+    "slope_bottom_2x1_right": 22,
+    "slope_bottom_4x1_left": 23,
+    "slope_bottom_4x1_right": 24
+  }
+}

@@ -6771,7 +6771,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 model_index = self.model.index(idx, 0)
                 if not model_index.isValid():
                     continue
-                sel_model.select(model_index, QtCore.QItemSelectionModel.Select)
+                sel_model.select(model_index, QtCore.QItemSelectionModel.SelectionFlag.Select)
                 if first_index is None:
                     first_index = model_index
 

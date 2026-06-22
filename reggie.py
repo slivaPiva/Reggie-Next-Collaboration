@@ -6062,6 +6062,65 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._RefreshCollabInteractionBlock()
         self._UpdateCollabTilesetProgress('Requesting patch tilesets...')
 
+    def _FinishCollabTilesetSyncWithoutDownloads(self):
+        self._ResetCollabTilesetSyncState()
+        try:
+            self._CollabEnsureClientFollowsHostLevel()
+        except Exception:
+            pass
+        try:
+            QtCore.QTimer.singleShot(0, self.TryApplyPendingRemoteSnapshot)
+        except Exception:
+            pass
+
+    def _PrimeCollabTilesetSyncFromLocalFiles(self):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return 0
+
+        expected_files = dict(state.get('expected_files') or {})
+        if not expected_files:
+            state['expected_files'] = {}
+            return 0
+
+        try:
+            local_known = self._BuildCollabKnownTilesetHashes(include_all_game_tilesets=True)
+        except Exception:
+            local_known = {}
+        if not isinstance(local_known, dict) or not local_known:
+            state['expected_files'] = expected_files
+            return 0
+
+        received_names = state.get('received_names')
+        if not isinstance(received_names, set):
+            received_names = set()
+            state['received_names'] = received_names
+
+        matched_names = []
+        matched_bytes = 0
+        for name, info in list(expected_files.items()):
+            name = str(name or '').strip()
+            if not name:
+                continue
+            expected_sha1 = str((info or {}).get('sha1') or '').strip()
+            if not expected_sha1:
+                continue
+            if str(local_known.get(name) or '').strip() != expected_sha1:
+                continue
+            matched_names.append(name)
+            matched_bytes += max(0, int((info or {}).get('size', 0) or 0))
+            expected_files.pop(name, None)
+
+        if not matched_names:
+            state['expected_files'] = expected_files
+            return 0
+
+        received_names.update(matched_names)
+        state['expected_files'] = expected_files
+        state['received_files'] = int(state.get('received_files', 0) or 0) + len(matched_names)
+        state['received_bytes'] = int(state.get('received_bytes', 0) or 0) + matched_bytes
+        return len(matched_names)
+
     def _TrackReceivedCollabTileset(self, name, data):
         state = getattr(self, '_collabTilesetSyncState', None)
         if not isinstance(state, dict):
@@ -6145,6 +6204,31 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._collabTilesetApplyTimer.start(0)
         except Exception:
             self._ProcessPendingTilesetPayloadBatch()
+
+    def _FinalizeCollabTilesetSyncFromHostDone(self, payload=None):
+        state = getattr(self, '_collabTilesetSyncState', None)
+        if not isinstance(state, dict):
+            return
+
+        self._PrimeCollabTilesetSyncFromLocalFiles()
+        total_files = int(state.get('total_files', 0) or 0)
+        received_files = int(state.get('received_files', 0) or 0)
+        if total_files > 0 and received_files < total_files:
+            missing_names = sorted(str(name or '') for name in (state.get('expected_files') or {}).keys() if str(name or ''))
+            if missing_names:
+                self._FailCollabTilesetSync(
+                    'The host tileset download finished before all files were received.\nMissing tilesets: %s'
+                    % ', '.join(missing_names[:8]),
+                    disconnect=True,
+                )
+            else:
+                self._FailCollabTilesetSync(
+                    'The host tileset download finished before all files were received.',
+                    disconnect=True,
+                )
+            return
+
+        self._BeginDeferredCollabTilesetApply()
 
     def _InstallDownloadedCollabTilesets(self):
         state = getattr(self, '_collabTilesetSyncState', None)
@@ -6428,6 +6512,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        try:
+            self.collabManager.send_message_to(peer_session_id, 'tileset_sync_done', {
+                'file_count': len(download_entries),
+                'total_bytes': sum(int(entry.get('size', 0) or 0) for entry in download_entries),
+            })
+        except Exception:
+            pass
+
     def _HostBroadcastTilesetsToAllPeers(self):
         """
         Host-side helper: broadcast the current area's tilesets to all peers.
@@ -6452,6 +6544,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 self.collabManager.broadcast_message('tileset_data', payload)
             except Exception:
                 pass
+        try:
+            self.collabManager.broadcast_message('tileset_sync_done', {
+                'file_count': len(entries),
+                'total_bytes': sum(int(entry.get('size', 0) or 0) for entry in entries),
+            })
+        except Exception:
+            pass
 
     def _DecodeTilesetPayload(self, payload):
         if not isinstance(payload, dict):
@@ -11728,15 +11827,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 }
             total_files = int(payload.get('file_count', len(expected_files)) or len(expected_files))
             if total_files <= 0:
-                self._ResetCollabTilesetSyncState()
-                try:
-                    self._CollabEnsureClientFollowsHostLevel()
-                except Exception:
-                    pass
-                try:
-                    QtCore.QTimer.singleShot(0, self.TryApplyPendingRemoteSnapshot)
-                except Exception:
-                    pass
+                self._FinishCollabTilesetSyncWithoutDownloads()
                 return
             self._collabTilesetSyncState = {
                 'expected_files': expected_files,
@@ -11752,12 +11843,21 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 'apply_total': 0,
                 'applied_files': 0,
             }
+            self._PrimeCollabTilesetSyncFromLocalFiles()
+            if int(self._collabTilesetSyncState.get('received_files', 0) or 0) >= int(self._collabTilesetSyncState.get('total_files', 0) or 0):
+                self._FinishCollabTilesetSyncWithoutDownloads()
+                return
             self._UpdateCollabTilesetProgress(
                 'Downloading host tilesets\n%s across %d files' % (
                     self._FormatCollabBytes(self._collabTilesetSyncState.get('total_bytes', 0)),
                     int(self._collabTilesetSyncState.get('total_files', 0) or 0),
                 )
             )
+            return
+
+        if msg_type == 'tileset_sync_done':
+            if self.IsCollabClientMode():
+                self._FinalizeCollabTilesetSyncFromHostDone(payload)
             return
 
         if globals_.Area is None or globals_.Level is None:
@@ -11782,6 +11882,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'tileset_manifest',
             'tileset_data',
             'tileset_update',
+            'tileset_sync_done',
         }:
             self._QueuePendingRemoteMessage(message, sender)
             return
@@ -11796,6 +11897,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'tileset_manifest',
             'tileset_data',
             'tileset_update',
+            'tileset_sync_done',
         }:
             self._QueuePendingRemoteMessage(message, sender)
             return
