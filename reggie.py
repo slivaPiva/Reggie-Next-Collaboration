@@ -5610,7 +5610,52 @@ class ReggieWindow(QtWidgets.QMainWindow):
     def _ReloadTilesetNameEverywhere(self, name):
         self._ReloadTilesetNamesEverywhere([name])
 
-    def _RefreshQuickPaintTilesetState(self, schedule_retry=True):
+    def _GetQuickPaintRequiredTilesetSlots(self):
+        """Return area tileset slots that should be visible in Quick Paint."""
+        if globals_.Area is None:
+            return []
+
+        required_slots = []
+        for slot in range(4):
+            try:
+                name = str(self._GetTilesetNameForSlot(slot) or '').strip()
+            except Exception:
+                name = ''
+            if name:
+                required_slots.append(slot)
+        return required_slots
+
+    def _GetQuickPaintMissingTilesetSlots(self, tileset_selector):
+        """Return required Quick Paint slots that still have no object list."""
+        if tileset_selector is None:
+            return []
+
+        required_slots = self._GetQuickPaintRequiredTilesetSlots()
+        if not required_slots:
+            return []
+
+        try:
+            tileset_objects = getattr(tileset_selector, 'tileset_objects', {}) or {}
+        except Exception:
+            tileset_objects = {}
+
+        missing_slots = []
+        for slot in required_slots:
+            try:
+                obj_defs = globals_.ObjectDefinitions[slot]
+            except Exception:
+                obj_defs = None
+            if obj_defs is None:
+                missing_slots.append(slot)
+                continue
+            if not tileset_objects.get(slot):
+                missing_slots.append(slot)
+        return missing_slots
+
+    def _QuickPaintTilesetSelectorNeedsRetry(self, tileset_selector):
+        return bool(self._GetQuickPaintMissingTilesetSlots(tileset_selector))
+
+    def _RefreshQuickPaintTilesetState(self, schedule_retry=True, retry_count=0):
         """
         Refresh Quick Paint state after tileset changes without touching the
         quickpaint package directly.
@@ -5636,21 +5681,27 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 fill_paint_tab = None
 
-            self._RefreshQuickPaintTilesetSelector(tileset_selector)
+            selectors_ready = self._RefreshQuickPaintTilesetSelector(tileset_selector)
             if fill_paint_tab is not None:
-                self._RefreshQuickPaintTilesetSelector(getattr(fill_paint_tab, 'tileset_selector', None))
+                selectors_ready = self._RefreshQuickPaintTilesetSelector(
+                    getattr(fill_paint_tab, 'tileset_selector', None)
+                ) and selectors_ready
 
             if qpt_widget is not None:
                 qpt_widget.initialize_with_current_tileset()
         except Exception as e:
             print(f"[QPT] Warning: Could not refresh QPT tilesets: {e}")
+            selectors_ready = False
 
-        # Client tileset data can arrive slightly after the area metadata;
-        # retry once on the next event loop to catch late ObjectDefinitions.
-        if schedule_retry:
-            QtCore.QTimer.singleShot(200, self._RefreshQuickPaintTilesetStateDeferred)
+        # Client tileset data can arrive slightly after the area metadata.
+        # Keep refreshing until all required area slots have object data.
+        if schedule_retry and not selectors_ready and retry_count < 8:
+            QtCore.QTimer.singleShot(
+                200,
+                lambda rc=retry_count + 1: self._RefreshQuickPaintTilesetStateDeferred(rc),
+            )
 
-    def _RefreshQuickPaintTilesetStateDeferred(self):
+    def _RefreshQuickPaintTilesetStateDeferred(self, retry_count=1):
         if not hasattr(self, 'qpt_palette') or self.qpt_palette is None:
             return
 
@@ -5670,23 +5721,19 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 fill_paint_tab = None
 
-            needs_retry = (
-                tileset_selector is not None and not getattr(tileset_selector, 'objects_loaded', False)
-            )
+            needs_retry = self._QuickPaintTilesetSelectorNeedsRetry(tileset_selector)
             fill_selector = getattr(fill_paint_tab, 'tileset_selector', None) if fill_paint_tab is not None else None
-            needs_retry = needs_retry or (
-                fill_selector is not None and not getattr(fill_selector, 'objects_loaded', False)
-            )
+            needs_retry = needs_retry or self._QuickPaintTilesetSelectorNeedsRetry(fill_selector)
 
             if needs_retry:
-                self._RefreshQuickPaintTilesetState(schedule_retry=False)
+                self._RefreshQuickPaintTilesetState(schedule_retry=True, retry_count=retry_count)
         except Exception:
             pass
 
     def _RefreshQuickPaintTilesetSelector(self, tileset_selector):
         """Reload a Quick Paint tileset selector from current ObjectDefinitions."""
         if tileset_selector is None:
-            return
+            return True
 
         try:
             current_tileset = int(tileset_selector.tileset_combo.currentIndex())
@@ -5696,7 +5743,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         tileset_selector.objects_loaded = False
         tileset_selector.tileset_objects.clear()
         tileset_selector.load_objects_from_reggie()
-        tileset_selector.objects_loaded = bool(tileset_selector.tileset_objects)
+        missing_slots = self._GetQuickPaintMissingTilesetSlots(tileset_selector)
+        tileset_selector.objects_loaded = bool(tileset_selector.tileset_objects) and not missing_slots
+        tileset_selector._reggie_missing_tileset_slots = tuple(missing_slots)
         tileset_selector.current_tileset = current_tileset
 
         if hasattr(tileset_selector, 'tileset_combo'):
@@ -5705,6 +5754,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             tileset_selector.tileset_combo.blockSignals(False)
 
         tileset_selector.update_object_list()
+        return not missing_slots
 
     def _InstallQuickPaintCollabSync(self):
         if getattr(self, '_qptCollabSyncInstalled', False):
