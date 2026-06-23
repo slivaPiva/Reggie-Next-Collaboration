@@ -82,7 +82,9 @@ ViewActions = None
 ZoneThemeValues = None
 CollabNickname = 'Player'
 CollabHighlightColor = '#ffff00'
-CollabCursorDisplayMode = 'always'
+CollabCursorDisplayMode = 'on_screen'
+CollabPointerShortcut = 'P'
+QuickPaintShortcut = 'O'
 
 # Collaboration tileset overrides:
 # name -> absolute filepath to a host-provided .arc (uncompressed U8)

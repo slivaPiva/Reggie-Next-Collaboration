@@ -338,10 +338,12 @@ sys.excepthook = _excepthook
 
 DEFAULT_COLLAB_HIGHLIGHT_COLOR = '#ffff00'
 COLLAB_CURSOR_DISPLAY_ALWAYS = 'always'
+COLLAB_CURSOR_DISPLAY_ON_SCREEN = 'on_screen'
 COLLAB_CURSOR_DISPLAY_ON_P = 'on_p'
 COLLAB_CURSOR_DISPLAY_NEVER = 'never'
 COLLAB_CURSOR_DISPLAY_MODES = {
     COLLAB_CURSOR_DISPLAY_ALWAYS,
+    COLLAB_CURSOR_DISPLAY_ON_SCREEN,
     COLLAB_CURSOR_DISPLAY_ON_P,
     COLLAB_CURSOR_DISPLAY_NEVER,
 }
@@ -959,6 +961,7 @@ class CollaborationBanListDialog(QtWidgets.QDialog):
 class CollaborationMonitorDialog(QtWidgets.QDialog):
     def __init__(self, participant_callback=None, ban_list_callback=None, parent=None):
         super().__init__(parent)
+
         self._participant_callback = participant_callback
         self._ban_list_callback = ban_list_callback
         self._is_host = False
@@ -978,6 +981,8 @@ class CollaborationMonitorDialog(QtWidgets.QDialog):
 
         self.listWidget = QtWidgets.QListWidget()
         self.listWidget.itemClicked.connect(self._HandleItemClicked)
+        self.listWidget.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.listWidget.customContextMenuRequested.connect(self._HandleContextMenuRequested)
         layout.addWidget(self.listWidget, 1)
 
         bottom_row = QtWidgets.QHBoxLayout()
@@ -993,9 +998,9 @@ class CollaborationMonitorDialog(QtWidgets.QDialog):
     def setHostMode(self, is_host):
         self._is_host = bool(is_host)
         if self._is_host:
-            self.infoLabel.setText('Online participants. Click a participant to choose kick or ban.')
+            self.infoLabel.setText('Online participants. Left-click to follow, right-click to kick or ban.')
         else:
-            self.infoLabel.setText('Online participants.')
+            self.infoLabel.setText('Online participants. Left-click to follow.')
         self.banListButton.setVisible(self._is_host)
 
     def setParticipants(self, participants):
@@ -1005,21 +1010,69 @@ class CollaborationMonitorDialog(QtWidgets.QDialog):
             if not isinstance(participant, dict):
                 continue
             role = 'Host' if participant.get('is_host') else 'Player'
-            text = '%s  |  %s  |  %s' % (
-                participant.get('nickname') or 'Player',
+            level_name = str(participant.get('level_name') or '').strip()
+            try:
+                area_num = int(participant.get('area_num', 0) or 0)
+            except Exception:
+                area_num = 0
+
+            tail = ''
+            if level_name:
+                if area_num > 0:
+                    tail = '  |  %s  |  Area %d' % (level_name, area_num)
+                else:
+                    tail = '  |  %s' % level_name
+
+            nickname = str(participant.get('nickname') or 'Player')
+            suffix = '  |  %s  |  %s%s' % (
                 participant.get('ip') or 'unknown',
                 role,
+                tail,
             )
-            item = QtWidgets.QListWidgetItem(text)
+            item = QtWidgets.QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, dict(participant))
             self.listWidget.addItem(item)
+            row = QtWidgets.QWidget(self.listWidget)
+            row.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            row.setStyleSheet('background: transparent;')
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(4, 2, 4, 2)
+            row_layout.setSpacing(0)
+
+            nick_label = QtWidgets.QLabel(nickname, row)
+            nick_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            nick_label.setStyleSheet(
+                'background: transparent; color: %s; font-weight: bold;' % (
+                    normalize_collab_color(participant.get('highlight_color')),
+                )
+            )
+
+            suffix_label = QtWidgets.QLabel(suffix, row)
+            suffix_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            suffix_label.setStyleSheet('background: transparent; color: white;')
+
+            row_layout.addWidget(nick_label, 0)
+            row_layout.addWidget(suffix_label, 1)
+
+            row.adjustSize()
+            item.setSizeHint(row.sizeHint())
+            self.listWidget.setItemWidget(item, row)
 
     def _HandleItemClicked(self, item):
-        if not self._is_host or item is None:
+        if item is None:
             return
         participant = item.data(Qt.ItemDataRole.UserRole)
         if callable(self._participant_callback):
-            self._participant_callback(dict(participant or {}), self.listWidget.viewport().mapToGlobal(self.listWidget.visualItemRect(item).bottomRight()))
+            self._participant_callback(dict(participant or {}), None, QtCore.Qt.MouseButton.LeftButton)
+
+    def _HandleContextMenuRequested(self, pos):
+        item = self.listWidget.itemAt(pos)
+        if item is None:
+            return
+        participant = item.data(Qt.ItemDataRole.UserRole)
+        if callable(self._participant_callback):
+            global_pos = self.listWidget.viewport().mapToGlobal(pos)
+            self._participant_callback(dict(participant or {}), global_pos, QtCore.Qt.MouseButton.RightButton)
 
     def _HandleBanList(self):
         if callable(self._ban_list_callback):
@@ -1521,8 +1574,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabLastBroadcastEditorStateAt = 0.0
         self.collabSelfNick = str(getattr(globals_, 'CollabNickname', 'Player') or 'Player')
         self.collabSelfHighlightColor = normalize_collab_color(getattr(globals_, 'CollabHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
-        self.collabCursorDisplayMode = self._NormalizeCollabCursorDisplayMode(getattr(globals_, 'CollabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS))
-        self.collabCursorPKeyHeld = False
+        self.collabCursorDisplayMode = self._NormalizeCollabCursorDisplayMode(getattr(globals_, 'CollabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN))
+        self.collabPointerKeyHeld = False
         self.collabRemoteCursors = {}
         self.collabCursorStaleSeconds = 1.6
         self.collabCursorBroadcastIntervalSeconds = 0.05
@@ -1539,10 +1592,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabCursorAnimTimer = QtCore.QTimer(self)
         self._collabCursorAnimTimer.setInterval(1000 // 60)
         self._collabCursorAnimTimer.timeout.connect(self._AdvanceCollabRemoteCursors)
+        self._collabFocusCursorSid = None
+        self._collabFocusCursorDueAt = 0.0
+        self._collabFocusCursorTimer = QtCore.QTimer(self)
+        self._collabFocusCursorTimer.setSingleShot(True)
+        self._collabFocusCursorTimer.timeout.connect(self._FlushCollabFocusCursor)
         self.collabParticipants = []
         self.collabWindow = None
         self.collabMonitorDialog = None
-        self.collabLiveActivityDialog = None
         self.collabBanListDialog = None
         self.collabLastMouseScenePos = None
         self.collabPings = []
@@ -2155,6 +2212,12 @@ class ReggieWindow(QtWidgets.QMainWindow):
         )
 
         self.CreateAction(
+            'collabcursor_on_screen', lambda checked=False: self.HandleCollabCursorDisplayModeChanged(COLLAB_CURSOR_DISPLAY_ON_SCREEN, checked), None,
+            'When on screen', 'Display collaboration cursors only while they are on-screen, but keep ping on P enabled',
+            None, True,
+        )
+
+        self.CreateAction(
             'collabcursor_on_p', lambda checked=False: self.HandleCollabCursorDisplayModeChanged(COLLAB_CURSOR_DISPLAY_ON_P, checked), None,
             'When P is pressed', 'Show collaboration cursors while P is held and keep ping on P enabled',
             None, True,
@@ -2405,6 +2468,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         vmenu.addAction(self.actions['showeventlinks'])
         collab_cursor_menu = vmenu.addMenu('Cursor display')
         collab_cursor_menu.addAction(self.actions['collabcursor_always'])
+        collab_cursor_menu.addAction(self.actions['collabcursor_on_screen'])
         collab_cursor_menu.addAction(self.actions['collabcursor_on_p'])
         collab_cursor_menu.addAction(self.actions['collabcursor_never'])
         vmenu.addSeparator()
@@ -2461,23 +2525,16 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabChatButton.setDefaultAction(self.actions['collab_chat'])
         self.collabChatButton.setVisible(False)
 
-        self.collabEditorStatusButton = QtWidgets.QPushButton('Live activity', self.collabTopBarWidget)
-        self.collabEditorStatusButton.setVisible(False)
-        self.collabEditorStatusButton.setToolTip('Show what everyone is editing right now')
-        self.collabEditorStatusButton.clicked.connect(self.HandleOpenCollabLiveActivity)
-
-        # Order: live activity, then monitor + chat buttons adjacent.
-        top_layout.addWidget(self.collabEditorStatusButton)
         top_layout.addWidget(self.collabMonitorButton)
         top_layout.addWidget(self.collabChatButton)
 
         try:
             button_height = max(
-                int(self.collabEditorStatusButton.sizeHint().height()),
                 int(self.collabMonitorButton.sizeHint().height()),
                 int(self.collabChatButton.sizeHint().height()),
             )
-            self.collabEditorStatusButton.setFixedHeight(button_height)
+            self.collabMonitorButton.setFixedHeight(button_height)
+            self.collabChatButton.setFixedHeight(button_height)
         except Exception:
             pass
 
@@ -2861,6 +2918,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not hasattr(self, 'collabPeerNicks'):
             self.collabPeerNicks = {}
         self.collabPeerNicks[sid] = nick
+        try:
+            self._RefreshCollabMonitorDialog()
+        except Exception:
+            pass
 
     def _CollabSetPeerColor(self, session_id, color):
         sid = str(session_id or '')
@@ -2869,6 +2930,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not hasattr(self, 'collabPeerColors'):
             self.collabPeerColors = {}
         self.collabPeerColors[sid] = normalize_collab_color(color)
+        try:
+            self._RefreshCollabMonitorDialog()
+        except Exception:
+            pass
 
     def _CollabPeerColor(self, session_id):
         sid = str(session_id or '')
@@ -2910,6 +2975,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'area_num': area_num,
         }
         self._RefreshCollabEditorStatusLabel()
+        try:
+            self._RefreshCollabMonitorDialog()
+        except Exception:
+            pass
 
     def _CollabPeerEditorStateInfo(self, session_id):
         sid = str(session_id or '')
@@ -2919,6 +2988,50 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return dict((getattr(self, 'collabPeerEditorState', {}) or {}).get(sid) or {})
         except Exception:
             return {}
+
+    def _CollabPeerNavigationStateInfo(self, session_id, participant=None):
+        sid = str(session_id or '')
+        if not sid:
+            return {}
+
+        if sid == self._CollabLocalSessionId():
+            return self._CollabCurrentEditorStateInfo()
+
+        if isinstance(participant, dict):
+            level_name = str(participant.get('level_name') or '').strip()
+            try:
+                area_num = int(participant.get('area_num', 0) or 0)
+            except Exception:
+                area_num = 0
+            if level_name or area_num > 0:
+                return {
+                    'level_name': level_name,
+                    'area_num': area_num,
+                }
+
+        state = self._CollabPeerEditorStateInfo(sid)
+        level_name = str(state.get('level_name') or '').strip() if isinstance(state, dict) else ''
+        try:
+            area_num = int(state.get('area_num', 0) or 0) if isinstance(state, dict) else 0
+        except Exception:
+            area_num = 0
+        if level_name or area_num > 0:
+            return {
+                'level_name': level_name,
+                'area_num': area_num,
+            }
+
+        cursor = dict((getattr(self, 'collabRemoteCursors', {}) or {}).get(sid) or {})
+        if not cursor:
+            return {}
+        try:
+            area_num = int(cursor.get('area_num', 0) or 0)
+        except Exception:
+            area_num = 0
+        return {
+            'level_name': str(cursor.get('level_name') or '').strip(),
+            'area_num': area_num,
+        }
 
     def _CollabCurrentEditorStateInfo(self):
         level_name = self._CollabCurrentLevelName() or ''
@@ -3144,13 +3257,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
     def _NormalizeCollabCursorDisplayMode(self, mode):
         mode = str(mode or '').strip().lower()
         if mode not in COLLAB_CURSOR_DISPLAY_MODES:
-            return COLLAB_CURSOR_DISPLAY_ALWAYS
+            return COLLAB_CURSOR_DISPLAY_ON_SCREEN
         return mode
 
     def _UpdateCollabCursorDisplayActions(self):
-        mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS))
+        mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN))
         mapping = (
             ('collabcursor_always', COLLAB_CURSOR_DISPLAY_ALWAYS),
+            ('collabcursor_on_screen', COLLAB_CURSOR_DISPLAY_ON_SCREEN),
             ('collabcursor_on_p', COLLAB_CURSOR_DISPLAY_ON_P),
             ('collabcursor_never', COLLAB_CURSOR_DISPLAY_NEVER),
         )
@@ -3163,24 +3277,23 @@ class ReggieWindow(QtWidgets.QMainWindow):
             action.blockSignals(False)
 
     def _ShouldDisplayCollabCursors(self):
-        mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS))
+        mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN))
         if mode == COLLAB_CURSOR_DISPLAY_NEVER:
             return False
         if mode == COLLAB_CURSOR_DISPLAY_ON_P:
-            return bool(getattr(self, 'collabCursorPKeyHeld', False))
+            return bool(getattr(self, 'collabPointerKeyHeld', False))
         return True
 
     def HandleCollabCursorDisplayModeChanged(self, mode, checked=False):
         mode = self._NormalizeCollabCursorDisplayMode(mode)
-        if not checked and mode == getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS):
+        if not checked and mode == getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN):
             self._UpdateCollabCursorDisplayActions()
             return
 
         self.collabCursorDisplayMode = mode
         globals_.CollabCursorDisplayMode = mode
-        if mode != COLLAB_CURSOR_DISPLAY_ON_P:
-            self.collabCursorPKeyHeld = False
         if mode == COLLAB_CURSOR_DISPLAY_NEVER:
+            self.collabPointerKeyHeld = False
             self.collabPings = []
             try:
                 self._RefreshCollabPingTimer()
@@ -3212,22 +3325,51 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabMonitorButton.setVisible(collab_active)
         if hasattr(self, 'collabChatButton'):
             self.collabChatButton.setVisible(collab_active)
-        if hasattr(self, 'collabEditorStatusButton'):
-            self.collabEditorStatusButton.setVisible(collab_active)
-            try:
-                self._RefreshCollabEditorStatusLabel()
-            except Exception:
-                pass
         self._RefreshCollabColorButton()
         self.UpdateCollaborationMenuTitle()
         self._UpdateChatOverlayText()
         self._ClampChatOverlay()
 
-        if hasattr(self, 'collabMonitorDialog') and self.collabMonitorDialog is not None:
-            self.collabMonitorDialog.setHostMode(hasattr(self, 'collabManager') and self.collabManager.mode == "host")
-            self.collabMonitorDialog.setParticipants(self.collabParticipants)
+        self._RefreshCollabMonitorDialog()
         if hasattr(self, 'collabBanListDialog') and self.collabBanListDialog is not None:
             self.collabBanListDialog.setBanList(self.collabManager.get_ban_list())
+
+    def _BuildCollabMonitorParticipants(self):
+        participants = []
+        local_sid = self._CollabLocalSessionId()
+        raw = list(getattr(self, 'collabParticipants', []) or [])
+        if local_sid and all(str(p.get('session_id') or '') != local_sid for p in raw if isinstance(p, dict)):
+            raw.insert(0, {
+                'session_id': local_sid,
+                'nickname': getattr(self, 'collabSelfNick', 'Player'),
+                'highlight_color': getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR),
+                'is_host': bool(getattr(self.collabManager, 'mode', None) == 'host'),
+                'ip': 'local',
+            })
+
+        for participant in raw:
+            if not isinstance(participant, dict):
+                continue
+            entry = dict(participant)
+            sid = str(entry.get('session_id') or '')
+            if sid:
+                state = self._CollabPeerNavigationStateInfo(sid, participant=entry)
+                if isinstance(state, dict):
+                    entry['level_name'] = state.get('level_name')
+                    entry['area_num'] = state.get('area_num')
+                if not entry.get('nickname'):
+                    entry['nickname'] = self._CollabPeerDisplayName(sid)
+                entry['highlight_color'] = normalize_collab_color(
+                    entry.get('highlight_color') or self._CollabPeerColor(sid)
+                )
+            participants.append(entry)
+        return participants
+
+    def _RefreshCollabMonitorDialog(self):
+        if not hasattr(self, 'collabMonitorDialog') or self.collabMonitorDialog is None:
+            return
+        self.collabMonitorDialog.setHostMode(hasattr(self, 'collabManager') and self.collabManager.mode == "host")
+        self.collabMonitorDialog.setParticipants(self._BuildCollabMonitorParticipants())
 
     def _AddCollabToolbarInfo(self, menu, text):
         label = QtWidgets.QLabel(str(text), menu)
@@ -3824,15 +3966,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 pass
 
     def HandleCollabPingShortcut(self):
-        if self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS)) == COLLAB_CURSOR_DISPLAY_NEVER:
+        if self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN)) == COLLAB_CURSOR_DISPLAY_NEVER:
             return
-        if hasattr(self, 'qpt_palette') and self.qpt_palette and hasattr(self, 'creationTabs'):
-            for i in range(self.creationTabs.count()):
-                if self.creationTabs.widget(i) == self.qpt_palette:
-                    if self.creationTabs.currentIndex() != i:
-                        self.creationTabs.setCurrentIndex(i)
-                        return
-                    break
         scene_pos = self._CurrentCollabPingScenePos()
         if scene_pos is None:
             return
@@ -3858,6 +3993,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not getattr(self, 'collabRemoteCursors', None):
             return
 
+        mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN))
+        force_edge = bool(getattr(self, 'collabPointerKeyHeld', False))
         viewport_rect = view.viewport().rect()
         font = painter.font()
         font.setBold(True)
@@ -3877,6 +4014,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 float(cursor.get('render_y', cursor.get('target_y', 0.0)) or 0.0),
             )
             target = QtCore.QPointF(view.mapFromScene(scene_point))
+            if mode == COLLAB_CURSOR_DISPLAY_ON_SCREEN and not force_edge:
+                if not viewport_rect.contains(QtCore.QPoint(int(target.x()), int(target.y()))):
+                    continue
             draw_x = min(max(float(target.x()), margin), max(margin, viewport_rect.width() - margin))
             draw_y = min(max(float(target.y()), margin), max(margin, viewport_rect.height() - margin))
             draw_point = QtCore.QPointF(draw_x, draw_y)
@@ -3922,7 +4062,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         painter.restore()
 
     def DrawCollabPings(self, view, painter):
-        if self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS)) == COLLAB_CURSOR_DISPLAY_NEVER:
+        if self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN)) == COLLAB_CURSOR_DISPLAY_NEVER:
             return
         if not self.collabPings:
             return
@@ -4035,8 +4175,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 ban_list_callback=self.HandleOpenCollabBanList,
                 parent=self,
             )
-        self.collabMonitorDialog.setHostMode(hasattr(self, 'collabManager') and self.collabManager.mode == "host")
-        self.collabMonitorDialog.setParticipants(self.collabParticipants)
+        self._RefreshCollabMonitorDialog()
         self.collabMonitorDialog.show()
         self.collabMonitorDialog.raise_()
         self.collabMonitorDialog.activateWindow()
@@ -4049,8 +4188,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabBanListDialog.raise_()
         self.collabBanListDialog.activateWindow()
 
-    def _HandleCollabMonitorParticipant(self, participant, global_pos):
+    def _HandleCollabMonitorParticipant(self, participant, global_pos=None, mouse_button=None):
         if not isinstance(participant, dict):
+            return
+        if mouse_button == QtCore.Qt.MouseButton.LeftButton:
+            self._CollabFollowParticipant(participant)
+            return
+
+        if mouse_button != QtCore.Qt.MouseButton.RightButton:
             return
         if not hasattr(self, 'collabManager') or self.collabManager.mode != "host":
             return
@@ -4071,6 +4216,113 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
     def _HandleCollabBanRemove(self, ip):
         self.collabManager.remove_ban(ip)
+
+    def _CollabFollowParticipant(self, participant):
+        if not isinstance(participant, dict):
+            return
+        session_id = str(participant.get('session_id') or '')
+        if not session_id:
+            return
+        state = self._CollabPeerNavigationStateInfo(session_id, participant=participant)
+
+        level_name = str(state.get('level_name') or '').strip() if isinstance(state, dict) else ''
+        try:
+            area_num = int(state.get('area_num', 0) or 0) if isinstance(state, dict) else 0
+        except Exception:
+            area_num = 0
+        if not level_name:
+            return
+        if area_num <= 0:
+            area_num = 1
+
+        same_level = False
+        try:
+            cur_level = str(self._CollabCurrentLevelName() or '')
+            cur_area = int(getattr(globals_.Area, 'areanum', 0) or 0) if globals_.Area is not None else 0
+            same_level = (self._CollabNormalizeLevelName(cur_level) == self._CollabNormalizeLevelName(level_name) and cur_area == area_num)
+        except Exception:
+            same_level = False
+
+        if not same_level:
+            if self.IsCollabClientMode():
+                try:
+                    self._CollabRequestHostedLevelOpen(level_name, area_num)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if self.CheckDirty():
+                        return
+                except Exception:
+                    pass
+                try:
+                    self.LoadLevel(level_name, False, area_num)
+                except Exception:
+                    pass
+
+        self._RequestCollabFocusCursor(session_id)
+
+    def _RequestCollabFocusCursor(self, session_id):
+        session_id = str(session_id or '')
+        if not session_id:
+            return
+        self._collabFocusCursorSid = session_id
+        self._collabFocusCursorDueAt = time.monotonic() + 8.0
+        try:
+            self._collabFocusCursorTimer.start(0)
+        except Exception:
+            pass
+
+    def _TryFocusCollabCursor(self, session_id):
+        session_id = str(session_id or '')
+        if not session_id:
+            return False
+        if not hasattr(self, 'view') or self.view is None:
+            return False
+
+        local_sid = self._CollabLocalSessionId()
+        scene_pos = None
+        if session_id == local_sid:
+            scene_pos = getattr(self, 'collabLastMouseScenePos', None)
+        else:
+            cursor = getattr(self, 'collabRemoteCursors', {}).get(session_id)
+            if not cursor or not isinstance(cursor, dict):
+                return False
+            if not self._CollabCursorMatchesCurrentContext(cursor):
+                return False
+            try:
+                scene_pos = QtCore.QPointF(
+                    float(cursor.get('target_x', 0.0) or 0.0),
+                    float(cursor.get('target_y', 0.0) or 0.0),
+                )
+            except Exception:
+                scene_pos = None
+        if scene_pos is None:
+            return False
+        try:
+            self.view.centerOn(scene_pos)
+        except Exception:
+            return False
+        try:
+            self.view.viewport().update()
+        except Exception:
+            pass
+        return True
+
+    def _FlushCollabFocusCursor(self):
+        session_id = str(getattr(self, '_collabFocusCursorSid', '') or '')
+        if not session_id:
+            return
+        if time.monotonic() > float(getattr(self, '_collabFocusCursorDueAt', 0.0) or 0.0):
+            self._collabFocusCursorSid = None
+            return
+        if self._TryFocusCollabCursor(session_id):
+            self._collabFocusCursorSid = None
+            return
+        try:
+            self._collabFocusCursorTimer.start(80)
+        except Exception:
+            pass
 
     def HandleCollaborationParticipantsChanged(self, participants):
         prev_count = int(getattr(self, 'collabOnlineCount', 0) or 0)
@@ -4431,6 +4683,13 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.spritePreviewButton = QtWidgets.QToolButton()
         self.spritePreviewButton.setText('Preview')
         self.spritePreviewButton.setCheckable(True)
+        self.spritePreviewButton.setAutoRaise(False)
+        self.spritePreviewButton.setStyleSheet(
+            'QToolButton { background-color: palette(button); color: palette(button-text); border: 1px solid palette(mid); border-radius: 6px; padding: 3px 6px; }'
+            'QToolButton:hover { border: 2px solid palette(highlight); }'
+            'QToolButton:pressed { background-color: palette(dark); }'
+            'QToolButton:checked { background-color: palette(button); color: palette(button-text); border: 1px solid palette(mid); }'
+        )
 
         spl.addLayout(svpl)
         spl.addLayout(sspl)
@@ -7632,7 +7891,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabRemoteCursors = {}
             self.collabRemoteRubberBands = {}
             self.collabLocalRubberBand = None
-            self.collabCursorPKeyHeld = False
+            self.collabPointerKeyHeld = False
             self.collabLastBroadcastCursorAt = 0.0
             self.collabLastBroadcastCursorPos = None
             self._collabLastBroadcastRubberBandAt = 0.0
@@ -8703,7 +8962,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabRemoteCursors = {}
             self.collabRemoteRubberBands = {}
             self.collabLocalRubberBand = None
-            self.collabCursorPKeyHeld = False
+            self.collabPointerKeyHeld = False
             self.collabLastBroadcastCursorAt = 0.0
             self.collabLastBroadcastCursorPos = None
             self._collabLastBroadcastRubberBandAt = 0.0
@@ -9401,7 +9660,37 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if not stage_dir or not level_name:
             return ''
         # level_name is a sanitized relative path (may include subfolders).
-        return os.path.join(stage_dir, *level_name.split('/'))
+        candidate = os.path.join(stage_dir, *level_name.split('/'))
+        return self._ResolveExistingLevelPath(candidate) or candidate
+
+    def _ResolveExistingLevelPath(self, path):
+        path = str(path or '').strip()
+        if not path:
+            return ''
+
+        candidates = []
+
+        def add_candidate(value):
+            value = str(value or '').strip()
+            if value and value not in candidates:
+                candidates.append(value)
+
+        add_candidate(path)
+
+        match = re.search(r'(?i)\.arc(?:\.(?:lz|lh))?$', path)
+        if match:
+            stem = path[:match.start()]
+            add_candidate(stem + '.arc')
+            add_candidate(stem + '.arc.LZ')
+            add_candidate(stem + '.arc.LH')
+        else:
+            for ext in getattr(globals_, 'FileExtentions', ('.arc', '.arc.LH', '.arc.LZ')) or ('.arc', '.arc.LH', '.arc.LZ'):
+                add_candidate(path + ext)
+
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return ''
 
     def _CollabListHostStageFiles(self):
         stage_dir = str(getattr(globals_.gamedef, 'GetStageGamePath', lambda: '')() or '').strip()
@@ -12515,7 +12804,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         elif msg_type == 'rubber_band':
             self._UpdateRemoteRubberBandState(sender, payload)
         elif msg_type == 'ping':
-            if self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS)) == COLLAB_CURSOR_DISPLAY_NEVER:
+            if self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN)) == COLLAB_CURSOR_DISPLAY_NEVER:
                 return
             nick = str(payload.get('nick') or '').strip()
             if nick:
@@ -16270,9 +16559,25 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Rejected:
             return
 
+        old_translation = setting('Translation')
+        old_theme = setting('Theme')
+        old_ui_style = setting('uiStyle')
+
         # Get the translation
         name = str(dlg.generalTab.Trans.itemData(dlg.generalTab.Trans.currentIndex(), Qt.ItemDataRole.UserRole))
         setSetting('Translation', name)
+
+        qp_default = str(getattr(globals_, 'QuickPaintShortcut', 'O') or 'O')
+        qp_value = dlg.generalTab.quickPaintShortcut.keySequence().toString(QtGui.QKeySequence.SequenceFormat.PortableText)
+        qp_value = str(qp_value or '').split(',', 1)[0].strip() or qp_default
+        setSetting('QuickPaintShortcut', qp_value)
+        globals_.QuickPaintShortcut = qp_value
+
+        ptr_default = str(getattr(globals_, 'CollabPointerShortcut', 'P') or 'P')
+        ptr_value = dlg.generalTab.collabPointerShortcut.keySequence().toString(QtGui.QKeySequence.SequenceFormat.PortableText)
+        ptr_value = str(ptr_value or '').split(',', 1)[0].strip() or ptr_default
+        setSetting('CollabPointerShortcut', ptr_value)
+        globals_.CollabPointerShortcut = ptr_value
 
         # Get the Zone Entrance Indicators setting
         globals_.DrawEntIndicators = dlg.generalTab.zEntIndicator.isChecked()
@@ -16328,11 +16633,20 @@ class ReggieWindow(QtWidgets.QMainWindow):
         setSetting('ToolbarActs', ToolbarSettings)
 
         # Get the theme settings
-        setSetting('Theme', dlg.themesTab.themeBox.currentText())
-        setSetting('uiStyle', dlg.themesTab.NonWinStyle.currentText())
+        new_theme = dlg.themesTab.themeBox.currentText()
+        new_ui_style = dlg.themesTab.NonWinStyle.currentText()
+        setSetting('Theme', new_theme)
+        setSetting('uiStyle', new_ui_style)
+
+        restart_needed = (
+            str(old_translation) != str(name)
+            or str(old_theme) != str(new_theme)
+            or str(old_ui_style) != str(new_ui_style)
+        )
 
         # Warn the user that they may need to restart
-        QtWidgets.QMessageBox.warning(None, globals_.trans.string('PrefsDlg', 0), globals_.trans.string('PrefsDlg', 30))
+        if restart_needed:
+            QtWidgets.QMessageBox.warning(None, globals_.trans.string('PrefsDlg', 0), globals_.trans.string('PrefsDlg', 30))
 
     def HandleNewLevel(self):
         """
@@ -16706,6 +17020,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if self._CollabLoadHostedLevelBytes(level_name, level_bytes, area_num=area_num, host_path=host_path):
             if hasattr(self, 'hoverLabel'):
                 self.hoverLabel.setText('Opened hosted level: %s' % level_name)
+            try:
+                if str(getattr(self, '_collabFocusCursorSid', '') or ''):
+                    self._collabFocusCursorTimer.start(0)
+            except Exception:
+                pass
 
     def _CollabHostHandleOpenHostedLevelRequest(self, payload, sender):
         requested_level_name = self._CollabNormalizeLevelName(payload.get('level_name'))
@@ -17777,10 +18096,17 @@ class ReggieWindow(QtWidgets.QMainWindow):
             if not restoring_autosave:
                 checknames = []
                 if isFullPath:
-                    checknames = [name]
+                    resolved_full_path = self._ResolveExistingLevelPath(name)
+                    checknames = [resolved_full_path] if resolved_full_path else [name]
                 else:
-                    for ext in globals_.FileExtentions:
-                        checknames.append(os.path.join(globals_.gamedef.GetStageGamePath(), name + ext))
+                    stage_path = str(globals_.gamedef.GetStageGamePath() or '')
+                    base_candidate = os.path.join(stage_path, str(name or ''))
+                    if re.search(r'(?i)\.arc(?:\.(?:lz|lh))?$', str(name or '')):
+                        resolved_stage_path = self._ResolveExistingLevelPath(base_candidate)
+                        checknames = [resolved_stage_path] if resolved_stage_path else [base_candidate]
+                    else:
+                        for ext in globals_.FileExtentions:
+                            checknames.append(os.path.join(stage_path, str(name or '') + ext))
 
                 for checkname in checknames:
                     if os.path.isfile(checkname):
@@ -19838,15 +20164,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
                          '[spry]', int(y / 1.5)))
         self.hoverLabel.setText(info)
 
-    def _CanHandleCollabPKeyEvent(self, event):
-        modifiers = event.modifiers()
-        blocked = (
-            QtCore.Qt.KeyboardModifier.ControlModifier
-            | QtCore.Qt.KeyboardModifier.AltModifier
-            | QtCore.Qt.KeyboardModifier.MetaModifier
-        )
-        if modifiers & blocked:
-            return False
+    def _CanHandleCollabPointerKeyEvent(self, event):
         focus = QtWidgets.QApplication.focusWidget()
         text_types = (
             QtWidgets.QLineEdit,
@@ -19859,32 +20177,107 @@ class ReggieWindow(QtWidgets.QMainWindow):
             return False
         return True
 
-    def _HandleCollabPKeyPress(self, event):
-        if not self._CanHandleCollabPKeyEvent(event):
+    def _NormalizeSingleShortcutText(self, value):
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        if ',' in text:
+            text = text.split(',', 1)[0].strip()
+        return text
+
+    def _ShortcutTextToKeyAndModifiers(self, text):
+        text = self._NormalizeSingleShortcutText(text)
+        if not text:
+            return (None, 0)
+        seq = QtGui.QKeySequence(text)
+        if seq.count() < 1:
+            return (None, 0)
+        kc = seq[0]
+        try:
+            key = int(kc.key())
+        except Exception:
+            key = None
+        try:
+            mods = int(kc.keyboardModifiers().value)
+        except Exception:
+            mods = 0
+        return (key, mods)
+
+    def _EventMatchesShortcut(self, event, key, mods):
+        if key is None:
             return False
-        mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS))
+        if int(event.key()) != int(key):
+            return False
+        try:
+            event_mods = int(event.modifiers().value)
+        except Exception:
+            event_mods = 0
+        nonshift_mask = int((
+            QtCore.Qt.KeyboardModifier.ControlModifier
+            | QtCore.Qt.KeyboardModifier.AltModifier
+            | QtCore.Qt.KeyboardModifier.MetaModifier
+        ).value)
+        if (mods & nonshift_mask) == 0:
+            return (event_mods & nonshift_mask) == 0
+        return event_mods == mods
+
+    def _GetCollabPointerShortcutKeyAndModifiers(self):
+        default_text = str(getattr(globals_, 'CollabPointerShortcut', 'P') or 'P')
+        return self._ShortcutTextToKeyAndModifiers(setting('CollabPointerShortcut', default_text))
+
+    def _GetQuickPaintShortcutKeyAndModifiers(self):
+        default_text = str(getattr(globals_, 'QuickPaintShortcut', 'O') or 'O')
+        return self._ShortcutTextToKeyAndModifiers(setting('QuickPaintShortcut', default_text))
+
+    def _IsCollabPointerShortcutEvent(self, event):
+        key, mods = self._GetCollabPointerShortcutKeyAndModifiers()
+        return self._EventMatchesShortcut(event, key, mods)
+
+    def _IsQuickPaintShortcutEvent(self, event):
+        key, mods = self._GetQuickPaintShortcutKeyAndModifiers()
+        return self._EventMatchesShortcut(event, key, mods)
+
+    def _HandleCollabPointerKeyPress(self, event):
+        if not self._CanHandleCollabPointerKeyEvent(event):
+            return False
+        mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN))
         if mode == COLLAB_CURSOR_DISPLAY_NEVER:
             event.accept()
             return True
 
-        if mode == COLLAB_CURSOR_DISPLAY_ON_P:
-            self.collabCursorPKeyHeld = True
-            try:
-                if hasattr(self, 'view') and self.view is not None:
-                    self.view.viewport().update()
-            except Exception:
-                pass
+        self.collabPointerKeyHeld = True
+        try:
+            if hasattr(self, 'view') and self.view is not None:
+                self.view.viewport().update()
+        except Exception:
+            pass
 
         if not event.isAutoRepeat():
             self.HandleCollabPingShortcut()
         event.accept()
         return True
 
+    def _HandleQuickPaintShortcut(self, event):
+        if not self._CanHandleCollabPointerKeyEvent(event):
+            return False
+        if hasattr(self, 'qpt_palette') and self.qpt_palette and hasattr(self, 'creationTabs'):
+            for i in range(self.creationTabs.count()):
+                if self.creationTabs.widget(i) == self.qpt_palette:
+                    if self.creationTabs.currentIndex() != i:
+                        self.creationTabs.setCurrentIndex(i)
+                        event.accept()
+                        return True
+                    break
+        return False
+
     def keyPressEvent(self, event):
         """
         Handles key press events for the main window if needed
         """
-        if event.key() == Qt.Key.Key_P and self._HandleCollabPKeyPress(event):
+        if self._IsCollabPointerShortcutEvent(event) and self._HandleCollabPointerKeyPress(event):
+            return
+
+        if self._IsQuickPaintShortcutEvent(event) and self._HandleQuickPaintShortcut(event):
             return
 
         qpt_keys = (
@@ -19990,27 +20383,20 @@ class ReggieWindow(QtWidgets.QMainWindow):
         QtWidgets.QMainWindow.keyPressEvent(self, event)
 
     def keyReleaseEvent(self, event):
-        if (
-            event.key() == Qt.Key.Key_P
-            and self._CanHandleCollabPKeyEvent(event)
-            and self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS)) == COLLAB_CURSOR_DISPLAY_NEVER
-        ):
-            event.accept()
-            return
-        if (
-            event.key() == Qt.Key.Key_P
-            and not event.isAutoRepeat()
-            and self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS)) == COLLAB_CURSOR_DISPLAY_ON_P
-            and getattr(self, 'collabCursorPKeyHeld', False)
-        ):
-            self.collabCursorPKeyHeld = False
-            try:
-                if hasattr(self, 'view') and self.view is not None:
-                    self.view.viewport().update()
-            except Exception:
-                pass
-            event.accept()
-            return
+        if self._IsCollabPointerShortcutEvent(event) and self._CanHandleCollabPointerKeyEvent(event):
+            mode = self._NormalizeCollabCursorDisplayMode(getattr(self, 'collabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN))
+            if mode == COLLAB_CURSOR_DISPLAY_NEVER:
+                event.accept()
+                return
+            if not event.isAutoRepeat() and getattr(self, 'collabPointerKeyHeld', False):
+                self.collabPointerKeyHeld = False
+                try:
+                    if hasattr(self, 'view') and self.view is not None:
+                        self.view.viewport().update()
+                except Exception:
+                    pass
+                event.accept()
+                return
         QtWidgets.QMainWindow.keyReleaseEvent(self, event)
 
     def HandleAreaOptions(self):
@@ -20545,7 +20931,9 @@ def main():
     globals_.InsertPathNode = setting('InsertPathNode', False)
     globals_.CollabNickname = str(setting('CollabNickname', getattr(globals_, 'CollabNickname', 'Player')) or 'Player')
     globals_.CollabHighlightColor = normalize_collab_color(setting('CollabHighlightColor', getattr(globals_, 'CollabHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR)))
-    globals_.CollabCursorDisplayMode = str(setting('CollabCursorDisplayMode', getattr(globals_, 'CollabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ALWAYS)) or COLLAB_CURSOR_DISPLAY_ALWAYS)
+    globals_.CollabCursorDisplayMode = str(setting('CollabCursorDisplayMode', getattr(globals_, 'CollabCursorDisplayMode', COLLAB_CURSOR_DISPLAY_ON_SCREEN)) or COLLAB_CURSOR_DISPLAY_ON_SCREEN)
+    globals_.CollabPointerShortcut = str(setting('CollabPointerShortcut', getattr(globals_, 'CollabPointerShortcut', 'P')) or 'P')
+    globals_.QuickPaintShortcut = str(setting('QuickPaintShortcut', getattr(globals_, 'QuickPaintShortcut', 'O')) or 'O')
     SLib.RealViewEnabled = globals_.RealViewEnabled
 
     # Check to see if we have anything saved

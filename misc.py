@@ -1520,6 +1520,20 @@ class PreferencesDialog(QtWidgets.QDialog):
                 """
                 QtWidgets.QWidget.__init__(self)
 
+                self.quickPaintShortcut = QtWidgets.QKeySequenceEdit()
+                try:
+                    self.quickPaintShortcut.setClearButtonEnabled(True)
+                except Exception:
+                    pass
+                self.quickPaintShortcut.setMaximumWidth(256)
+
+                self.collabPointerShortcut = QtWidgets.QKeySequenceEdit()
+                try:
+                    self.collabPointerShortcut.setClearButtonEnabled(True)
+                except Exception:
+                    pass
+                self.collabPointerShortcut.setMaximumWidth(256)
+
                 # Add the Clear Recent Files button
                 ClearRecentBtn = QtWidgets.QPushButton(globals_.trans.string('PrefsDlg', 16))
                 ClearRecentBtn.setMaximumWidth(ClearRecentBtn.minimumSizeHint().width())
@@ -1562,6 +1576,8 @@ class PreferencesDialog(QtWidgets.QDialog):
 
                 # Create the main layout
                 L = QtWidgets.QFormLayout()
+                L.addRow('QuickPaint shortcut', self.quickPaintShortcut)
+                L.addRow('Pointer shortcut', self.collabPointerShortcut)
                 L.addRow(globals_.trans.string('PrefsDlg', 14), self.Trans)
                 L.addRow(globals_.trans.string('PrefsDlg', 15), ClearRecentBtn)
                 L.addWidget(self.collabRuntimeLogs)
@@ -1612,6 +1628,14 @@ class PreferencesDialog(QtWidgets.QDialog):
                 self.fullObjSize.setChecked(globals_.PlaceObjectsAtFullSize)
                 self.insertPathNode.setChecked(globals_.InsertPathNode)
                 self.collabRuntimeLogs.setChecked(setting('CollabRuntimeLogsEnabled', False))
+
+                qp_default = str(getattr(globals_, 'QuickPaintShortcut', 'O') or 'O')
+                qp_value = str(setting('QuickPaintShortcut', qp_default) or qp_default).split(',', 1)[0].strip()
+                self.quickPaintShortcut.setKeySequence(QtGui.QKeySequence(qp_value))
+
+                ptr_default = str(getattr(globals_, 'CollabPointerShortcut', 'P') or 'P')
+                ptr_value = str(setting('CollabPointerShortcut', ptr_default) or ptr_default).split(',', 1)[0].strip()
+                self.collabPointerShortcut.setKeySequence(QtGui.QKeySequence(ptr_value))
 
             def ClearRecent(self):
                 """
