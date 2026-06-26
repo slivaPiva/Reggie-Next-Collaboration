@@ -1503,6 +1503,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabHostCurrentLevelName = ''
         self._collabHostCurrentAreaNum = 1
         self.collabKnownHostedStageFiles = []
+        self._collabPendingHostedLevelDownloads = {}
         self.collabModifiedLevels = collections.OrderedDict()
         self._collabPatchSyncState = None
         self._collabPatchProgressDialog = None
@@ -2368,6 +2369,11 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'Change highlight color', 'Choose the collaboration highlight color',
             None,
         )
+        self.CreateAction(
+            'collab_downloadlevel', self.HandleCollabDownloadHostedLevel, None,
+            'Download hosted level copy', 'Request the current host level state and save it locally',
+            None,
+        )
 
         # Help actions are created later
 
@@ -2508,6 +2514,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         collabmenu.addAction(self.actions['collab_banlist'])
         collabmenu.addAction(self.actions['collab_nick'])
         collabmenu.addAction(self.actions['collab_color'])
+        collabmenu.addAction(self.actions['collab_downloadlevel'])
         collabmenu.addSeparator()
         collabmenu.addAction(self.actions['collab_stop'])
         self.UpdateCollaborationMenuTitle()
@@ -3329,6 +3336,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.UpdateCollaborationMenuTitle()
         self._UpdateChatOverlayText()
         self._ClampChatOverlay()
+        download_action = self.actions.get('collab_downloadlevel')
+        if download_action is not None:
+            download_action.setEnabled(bool(self._CollabEnabled()) and self.IsCollabClientMode())
 
         self._RefreshCollabMonitorDialog()
         if hasattr(self, 'collabBanListDialog') and self.collabBanListDialog is not None:
@@ -3424,6 +3434,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
             menu.addAction(self.actions['collab_nick'])
         if 'collab_color' in self.actions:
             menu.addAction(self.actions['collab_color'])
+        if 'collab_downloadlevel' in self.actions:
+            menu.addAction(self.actions['collab_downloadlevel'])
         if 'collab_stop' in self.actions:
             menu.addAction(self.actions['collab_stop'])
 
@@ -7948,6 +7960,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self._collabLastBroadcastRubberBand = None
             self._collabLastBroadcastEditorState = None
             self._collabLastBroadcastEditorStateAt = 0.0
+            self._collabPendingHostedLevelDownloads = {}
             self._CollabSetPeerNick(getattr(self.collabManager, 'session_id', ''), getattr(self, 'collabSelfNick', 'Player'))
             self._CollabSetPeerColor(getattr(self.collabManager, 'session_id', ''), getattr(self, 'collabSelfHighlightColor', DEFAULT_COLLAB_HIGHLIGHT_COLOR))
         if message.startswith('Disconnected from host') and self.IsCollabClientMode():
@@ -12962,6 +12975,15 @@ class ReggieWindow(QtWidgets.QMainWindow):
         elif msg_type == 'open_hosted_level_data':
             if self.IsCollabClientMode():
                 self._CollabClientHandleHostedLevelData(payload, sender)
+        elif msg_type == 'download_hosted_level_request':
+            if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
+                self._CollabHostHandleHostedLevelDownloadRequest(payload, sender)
+        elif msg_type == 'download_hosted_level_response':
+            if self.IsCollabClientMode():
+                self._CollabClientHandleHostedLevelDownloadResponse(payload, sender)
+        elif msg_type == 'download_hosted_level_data':
+            if self.IsCollabClientMode():
+                self._CollabClientHandleHostedLevelDownloadData(payload, sender)
         elif msg_type == 'request_full_sync':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
                 try:
@@ -16900,6 +16922,20 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if fn == '': return
         self.LoadLevel(str(fn), True, 1)
 
+    def _CollabChooseHostedLevel(self, title, empty_message):
+        levels = list(getattr(self, 'collabKnownHostedStageFiles', []) or [])
+        if not levels:
+            levels = self._CollabListHostStageFiles()
+            if levels:
+                self.collabKnownHostedStageFiles = list(levels)
+        if not levels:
+            QtWidgets.QMessageBox.information(self, 'Collaboration', str(empty_message))
+            return ''
+        dlg = HostedLevelSelectionDialog(title, levels, self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return ''
+        return str(dlg.selected_level or '')
+
     def _CollabRequestHostedLevelOpen(self, level_name, area_num=1):
         if not self.IsCollabClientMode() or not self._CollabEnabled():
             return False
@@ -16916,6 +16952,41 @@ class ReggieWindow(QtWidgets.QMainWindow):
         })
         if hasattr(self, 'hoverLabel'):
             self.hoverLabel.setText('Requested hosted level: %s' % level_name)
+        return True
+
+    def HandleCollabDownloadHostedLevel(self):
+        if not self.IsCollabClientMode() or not self._CollabEnabled():
+            return False
+        level_name = self._CollabChooseHostedLevel(
+            'Download hosted level file',
+            'The host did not expose any Stage .arc files yet.',
+        )
+        if not level_name:
+            return False
+        return self._CollabRequestHostedLevelDownload(level_name, 1)
+
+    def _CollabRequestHostedLevelDownload(self, level_name, area_num=1):
+        if not self.IsCollabClientMode() or not self._CollabEnabled():
+            return False
+        level_name = self._CollabNormalizeLevelName(level_name)
+        if not level_name:
+            return False
+        try:
+            area_num = max(1, min(4, int(area_num)))
+        except Exception:
+            area_num = 1
+        request_id = uuid.uuid4().hex
+        self._collabPendingHostedLevelDownloads[request_id] = {
+            'level_name': level_name,
+            'area_num': area_num,
+        }
+        self.collabManager.broadcast_message('download_hosted_level_request', {
+            'request_id': request_id,
+            'level_name': level_name,
+            'area_num': area_num,
+        })
+        if hasattr(self, 'hoverLabel'):
+            self.hoverLabel.setText('Requested hosted level download: %s' % level_name)
         return True
 
     def _CollabLoadHostedLevelBytes(self, level_name, level_bytes, area_num=1, host_path=''):
@@ -17076,6 +17147,75 @@ class ReggieWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def _CollabClientHandleHostedLevelDownloadResponse(self, payload, sender):
+        if self.collabHostSessionId is not None and sender != self.collabHostSessionId:
+            return
+        request_id = str(payload.get('request_id') or '')
+        status = str(payload.get('status') or '').strip().lower()
+        pending = self._collabPendingHostedLevelDownloads.get(request_id)
+        if pending is None:
+            return
+        level_name = str(pending.get('level_name') or payload.get('level_name') or 'the hosted level')
+        if status == 'accepted':
+            if hasattr(self, 'hoverLabel'):
+                self.hoverLabel.setText('Host accepted the download request: %s' % level_name)
+            return
+        self._collabPendingHostedLevelDownloads.pop(request_id, None)
+        if status == 'denied':
+            QtWidgets.QMessageBox.information(
+                self,
+                'Collaboration',
+                'The host declined your download request for %s.' % level_name,
+            )
+            return
+        message = str(payload.get('message') or '').strip() or ('Unable to download %s from the host.' % level_name)
+        QtWidgets.QMessageBox.warning(self, 'Collaboration', message)
+
+    def _CollabClientHandleHostedLevelDownloadData(self, payload, sender):
+        if self.collabHostSessionId is not None and sender != self.collabHostSessionId:
+            return
+        request_id = str(payload.get('request_id') or '')
+        pending = self._collabPendingHostedLevelDownloads.pop(request_id, None)
+        level_name = self._CollabResolveHostedLevelName(payload.get('level_name')) or self._CollabNormalizeLevelName(payload.get('level_name'))
+        if not level_name and isinstance(pending, dict):
+            level_name = self._CollabNormalizeLevelName(pending.get('level_name'))
+        if not level_name:
+            level_name = 'hosted_level.arc'
+        try:
+            level_bytes = base64.b64decode(payload.get('payload') or '')
+        except Exception:
+            QtWidgets.QMessageBox.warning(self, 'Collaboration', 'Unable to decode the hosted level download sent by the host.')
+            return
+
+        suggested_name = os.path.basename(level_name.replace('\\', '/')) or 'hosted_level.arc'
+        if '.' not in suggested_name:
+            suggested_name += '.arc'
+        initial_dir = str(setting('CollabHostedLevelDownloadDir', '') or '').strip()
+        initial_path = os.path.join(initial_dir, suggested_name) if initial_dir else suggested_name
+        fn = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            'Save hosted level copy',
+            initial_path,
+            globals_.trans.string('FileDlgs', 1) + ' (*' + '.arc' + ');;' +
+            globals_.trans.string('FileDlgs', 10) + ' (*' + '.arc.LZ'+ ');;' +
+            globals_.trans.string('FileDlgs', 11) + ' (*' + '.rgl'+ ');;' +
+            globals_.trans.string('FileDlgs', 2) + ' (*)'
+        )[0]
+        if fn == '':
+            if hasattr(self, 'hoverLabel'):
+                self.hoverLabel.setText('Canceled hosted level download: %s' % level_name)
+            return
+        if os.path.dirname(fn):
+            setSetting('CollabHostedLevelDownloadDir', os.path.dirname(fn))
+        if self._CollabWriteLevelBytesToPath(fn, level_bytes):
+            if hasattr(self, 'hoverLabel'):
+                self.hoverLabel.setText('Downloaded hosted level: %s' % os.path.basename(fn))
+            QtWidgets.QMessageBox.information(
+                self,
+                'Collaboration',
+                'Saved the hosted level copy to:\n%s' % fn,
+            )
+
     def _CollabHostHandleOpenHostedLevelRequest(self, payload, sender):
         requested_level_name = self._CollabNormalizeLevelName(payload.get('level_name'))
         level_name = self._CollabResolveHostedLevelName(requested_level_name) or requested_level_name
@@ -17094,6 +17234,53 @@ class ReggieWindow(QtWidgets.QMainWindow):
             'area_num': area_num,
             # Keep a stable relative key; clients reconstruct a local path.
             'host_path': level_name,
+            'payload': base64.b64encode(level_bytes).decode('ascii'),
+        })
+
+    def _CollabHostHandleHostedLevelDownloadRequest(self, payload, sender):
+        request_id = str(payload.get('request_id') or '')
+        requested_level_name = self._CollabNormalizeLevelName(payload.get('level_name'))
+        level_name = self._CollabResolveHostedLevelName(requested_level_name) or requested_level_name
+        if not request_id or not level_name:
+            return
+        try:
+            area_num = max(1, min(4, int(payload.get('area_num', 1) or 1)))
+        except Exception:
+            area_num = 1
+        requester_name = self._CollabPeerDisplayName(sender)
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            'Collaboration',
+            '%s wants to download the current state of %s.\nAccept?' % (requester_name, level_name),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            self.collabManager.send_message_to(sender, 'download_hosted_level_response', {
+                'request_id': request_id,
+                'level_name': level_name,
+                'status': 'denied',
+            })
+            return
+
+        self.collabManager.send_message_to(sender, 'download_hosted_level_response', {
+            'request_id': request_id,
+            'level_name': level_name,
+            'status': 'accepted',
+        })
+        level_bytes = self._CollabHostMaterializeLevelBytes(level_name)
+        if level_bytes is None:
+            self.collabManager.send_message_to(sender, 'download_hosted_level_response', {
+                'request_id': request_id,
+                'level_name': level_name,
+                'status': 'error',
+                'message': 'Unable to prepare the hosted level for download: %s' % requested_level_name,
+            })
+            return
+        self.collabManager.send_message_to(sender, 'download_hosted_level_data', {
+            'request_id': request_id,
+            'level_name': level_name,
+            'area_num': area_num,
             'payload': base64.b64encode(level_bytes).decode('ascii'),
         })
 
