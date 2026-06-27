@@ -1311,7 +1311,33 @@ class CollaborationManager(QtCore.QObject):
             item = self._send_queue.get()
             if item is None:
                 continue
-            data, exclude = item
+
+            target_conn_id = None
+            exclude = set()
+            if isinstance(item, tuple):
+                if len(item) == 3:
+                    data, exclude, target_conn_id = item
+                elif len(item) == 2:
+                    data, exclude = item
+                else:
+                    continue
+            else:
+                continue
+
+            if target_conn_id is not None:
+                with self._connections_lock:
+                    conn = self._connections.get(target_conn_id)
+                if conn is None:
+                    continue
+                try:
+                    if hasattr(conn, "send_line"):
+                        conn.send_line(data)
+                    else:
+                        conn.sendall(data)
+                except OSError:
+                    self._drop_connection(target_conn_id)
+                continue
+
             if exclude is None:
                 exclude = set()
 
@@ -1385,24 +1411,17 @@ class CollaborationManager(QtCore.QObject):
         self._debug("broadcast_message", message=self._summarize_message_for_debug(message), exclude=list(exclude))
         data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
         try:
-            self._send_queue.put_nowait((data, set(exclude)))
+            self._send_queue.put_nowait((data, set(exclude), None))
         except Exception:
             pass
 
     def _send_direct_message(self, conn_id, message):
         self._debug("send_direct_message", conn_id=conn_id, message=self._summarize_message_for_debug(message))
         data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-        with self._connections_lock:
-            conn = self._connections.get(conn_id)
-        if conn is None:
-            return
         try:
-            if hasattr(conn, "send_line"):
-                conn.send_line(data)
-            else:
-                conn.sendall(data)
-        except OSError:
-            self._drop_connection(conn_id)
+            self._send_queue.put_nowait((data, None, conn_id))
+        except Exception:
+            pass
 
     def _send_rejection(self, conn, message):
         self._debug("send_rejection", message=self._summarize_message_for_debug(message))

@@ -58,6 +58,7 @@ import hashlib
 import zlib
 import subprocess
 import shutil
+import threading
 
 # PyQt6: import, and error msg if not installed
 try:
@@ -1518,6 +1519,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabTilesetSyncState = None
         self._collabTilesetProgressDialog = None
         self._collabGamePluginSummaryCache = {}
+        self._collabHostTransferJobs = set()
+        self._collabHostTransferJobsLock = threading.Lock()
         self._collabOutOps = []
         # Rate-limit outgoing ops so we don't spam the network/UI thread while dragging.
         # 16ms ~= 60fps, keeps remote movement smooth but stable.
@@ -7268,6 +7271,60 @@ class ReggieWindow(QtWidgets.QMainWindow):
     def _MaybeScheduleCollabTilesetSync(self, delay_ms=250, names=None):
         if self._NeedsCollabTilesetSync(names=names):
             self._ScheduleCollabTilesetSync(delay_ms)
+
+    def _StartCollabHostTransferWorker(self, job_key, worker, *args, **kwargs):
+        if not callable(worker):
+            return False
+
+        if isinstance(job_key, (list, tuple)):
+            normalized_key = tuple(job_key)
+        else:
+            normalized_key = (str(job_key or ''),)
+
+        lock = getattr(self, '_collabHostTransferJobsLock', None)
+        active_jobs = getattr(self, '_collabHostTransferJobs', None)
+        if lock is None or not isinstance(active_jobs, set):
+            return False
+
+        with lock:
+            if normalized_key in active_jobs:
+                self._CollabDebugLog('host.transfer.skip_active', job_key=list(normalized_key))
+                return False
+            active_jobs.add(normalized_key)
+
+        def run():
+            try:
+                worker(*args, **kwargs)
+            except Exception:
+                self._CollabDebugLog(
+                    'host.transfer.failed',
+                    job_key=list(normalized_key),
+                    traceback=traceback.format_exc(),
+                )
+            finally:
+                try:
+                    with lock:
+                        active_jobs.discard(normalized_key)
+                except Exception:
+                    pass
+
+        try:
+            thread = threading.Thread(
+                target=run,
+                daemon=True,
+                name='CollabHostTransfer-%s' % '-'.join(str(part) for part in normalized_key[:3]),
+            )
+            thread.start()
+            return True
+        except Exception:
+            with lock:
+                active_jobs.discard(normalized_key)
+            self._CollabDebugLog(
+                'host.transfer.start_failed',
+                job_key=list(normalized_key),
+                traceback=traceback.format_exc(),
+            )
+            return False
 
     def _RequestHostTilesetsNow(self, include_all_game_tilesets=False, force=False):
         if not self.IsCollabClientMode():
@@ -13057,7 +13114,14 @@ class ReggieWindow(QtWidgets.QMainWindow):
                     include_all_game_tilesets=bool(payload.get('include_all_game_tilesets')),
                     known_files_count=len(payload.get('known_files') or {}),
                 )
-                self._HostSendTilesetsToPeer(
+                self._StartCollabHostTransferWorker(
+                    (
+                        'tileset',
+                        str(sender or ''),
+                        int(area_num or 0) if str(area_num or '').isdigit() else 0,
+                        int(bool(payload.get('include_all_game_tilesets'))),
+                    ),
+                    self._HostSendTilesetsToPeer,
                     sender,
                     area_num=area_num,
                     include_all_game_tilesets=bool(payload.get('include_all_game_tilesets')),
@@ -13065,7 +13129,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 )
         elif msg_type == 'patch_sync_request':
             if hasattr(self, 'collabManager') and self.collabManager.mode == "host":
-                self._HostSendPatchFilesToPeer(
+                self._StartCollabHostTransferWorker(
+                    ('patch', str(sender or ''), str(payload.get('game_id') or '')),
+                    self._HostSendPatchFilesToPeer,
                     sender,
                     payload.get('game_id'),
                     known_files=payload.get('known_files'),
