@@ -726,6 +726,7 @@ class CollaborationManager(QtCore.QObject):
     snapshotReceived = QtCore.pyqtSignal(bytes, int, str)
     messageReceived = QtCore.pyqtSignal(dict, str)
     peerCountChanged = QtCore.pyqtSignal(int)
+    peerConnected = QtCore.pyqtSignal(str)
     participantsChanged = QtCore.pyqtSignal(object)
     banListChanged = QtCore.pyqtSignal(object)
 
@@ -2395,6 +2396,7 @@ class CollaborationManager(QtCore.QObject):
         if self._mode == "host" and msg_type == "peer_intro":
             payload = msg.get("payload") or {}
             meta = {}
+            peer_session_id = str(sender or conn_id)
             with self._connections_lock:
                 current_meta = self._conn_meta.get(conn_id)
                 if current_meta is not None:
@@ -2420,7 +2422,7 @@ class CollaborationManager(QtCore.QObject):
                 if meta is not None:
                     meta["nickname"] = self._sanitize_nickname(payload.get("nickname"))
                     meta["highlight_color"] = self._sanitize_color(payload.get("highlight_color"))
-                    meta["session_id"] = str(sender or conn_id)
+                    meta["session_id"] = peer_session_id
                     peer_ip = meta.get("ip") or "unknown"
                     peer_port = meta.get("port")
                 else:
@@ -2432,6 +2434,7 @@ class CollaborationManager(QtCore.QObject):
                 self.statusChanged.emit("Peer connected: %s:%d" % (peer_ip, int(peer_port)))
             self._emit_peer_count_if_changed()
             self._broadcast_roster()
+            self.peerConnected.emit(peer_session_id)
             self._debug("peer_intro_accepted", conn_id=conn_id, sender=sender, peer_ip=peer_ip, peer_port=peer_port)
             return
 

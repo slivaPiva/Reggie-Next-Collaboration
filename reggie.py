@@ -1470,6 +1470,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self.collabManager.set_room_info_provider(self._BuildCollabRoomInfo)
 #       self.collabManager.set_peer_intro_validator(self._ValidateCollabPeerIntro)
         self.collabManager.statusChanged.connect(self.HandleCollaborationStatus)
+        self.collabManager.peerConnected.connect(self.HandleCollabPeerConnected)
         self.collabManager.snapshotReceived.connect(self.HandleRemoteSnapshot)
         self.collabManager.messageReceived.connect(self.HandleRemoteMessage)
         self.collabManager.peerCountChanged.connect(self.HandleCollaborationPeerCount)
@@ -1599,6 +1600,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         self._collabFocusCursorTimer.setSingleShot(True)
         self._collabFocusCursorTimer.timeout.connect(self._FlushCollabFocusCursor)
         self.collabParticipants = []
+        self.collabChatHistory = []
+        self._collabChatHistoryLimit = 300
         self.collabWindow = None
         self.collabMonitorDialog = None
         self.collabBanListDialog = None
@@ -3524,17 +3527,60 @@ class ReggieWindow(QtWidgets.QMainWindow):
             pass
 
     def _ChatAddLine(self, text):
+        self._ChatAddLineEx(text, store=True, auto_expand=True)
+
+    def _ChatAddLineEx(self, text, store=True, auto_expand=True):
+        line = str(text or '')
+        if store:
+            history = list(getattr(self, 'collabChatHistory', []) or [])
+            history.append(line)
+            limit = max(1, int(getattr(self, '_collabChatHistoryLimit', 300) or 300))
+            if len(history) > limit:
+                history = history[-limit:]
+            self.collabChatHistory = history
         self._EnsureChatWindow()
         try:
-            self.collabWindow.addLine(text)
+            self.collabWindow.addLine(line, auto_expand=auto_expand)
         except Exception:
             pass
         self._ClampChatOverlay()
 
+    def _SetCollabChatHistory(self, lines, auto_expand=False):
+        cleaned = [str(line or '') for line in (lines or []) if str(line or '')]
+        limit = max(1, int(getattr(self, '_collabChatHistoryLimit', 300) or 300))
+        self.collabChatHistory = cleaned[-limit:]
+        self._EnsureChatWindow()
+        try:
+            self.collabWindow.setLines(self.collabChatHistory, auto_expand=auto_expand)
+        except Exception:
+            pass
+        self._ClampChatOverlay()
+
+    def _ClearCollabChatHistory(self):
+        self._SetCollabChatHistory([], auto_expand=False)
+
+    def _SendCollabChatHistoryToPeer(self, peer_session_id):
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
+            return False
+        peer_session_id = str(peer_session_id or '')
+        if not peer_session_id:
+            return False
+        try:
+            return bool(self.collabManager.send_message_to(peer_session_id, 'chat_history', {
+                'lines': list(getattr(self, 'collabChatHistory', []) or []),
+            }))
+        except Exception:
+            return False
+
+    def HandleCollabPeerConnected(self, peer_session_id):
+        if not self._CollabEnabled() or getattr(self.collabManager, 'mode', None) != 'host':
+            return
+        self._SendCollabChatHistoryToPeer(peer_session_id)
+
     def HandleCollabChatSend(self, text):
         nick = str(getattr(self, 'collabSelfNick', getattr(globals_, 'CollabNickname', 'Player')) or 'Player')
         line = '%s: %s' % (nick, str(text))
-        self._ChatAddLine(line)
+        self._ChatAddLineEx(line, store=True, auto_expand=True)
 
         if not self._CollabEnabled():
             return
@@ -5028,6 +5074,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
             action = self.actions.get(action_name)
             if action is not None:
                 action.setEnabled(not client_mode)
+        delete_area_action = self.actions.get('deletearea')
+        if delete_area_action is not None:
+            area_count = len(getattr(getattr(globals_, 'Level', None), 'areas', []) or [])
+            delete_area_action.setEnabled((not client_mode) and area_count > 1)
         save_all_action = self.actions.get('collab_saveall')
         if save_all_action is not None:
             save_all_action.setEnabled(bool(self._CollabEnabled()) and getattr(self.collabManager, 'mode', None) == 'host')
@@ -7914,6 +7964,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'hoverLabel'):
             self.hoverLabel.setText(message)
         if message.startswith('Hosting room') or message.startswith('Connected to'):
+            self._ClearCollabChatHistory()
             self._BroadcastCollabNick()
             self._EnsureChatWindow()
             try:
@@ -7954,6 +8005,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.collabRemoteRubberBands = {}
             self.collabLocalRubberBand = None
             self.collabPointerKeyHeld = False
+            self._ClearCollabChatHistory()
             self.collabLastBroadcastCursorAt = 0.0
             self.collabLastBroadcastCursorPos = None
             self._collabLastBroadcastRubberBandAt = 0.0
@@ -12854,6 +12906,10 @@ class ReggieWindow(QtWidgets.QMainWindow):
                 if area_num > 0:
                     self._collabHostCurrentAreaNum = area_num
             self._CollabSetPeerEditorState(sender, level_name, area_num)
+        elif msg_type == 'chat_history':
+            lines = payload.get('lines') or []
+            if isinstance(lines, list):
+                self._SetCollabChatHistory(lines, auto_expand=False)
         elif msg_type == 'chat':
             nick = str(payload.get('nick') or '').strip()
             if nick:
@@ -16547,6 +16603,9 @@ class ReggieWindow(QtWidgets.QMainWindow):
         """
         Deletes the current area
         """
+        if self.IsCollabClientMode():
+            QtWidgets.QMessageBox.information(self, 'Collaboration', 'Only the host can delete the current area.')
+            return
         result = QtWidgets.QMessageBox.warning(self, 'Reggie', globals_.trans.string('DeleteArea', 0),
                                                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
                                                QtWidgets.QMessageBox.StandardButton.No)
@@ -16554,9 +16613,16 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         # Save the current area in case something goes wrong.
         if not self.HandleSave(): return
+        try:
+            backup_bytes = globals_.Level.save() if globals_.Level is not None else None
+        except Exception:
+            backup_bytes = None
+        if not self._CreateLevelBackupNow(backup_bytes):
+            return
 
         area_to_delete = globals_.Area.areanum
         new_area_one = 1 if area_to_delete != 1 else 2
+        current_level_name = self._CollabCurrentLevelName()
 
         # Load the new area 1 before deleting the old area to avoid glitches
         # when the old area was area 1.
@@ -16565,7 +16631,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
         # Actually delete the area
         globals_.Level.deleteArea(area_to_delete)
 
-        self.actions['deletearea'].setEnabled(len(globals_.Level.areas) > 1)
+        self.actions['deletearea'].setEnabled((not self.IsCollabClientMode()) and (len(globals_.Level.areas) > 1))
 
         # Update the area selection combobox
         self.areaComboBox.clear()
@@ -16577,6 +16643,30 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
         # Save the level without the area as promised
         self.HandleSave()
+        self.UpdateSaveActionsForCollabMode()
+        if self._CollabEnabled() and getattr(self.collabManager, 'mode', None) == 'host':
+            resolved_level_name = self._CollabResolveHostedLevelName(current_level_name) or self._CollabNormalizeLevelName(current_level_name)
+            try:
+                self._CollabSceneCacheForLevel(resolved_level_name, create=True).clear()
+            except Exception:
+                pass
+            try:
+                self._CollabMetaCacheForLevel(resolved_level_name, create=True).clear()
+            except Exception:
+                pass
+            try:
+                self._CollabPrimeLevelCachesFromSource(resolved_level_name)
+            except Exception:
+                pass
+            try:
+                self._BroadcastHostHelloToPeers(force=True)
+            except Exception:
+                pass
+            try:
+                self.BroadcastFullLevelSnapshot()
+                self.BroadcastFullStateForArea(int(getattr(globals_.Area, 'areanum', 1) or 1), level_name=resolved_level_name)
+            except Exception:
+                pass
 
     def HandleChangeGamePath(self, auto=False):
         """
@@ -16843,6 +16933,46 @@ class ReggieWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _CreateLevelBackupNow(self, u8_data=None):
+        if globals_.Level is None:
+            return ''
+        try:
+            if u8_data is None:
+                u8_data = globals_.Level.save()
+        except Exception:
+            return ''
+
+        if self._IsAllNullBytes(u8_data):
+            QtWidgets.QMessageBox.warning(self, globals_.trans.string('Warn_NullSave', 0),
+                                          globals_.trans.string('Warn_NullSave', 3))
+            return ''
+
+        backups_dir = self._GetBackupsDir()
+        level_id = self._LevelBackupId()
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        backup_path = os.path.join(backups_dir, '%s_%s.rgl' % (level_id, ts))
+        if not self._SaveReggieRawLevel(backup_path, u8_data):
+            return ''
+
+        self._levelBackupLastHash = hash(u8_data)
+
+        try:
+            existing = []
+            prefix = level_id + '_'
+            for fn in os.listdir(backups_dir):
+                if fn.startswith(prefix) and fn.lower().endswith('.rgl'):
+                    existing.append(os.path.join(backups_dir, fn))
+            existing.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for old in existing[3:]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return backup_path
+
     def LevelBackupTick(self):
         if self.IsCollabClientMode():
             return
@@ -16865,30 +16995,8 @@ class ReggieWindow(QtWidgets.QMainWindow):
         if getattr(self, '_levelBackupLastHash', None) == new_hash:
             return
 
-        backups_dir = self._GetBackupsDir()
-        level_id = self._LevelBackupId()
-        ts = time.strftime('%Y%m%d_%H%M%S')
-        backup_path = os.path.join(backups_dir, '%s_%s.rgl' % (level_id, ts))
-
-        if not self._SaveReggieRawLevel(backup_path, u8_data):
-            return
-
-        self._levelBackupLastHash = new_hash
-
-        try:
-            existing = []
-            prefix = level_id + '_'
-            for fn in os.listdir(backups_dir):
-                if fn.startswith(prefix) and fn.lower().endswith('.rgl'):
-                    existing.append(os.path.join(backups_dir, fn))
-            existing.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            for old in existing[3:]:
-                try:
-                    os.remove(old)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        if self._CreateLevelBackupNow(u8_data):
+            self._levelBackupLastHash = new_hash
 
     def HandleOpenFromFile(self):
         """
@@ -18203,7 +18311,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
 
             self.actions['addarea'].setEnabled(len(globals_.Level.areas) < 4)
             self.actions['importarea'].setEnabled(len(globals_.Level.areas) < 4)
-            self.actions['deletearea'].setEnabled(len(globals_.Level.areas) > 1)
+            self.actions['deletearea'].setEnabled((not self.IsCollabClientMode()) and (len(globals_.Level.areas) > 1))
             self.actions['backgrounds'].setEnabled(len(globals_.Area.zones) > 0)
 
             self.collabLastLevelName = self._CollabNormalizeLevelName()
@@ -18518,7 +18626,7 @@ class ReggieWindow(QtWidgets.QMainWindow):
             self.actions['showcomments'].setChecked(True)
             self.actions['addarea'].setEnabled(len(globals_.Level.areas) < 4)
             self.actions['importarea'].setEnabled(len(globals_.Level.areas) < 4)
-            self.actions['deletearea'].setEnabled(len(globals_.Level.areas) > 1)
+            self.actions['deletearea'].setEnabled((not self.IsCollabClientMode()) and (len(globals_.Level.areas) > 1))
             self.actions['backgrounds'].setEnabled(len(globals_.Area.zones) > 0)
 
             # Turn snapping back on

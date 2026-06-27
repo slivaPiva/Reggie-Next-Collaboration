@@ -219,13 +219,23 @@ class ChatWindow(QtWidgets.QWidget):
             except Exception:
                 pass
 
-    def addLine(self, text):
+    def addLine(self, text, auto_expand=True):
         try:
             self.view.appendPlainText(str(text))
             self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
         except Exception:
             pass
-        self.setExpanded(True, auto_collapse=True)
+        if auto_expand:
+            self.setExpanded(True, auto_collapse=True)
+
+    def setLines(self, lines, auto_expand=False):
+        try:
+            self.view.setPlainText('\n'.join(str(line) for line in (lines or [])))
+            self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+        except Exception:
+            pass
+        if auto_expand:
+            self.setExpanded(True, auto_collapse=True)
 
     def setLevelText(self, text):
         self.levelLabel.setText(str(text or 'Level: -'))
